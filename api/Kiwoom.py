@@ -224,10 +224,20 @@ class Kiwoom(QAxWidget):
             if fid in FID_CODES:
                 code = self.dynamicCall("GetChejanData(int)", '9001')[1:]
                 data = self.dynamicCall("GetChejanData(int)", fid)
-                data = data.strip().lstrip('+').lstrip('-')
+               
+                raw_data = self.dynamicCall("GetChejanData(int)", fid)
+                data = str(raw_data).strip().lstrip('+').lstrip('-').replace(",", "")
+                item_name = FID_CODES[fid]
 
-                if data.isdigit():
-                    data = int(data)
+                numeric_fields = {
+                    "주문수량", "주문가격", "미체결수량", "체결누계금액", "원주문번호",
+                    "체결가", "체결량", "현재가", "(최우선)매도호가", "(최우선)매수호가",
+                    "단위체결가", "단위체결량", "당일매매 수수료", "당일매매세금",
+                    "보유수량", "매입단가", "총매입가", "주문가능수량"
+                }
+
+                if item_name in numeric_fields:
+                    data = self._safe_int(data)
                 
                 item_name = FID_CODES[fid]
                 print("{}: {}".format(item_name, data))
@@ -242,6 +252,12 @@ class Kiwoom(QAxWidget):
                     if code not in self.balance:
                         self.balance[code]={}
 
+                    normalized_name = item_name
+                    if item_name == "매입단가":
+                        normalized_name = "매입가"
+                    elif item_name == "주문가능수량":
+                        normalized_name = "매매가능수량"
+                        
                     self.balance[code].update({item_name: data})
             
         if int(s_gubun) == 0:
@@ -253,6 +269,7 @@ class Kiwoom(QAxWidget):
                 order_status = order_info.get("주문상태", "")
                 executed_quantity = order_info.get("체결량", 0)
                 left_quantity = order_info.get("미체결수량", 0)
+                executed_price = self._safe_int(order_info.get("체결가", 0))
                 code_name = order_info.get("종목명", code)
 
                 if order_status == "체결" or (executed_quantity > 0 and left_quantity == 0):
@@ -333,6 +350,15 @@ class Kiwoom(QAxWidget):
     def get_fid(search_value): #const 파일에서 fid 이름으로 fid 번호 찾는 함수
         keys = [key for key, value in FID_CODES.items() if value == search_value]
         return keys[0]
+
+    def _safe_int(self, value):
+            value = str(value).strip().replace(",", "")
+            if value == "":
+                return 0
+            try:
+                return int(value)
+            except ValueError:
+                return 0     
 
     def _to_int(self, value):
         value = str(value).strip()

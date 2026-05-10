@@ -74,14 +74,14 @@ def add_rsi_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     diff = out["close"].diff(1)
     up = np.where(diff > 0, diff, 0)
-    down = np.where(diff < 0, diff, 0)  # 기존 실시간 코드와 동일하게 음수 유지
-    au = pd.Series(up, index=out.index).rolling(window=2).mean()
-    ad = pd.Series(down, index=out.index).rolling(window=2).mean()
-    out["rsi2"] = au / (au + ad) * 100
+    down = np.where(diff < 0, -diff, 0)  # 기존 실시간 코드와 동일하게 음수 유지
+    au = pd.Series(up, index=out.index).rolling(window=14).mean()
+    ad = pd.Series(down, index=out.index).rolling(window=14).mean()
+    out["rsi14"] = au / (au + ad) * 100
     out["ma20"] = out["close"].rolling(window=20, min_periods=1).mean()
     out["ma60"] = out["close"].rolling(window=60, min_periods=1).mean()
-    out["close_2d_ago"] = out["close"].shift(2)
-    out["price_diff_2d_pct"] = (out["close"] - out["close_2d_ago"]) / out["close_2d_ago"] * 100
+    out["close_14d_ago"] = out["close"].shift(14)
+    out["price_diff_14d_pct"] = (out["close"] - out["close_14d_ago"]) / out["close_14d_ago"] * 100
     return out
 
 def add_band_reversion_indicators(df: pd.DataFrame, mfi_period: int = 14) -> pd.DataFrame:

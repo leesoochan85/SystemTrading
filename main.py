@@ -1,6 +1,8 @@
 from api.Kiwoom import *
 from strategy.RSIStrategy import *
-from strategy.BandStrategy import *
+from strategy.BandTrendStrategy import *
+from strategy.BandReversionStrategy import *
+from strategy.HighBreakoutStrategy import *
 import sys
 
 app=QApplication(sys.argv)
@@ -38,14 +40,17 @@ app=QApplication(sys.argv)
 # codes = '005930;007700;000660;'
 # kiwoom.set_real_reg("1000", codes, fids, "0")
 
-# rsi_strategy = RSIStrategy()
-# rsi_strategy.start()
+rsi_strategy = RSIStrategy()
+rsi_strategy.start()
+
+high_breakout_strategy = HighBreakoutStrategy()
+high_breakout_strategy.start()
 
 # band_combine_strategy = BandCombine()
-# band_combine_strategy.start()
+# # band_combine_strategy.start()
 
-band_trebd_strategy = BandTrendStrategy()
-band_trebd_strategy.start()
+# band_trebd_strategy = BandTrendStrategy()
+# band_trebd_strategy.start()
 
 
 app.exec_()

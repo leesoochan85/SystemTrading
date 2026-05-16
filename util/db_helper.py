@@ -1,4 +1,5 @@
 import sqlite3
+from datetime import datetime
 conn = sqlite3.connect('universe_price.db',isolation_level=None)
 cur = conn.cursor()
 
@@ -10,32 +11,58 @@ cur.execute('''CREATE TABLE IF NOT EXISTS balance(
                 will_clear_at varchar(14)
             )''')
 
-# sql = "select * from balance where code= :code"
-# cur.execute(sql, {"code": "007700"})
-# row = cur.fetchone()
-# print(row)
+def init_position_strategy_table():
+    with sqlite3.connect("strategy_position.db") as con:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS position_strategy (
+                code TEXT PRIMARY KEY,
+                code_name TEXT,
+                strategy_name TEXT NOT NULL,
+                quantity INTEGER,
+                buy_price INTEGER,
+                created_at TEXT
+            )
+        """)
 
-# cur.execute('select * from balance')
-# rows = cur.fetchall()
-# # print(rows)
-# for row in rows:
-#     # print(row)
-#     code, bid_price, quantity, created_at, will_clear_at = row
-#     print(code, bid_price, quantity, created_at, will_clear_at)
+def save_position_strategy(code, code_name, strategy_name, quantity, buy_price):
+    with sqlite3.connect("strategy_position.db") as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT OR REPLACE INTO position_strategy
+            (code, code_name, strategy_name, quantity, buy_price, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            str(code).zfill(6),
+            code_name,
+            strategy_name,
+            quantity,
+            buy_price,
+            datetime.now().strftime("%Y%m%d%H%M%S")
+        ))
 
+def get_position_strategy(code):
+    with sqlite3.connect("strategy_position.db") as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT strategy_name
+            FROM position_strategy
+            WHERE code = ?
+        """, (str(code).zfill(6),))
+        row = cur.fetchone()
 
-# sql = "insert into balance(code, bid_price, quantity, created_at,will_clear_at) values(?,?,?,?,?)"
-# cur.execute(sql, ("0077000", 35000, 30, "20240317", 'today'))
-# print(cur.rowcount)
+    if row is None:
+        return None
 
+    return row[0]
 
-# sql = "update balance set will_clear_at = :will_clear_at where bid_price = :bid_price"
-# cur.execute(sql, {"will_clear_at": "next", "bid_price": 100000})
-# print(cur.rowcount)
-
-# sql = "delete from balance where will_clear_at = :will_clear_at"
-# cur.execute(sql, {"will_clear_at": "next"})
-# print(cur.rowcount)
+def delete_position_strategy(code):
+    with sqlite3.connect("strategy_position.db") as con:
+        cur = con.cursor()
+        cur.execute("""
+            DELETE FROM position_strategy
+            WHERE code = ?
+        """, (str(code).zfill(6),))
 
 def check_table_exists(db_name, table_name):
     with sqlite3.connect('{}.db'.format(db_name)) as con:
@@ -57,4 +84,45 @@ def execute_sql(db_name, sql, params={}):
         cur = con.cursor()
         cur.execute(sql, params)
         return cur
+    
+def init_sent_news_table():
+    with sqlite3.connect("sent_news.db") as con:
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS sent_news (
+                link TEXT PRIMARY KEY,
+                title TEXT,
+                source TEXT,
+                sent_at TEXT
+            )
+        """)
+
+
+def is_news_sent(link):
+    with sqlite3.connect("sent_news.db") as con:
+        cur = con.cursor()
+        cur.execute("""
+            SELECT 1
+            FROM sent_news
+            WHERE link = ?
+            LIMIT 1
+        """, (link,))
+        row = cur.fetchone()
+
+    return row is not None
+
+
+def save_sent_news(link, title, source="naver_economy"):
+    with sqlite3.connect("sent_news.db") as con:
+        cur = con.cursor()
+        cur.execute("""
+            INSERT OR IGNORE INTO sent_news
+            (link, title, source, sent_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            link,
+            title,
+            source,
+            datetime.now().strftime("%Y%m%d%H%M%S")
+        ))
     

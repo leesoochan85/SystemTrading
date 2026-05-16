@@ -7,9 +7,15 @@ import numpy as np
 import pandas as pd
 from PyQt5.QtCore import QThread
 
-from api.Kiwoom import Kiwoom
 from util.const import get_fid
-from util.db_helper import check_table_exists, execute_sql, insert_df_to_db
+from util.db_helper import (
+    check_table_exists,
+    execute_sql,
+    insert_df_to_db,
+    save_position_strategy,
+    get_position_strategy,
+    delete_position_strategy,
+)
 from util.make_up_universe import get_universe
 from util.notifier import send_message
 from util.time_helper import check_transaction_closed, check_transaction_open
@@ -39,14 +45,16 @@ class HighBreakoutStrategy(QThread):
     BUY_FEE_RATE = 0.00035
     STOP_LOSS_PCT = -5.0
 
-    def __init__(self):
+    def __init__(self, kiwoom, auto_init=True):
         super().__init__()
         self.strategy_name = "HighBreakoutStrategy"
-        self.kiwoom = Kiwoom()
+        self.kiwoom = kiwoom
         self.universe = {}
         self.deposit = 0
         self.is_init_success = False
-        self.init_strategy()
+
+        if auto_init:
+            self.init_strategy()
 
     def init_strategy(self):
         try:
@@ -143,7 +151,7 @@ class HighBreakoutStrategy(QThread):
 
         chunk_size = 90
         for i in range(0, len(codes), chunk_size):
-            screen_no = str(1000 + (i // chunk_size))
+            screen_no = str(1300 + (i // chunk_size))
             code_chunk = ";".join(codes[i : i + chunk_size])
             self.kiwoom.set_real_reg(screen_no, code_chunk, fids, "0")
             print(f"[실시간 등록] screen={screen_no}, count={len(codes[i : i + chunk_size])}")
@@ -222,14 +230,24 @@ class HighBreakoutStrategy(QThread):
         if self.deposit < estimated_amount:
             return False
 
-        result = self.kiwoom.send_order("send_buy_order", "1001", 1, code, quantity, bid, "00")
+        result = self.kiwoom.send_order("send_buy_order", "2004", 1, code, quantity, bid, "00")
         if result == 0:
             self.deposit -= estimated_amount
+
+            save_position_strategy(
+                code=code,
+                code_name=self.universe[code]["code_name"],
+                strategy_name=self.strategy_name,
+                quantity=quantity,
+                buy_price=bid,
+            )
             send_message(
                 f"[신고가돌파 매수] {self.universe[code]['code_name']}({code}) "
                 f"{quantity}주 {bid}원 / 직전{self.BREAKOUT_WINDOW}일 최고가 {int(prev_highest_high)}원 돌파"
             )
-            self.kiwoom.order[code] = {"주문구분": "매수", "미체결수량": quantity}
+            self.kiwoom.order[code] = {"주문구분": "매수", 
+                                       "미체결수량": quantity, 
+                                       "strategy_name": self.strategy_name}
             return True
 
         send_message(f"[신고가돌파 매수 실패] {self.universe[code]['code_name']}({code}) result={result}")
@@ -273,10 +291,14 @@ class HighBreakoutStrategy(QThread):
         if ask <= 0:
             return False
 
-        result = self.kiwoom.send_order("send_sell_order", "1001", 2, code, quantity, ask, "00")
+        result = self.kiwoom.send_order("send_sell_order", "2004", 2, code, quantity, ask, "00")
         if result == 0:
             send_message(f"[신고가돌파 매도] {self.universe[code]['code_name']}({code}) {quantity}주 {ask}원")
-            self.kiwoom.order[code] = {"주문구분": "매도", "미체결수량": quantity}
+            self.kiwoom.order[code] = {
+                "주문구분": "매도", 
+                "미체결수량": quantity,
+                "strategy_name": self.strategy_name, 
+            }
             return True
         send_message(f"[신고가돌파 매도 실패] {self.universe[code]['code_name']}({code}) result={result}")
         return False
@@ -303,32 +325,58 @@ class HighBreakoutStrategy(QThread):
                 buy_order_count += 1
         return buy_order_count
 
-    def run(self):
-        while self.is_init_success:
-            try:
-                if not check_transaction_open():
-                    print("장 시간이 아니므로 대기합니다.")
-                    time.sleep(60)
-                    continue
+    def check_code(self, code):
+        if code not in self.universe:
+            return False
 
-                # 장중 잔고 변동을 주기적으로 반영한다.
-                self.kiwoom.get_balance()
+        if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+            return False
 
-                for idx, code in enumerate(list(self.universe.keys()), start=1):
-                    print(f"[{idx}/{len(self.universe)}_{self.universe[code]['code_name']}]")
-                    time.sleep(0.5)
+        if code in self.kiwoom.balance:
+            owner_strategy = get_position_strategy(code)
 
-                    if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
-                        continue
+            if owner_strategy != self.strategy_name:
+                return False
 
-                    if code in self.kiwoom.balance:
-                        if self.check_sell_signal(code):
-                            self.order_sell(code)
-                    else:
-                        self.check_buy_signal_and_order(code)
+            if self.check_sell_signal(code):
+                return self.order_sell(code)
 
-            except Exception:
-                error_msg = traceback.format_exc()
-                print(error_msg)
-                send_message(error_msg)
-                time.sleep(5)
+            return False
+
+        return self.check_buy_signal_and_order(code)
+
+    # def run(self):
+    #     print("[HighBreakoutStrategy] run 시작")
+    #     while self.is_init_success:
+    #         try:
+    #             if not check_transaction_open():
+    #                 print("장 시간이 아니므로 대기합니다.")
+    #                 time.sleep(60)
+    #                 continue
+
+    #             # 장중 잔고 변동을 주기적으로 반영한다.
+    #             self.kiwoom.get_balance()
+
+    #             for idx, code in enumerate(list(self.universe.keys()), start=1):
+    #                 print(f"[{self.strategy_name}] [{idx}/{len(self.universe)}_{self.universe[code]['code_name']}]")
+    #                 time.sleep(0.5)
+
+    #                 if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+    #                     continue
+
+    #                 if code in self.kiwoom.balance:
+    #                     owner_strategy = get_position_strategy(code)
+
+    #                     if owner_strategy != self.strategy_name:
+    #                         continue
+
+    #                     if self.check_sell_signal(code):
+    #                         self.order_sell(code)
+    #                 else:
+    #                     self.check_buy_signal_and_order(code)
+
+    #         except Exception:
+    #             error_msg = traceback.format_exc()
+    #             print(error_msg)
+    #             send_message(error_msg)
+    #             time.sleep(5)

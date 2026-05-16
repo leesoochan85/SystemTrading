@@ -7,8 +7,11 @@ import numpy as np
 import pandas as pd
 from PyQt5.QtCore import QThread
 
-from api.Kiwoom import Kiwoom
-from util.db_helper import check_table_exists, execute_sql, insert_df_to_db
+from util.db_helper import (
+    check_table_exists, execute_sql, insert_df_to_db,
+    init_position_strategy_table, save_position_strategy, 
+    get_position_strategy, delete_position_strategy,
+)
 from util.make_up_universe import get_universe
 from util.notifier import send_message
 from util.const import get_fid
@@ -19,26 +22,32 @@ from util.time_helper import (
 
 
 class RSIStrategy(QThread):
-    def __init__(self):
+    def __init__(self, kiwoom, auto_init=True):
         super().__init__()
         self.strategy_name = "RSIStrategy"
-        self.kiwoom = Kiwoom()
+        self.kiwoom = kiwoom
         self.universe = {}
         self.deposit = 0
         self.is_init_success = False
-        self.init_strategy()
+
+        if auto_init:
+            self.init_strategy()
 
     def init_strategy(self):
         try:
+            init_position_strategy_table()
             self.kiwoom.get_order()
             self.kiwoom.get_balance()
-            
             self.check_and_get_universe()
             self.check_and_get_price_data()
             
             self.deposit = self.kiwoom.get_deposit()
             self.set_universe_real_time()
             self.is_init_success = True
+
+            print("[RSIStrategy] 초기화 완료")
+            send_message("[RSIStrategy] 초기화 완료")
+
         except Exception:
             error_msg = traceback.format_exc()
             print(error_msg)
@@ -79,7 +88,6 @@ class RSIStrategy(QThread):
 
         print(self.universe)
 
-
     def check_and_get_price_data(self):
         for idx, code in enumerate(self.universe.keys(), start=1):
             print(f"{idx}/{len(self.universe)}) {code}")
@@ -108,35 +116,95 @@ class RSIStrategy(QThread):
             self.universe[code]["price_df"] = price_df
 
     def set_universe_real_time(self):
-        fids = get_fid("체결시간")
-        codes = ";".join(map(str, self.universe.keys()))
-        self.kiwoom.set_real_reg("1000", codes, fids, "0")
+        fids = ";".join([
+            get_fid("체결시간"),
+            get_fid("현재가"),
+            get_fid("시가"),
+            get_fid("고가"),
+            get_fid("저가"),
+            get_fid("누적거래량"),
+            get_fid("(최우선)매도호가"),
+            get_fid("(최우선)매수호가"),
+        ])
 
-    def check_sell_signal(self, code):
-        if "price_df" not in self.universe.get(code, {}):
-            print(f"{code}price_df가 아직 준비되지 않았습니다.")
-            return False
-        
+        codes = list(self.universe.keys())
+        chunk_size = 90
+
+        for i in range(0, len(codes), chunk_size):
+            screen_no = str(1000 + (i // chunk_size))
+            code_chunk = ";".join(codes[i:i + chunk_size])
+            self.kiwoom.set_real_reg(screen_no, code_chunk, fids, "0")
+
+    def get_today_price_df(self, code):
+        if code not in self.universe or "price_df" not in self.universe[code]:
+            return None
+
         if code not in self.kiwoom.universe_realtime_transaction_info:
-            print("매도대상 확인 과정에서 아직 체결정보가 없습니다.")
-            return False
+            return None
 
         rt = self.kiwoom.universe_realtime_transaction_info[code]
-        today_price_data = [rt["시가"], rt["고가"], rt["저가"], rt["현재가"], rt["누적거래량"]]
+        today = datetime.now().strftime("%Y%m%d")
 
         df = self.universe[code]["price_df"].copy()
-        df.loc[datetime.now().strftime("%Y%m%d")] = today_price_data
+        df.loc[today] = [
+            rt["시가"],
+            rt["고가"],
+            rt["저가"],
+            rt["현재가"],
+            rt["누적거래량"],
+        ]
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        return df
+
+    def get_rsi_df(self, code):
+        df = self.get_today_price_df(code)
+
+        if df is None or len(df) < 60:
+            return None
+
+        df = df.copy()
 
         diff = df["close"].diff(1)
         up = np.where(diff > 0, diff, 0)
         down = np.where(diff < 0, -diff, 0)
-        au = pd.Series(up, index=df.index.astype(str)).rolling(window=14).mean()
-        ad = pd.Series(down, index=df.index.astype(str)).rolling(window=14).mean()
-        df["RSI(14)"] = au / (au + ad) * 100
 
-        purchase_price = self.kiwoom.balance[code]["매입가"]
-        rsi = df.iloc[-1]["RSI(14)"]
-        close = rt["현재가"]
+        au = pd.Series(up, index=df.index).rolling(window=14).mean()
+        ad = pd.Series(down, index=df.index).rolling(window=14).mean()
+
+        df["RSI(14)"] = au / (au + ad) * 100
+        df["ma20"] = df["close"].rolling(window=20, min_periods=1).mean()
+        df["ma60"] = df["close"].rolling(window=60, min_periods=1).mean()
+        df["close_14days_ago"] = df["close"].shift(14)
+        df["price_diff_14d_pct"] = (
+            (df["close"] - df["close_14days_ago"]) / df["close_14days_ago"] * 100
+        )
+
+        return df
+
+    def check_sell_signal(self, code):
+        if code not in self.kiwoom.balance:
+            return False
+
+        df = self.get_rsi_df(code)
+        if df is None:
+            return False
+
+        latest = df.iloc[-1]
+        rsi = latest["RSI(14)"]
+        close = latest["close"]
+
+        if pd.isna(rsi) or pd.isna(close):
+            return False
+
+        balance_info = self.kiwoom.balance[code]
+        purchase_price = balance_info.get("매입가", balance_info.get("매입단가", 0))
+
+        if purchase_price <= 0:
+            return False
+
         return bool(rsi > 75 and close > purchase_price)
 
     def order_sell(self, code):
@@ -145,13 +213,14 @@ class RSIStrategy(QThread):
         if quantity < 1:
             return False
 
-        result = self.kiwoom.send_order("send_sell_order", "1001", 2, code, quantity, ask, "00")
+        result = self.kiwoom.send_order("send_sell_order", "2001", 2, code, quantity, ask, "00")
 
         if result == 0:
             send_message(f"RSI 매도 주문: {self.universe[code]['code_name']} {quantity}주 {ask}원")
             self.kiwoom.order[code] = {
                 "주문구분": "매도",
                 "미체결수량": quantity,
+                "strategy_name": self.strategy_name,
             }
             return True
         else:
@@ -159,40 +228,29 @@ class RSIStrategy(QThread):
             return False
         
     def check_buy_signal_and_order(self, code):
-
-        if "price_df" not in self.universe.get(code, {}):
-            print(f"{code}price_df가 아직 준비되지 않았습니다.")
-            return False
         if not check_transaction_open():
             return False
-        if code not in self.kiwoom.universe_realtime_transaction_info:
-            print("매수대상 확인 과정에서 아직 체결정보가 없습니다.")
+
+        if code in self.kiwoom.balance:
             return False
 
-        rt = self.kiwoom.universe_realtime_transaction_info[code]
-        today_price_data = [rt["시가"], rt["고가"], rt["저가"], rt["현재가"], rt["누적거래량"]]
+        if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+            return False
 
-        df = self.universe[code]["price_df"].copy()
-        today = datetime.now().strftime("%Y%m%d")
-        df.loc[today] = today_price_data
+        df = self.get_rsi_df(code)
+        if df is None:
+            return False
 
-        diff = df["close"].diff(1)
-        up = np.where(diff > 0, diff, 0)
-        down = np.where(diff < 0, -diff, 0)
-        au = pd.Series(up, index=df.index.astype(str)).rolling(window=14).mean()
-        ad = pd.Series(down, index=df.index.astype(str)).rolling(window=14).mean()
-        df["RSI(14)"] = au / (au + ad) * 100
-        df["ma20"] = df["close"].rolling(window=20, min_periods=1).mean()
-        df["ma60"] = df["close"].rolling(window=60, min_periods=1).mean()
+        latest = df.iloc[-1]
 
-        rsi = df.iloc[-1]["RSI(14)"]
-        ma20 = df.iloc[-1]["ma20"]
-        ma60 = df.iloc[-1]["ma60"]
-        close = rt["현재가"]
+        rsi = latest["RSI(14)"]
+        ma20 = latest["ma20"]
+        ma60 = latest["ma60"]
+        close = latest["close"]
+        price_diff = latest["price_diff_14d_pct"]
 
-        idx = df.index.get_loc(today) - 14
-        close_14days_ago = df.iloc[idx]["close"]
-        price_diff = (close - close_14days_ago) / close_14days_ago * 100
+        if pd.isna(rsi) or pd.isna(ma20) or pd.isna(ma60) or pd.isna(close) or pd.isna(price_diff):
+            return False
 
         if not (ma20 > ma60 and rsi < 25 and price_diff < -2):
             return False
@@ -200,28 +258,49 @@ class RSIStrategy(QThread):
         if (self.get_balance_count() + self.get_buy_order_count()) >= 10:
             return False
 
-        budget = self.deposit / (10 - (self.get_balance_count() + self.get_buy_order_count()))
+        rt = self.kiwoom.universe_realtime_transaction_info.get(code)
+        if not rt:
+            return False
+
         bid = rt["(최우선)매수호가"]
+        if bid <= 0:
+            return False
+
+        budget = self.deposit / (10 - (self.get_balance_count() + self.get_buy_order_count()))
         quantity = math.floor(budget / bid)
+
         if quantity < 1:
             return False
 
         amount = quantity * bid
         estimated_amount = math.floor(amount * 1.00015)
-        
+
         if self.deposit < estimated_amount:
             return False
 
-        result=self.kiwoom.send_order("send_buy_order", "1001", 1, code, quantity, bid, "00")
+        result = self.kiwoom.send_order("send_buy_order", "2001", 1, code, quantity, bid, "00")
 
         if result == 0:
             self.deposit -= estimated_amount
+
+            save_position_strategy(
+                code=code,
+                code_name=self.universe[code]["code_name"],
+                strategy_name=self.strategy_name,
+                quantity=quantity,
+                buy_price=bid,
+            )
+
             send_message(f"RSI매수 주문: {self.universe[code]['code_name']} {quantity}주 {bid}원")
-            self.kiwoom.order[code] = {"주문구분": "매수", "미체결수량": quantity}
+            self.kiwoom.order[code] = {
+                "주문구분": "매수",
+                "미체결수량": quantity,
+                "strategy_name": self.strategy_name,
+            }
             return True
-        else:
-            send_message(f"RSI매수 주문 실패: {self.universe[code]['code_name']} result={result}")
-            return False
+
+        send_message(f"RSI매수 주문 실패: {self.universe[code]['code_name']} result={result}")
+        return False
 
     def get_balance_count(self):
         balance_count = len(self.kiwoom.balance)
@@ -243,28 +322,56 @@ class RSIStrategy(QThread):
                 buy_order_count += 1
         return buy_order_count
 
-    def run(self):
-        while self.is_init_success:
-            try:
-                if not check_transaction_open():
-                    print("장 시간이 아니므로 대기합니다.")
-                    send_message("장 시간이 아니므로 대기합니다.")
-                    time.sleep(60)
-                    continue
+    def check_code(self, code):
+        if code not in self.universe:
+            return False
 
-                for idx, code in enumerate(self.universe.keys(), start=1):
-                    print(f"[{idx}/{len(self.universe)}_{self.universe[code]['code_name']}]")
-                    time.sleep(0.5)
+        if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+            return False
 
-                    if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
-                        continue
-                    if code in self.kiwoom.balance:
-                        if self.check_sell_signal(code):
-                            self.order_sell(code)
-                    else:
-                        self.check_buy_signal_and_order(code)
+        if code in self.kiwoom.balance:
+            owner_strategy = get_position_strategy(code)
 
-            except Exception:
-                error_msg = traceback.format_exc()
-                print(error_msg)
-                send_message(error_msg)
+            if owner_strategy != self.strategy_name:
+                return False
+
+            if self.check_sell_signal(code):
+                return self.order_sell(code)
+
+            return False
+
+        return self.check_buy_signal_and_order(code)
+
+    # def run(self):
+    #     print(f"[{self.strategy_name}] run 시작 / is_init_success={self.is_init_success}")
+    #     while self.is_init_success:
+    #         try:
+    #             if not check_transaction_open():
+    #                 print("장 시간이 아니므로 대기합니다.")
+    #                 send_message("장 시간이 아니므로 대기합니다.")
+    #                 time.sleep(60)
+    #                 continue
+                
+    #             # 장중 잔고 변동을 주기적으로 반영한다.
+    #             self.kiwoom.get_balance()
+
+    #             for idx, code in enumerate(self.universe.keys(), start=1):
+    #                 print(f"[{self.strategy_name}] [{idx}/{len(self.universe)}_{self.universe[code]['code_name']}]")
+    #                 time.sleep(0.5)
+
+    #                 if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+    #                     continue
+    #                 if code in self.kiwoom.balance:
+    #                     owner_strategy = get_position_strategy(code)
+    #                     if owner_strategy != self.strategy_name:
+    #                         continue
+
+    #                     if self.check_sell_signal(code):
+    #                         self.order_sell(code)
+    #                 else:
+    #                     self.check_buy_signal_and_order(code)
+
+    #         except Exception:
+    #             error_msg = traceback.format_exc()
+    #             print(error_msg)
+    #             send_message(error_msg)

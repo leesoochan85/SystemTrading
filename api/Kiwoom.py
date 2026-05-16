@@ -5,6 +5,7 @@ import time
 import pandas as pd
 from util.const import *
 from util.notifier import send_message
+from util.db_helper import delete_position_strategy
 
 class Kiwoom(QAxWidget):
     def __init__(self):
@@ -91,7 +92,7 @@ class Kiwoom(QAxWidget):
             self.tr_data = self._to_int (deposit)
             print (self.tr_data)
 
-        elif rqname =="opt10075_req":   #미체결 주문 수신
+        elif rqname == "opt10075_req":   # 미체결 주문 수신
             for i in range(tr_data_cnt):
                 code = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목코드")
                 code_name = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목명")
@@ -109,34 +110,39 @@ class Kiwoom(QAxWidget):
 
                 code = code.strip()
                 code_name = code_name.strip()
-                order_number = str(int(order_number.strip()))
-                order_status = order_status.strip()
-                order_quantity = int(order_quantity.strip())
-                order_price = int(order_price.strip())
 
-                current_price = int(current_price.strip().lstrip('+').lstrip('-'))
-                order_type = order_type.strip().lstrip('+').lstrip('-')
-                left_quantity = int(left_quantity.strip())
-                executed_quantity = int(executed_quantity.strip())
+                order_number = order_number.strip()
+                order_number = str(int(order_number)) if order_number else ""
+
+                order_status = order_status.strip()
+                order_quantity = self._to_int(order_quantity)
+                order_price = self._to_int(order_price)
+                current_price = self._to_int(current_price.strip().lstrip("+").lstrip("-"))
+                order_type = order_type.strip().lstrip("+").lstrip("-")
+                left_quantity = self._to_int(left_quantity)
+                executed_quantity = self._to_int(executed_quantity)
                 orderd_at = orderd_at.strip()
                 fee = self._to_int(fee)
                 tax = self._to_int(tax)
 
-                self.order[code] = {'종목코드': code, 
-                                    '종목명': code_name, 
-                                    '주문번호': order_number, 
-                                    '주문상태': order_status, 
-                                    '주문수량': order_quantity, 
-                                    '주문가격': order_price, 
-                                    '현재가': current_price, 
-                                    '매매구분': order_type, 
-                                    '미체결수량': left_quantity, 
-                                    '체결량': executed_quantity, 
-                                    '시간': orderd_at, 
-                                    '당일매매수수료': fee, 
-                                    '당일매매세금': tax
-                                    }
-            self.tr_data=self.order
+                self.order[code] = {
+                    "종목코드": code,
+                    "종목명": code_name,
+                    "주문번호": order_number,
+                    "주문상태": order_status,
+                    "주문수량": order_quantity,
+                    "주문가격": order_price,
+                    "현재가": current_price,
+                    "매매구분": order_type,
+                    "미체결수량": left_quantity,
+                    "체결량": executed_quantity,
+                    "시간": orderd_at,
+                    "당일매매수수료": fee,
+                    "당일매매세금": tax,
+                }
+
+            # 중요: 미체결 주문이 0건이어도 항상 tr_data 세팅
+            self.tr_data = self.order
 
         elif rqname == "opw00018_req": #잔고 데이터 수신
             for i in range(tr_data_cnt):
@@ -258,7 +264,7 @@ class Kiwoom(QAxWidget):
                     elif item_name == "주문가능수량":
                         normalized_name = "매매가능수량"
                         
-                    self.balance[code].update({item_name: data})
+                    self.balance[code].update({normalized_name: data})
             
         if int(s_gubun) == 0:
             print("* 주문 출력(self.order)")
@@ -279,11 +285,22 @@ class Kiwoom(QAxWidget):
                     f"{executed_quantity}주 "
                     f"{order_info.get('체결가', 0)}원"
                 )
+                    
+                order_type = str(order_info.get("주문구분", ""))
+                if "매도" in order_type and left_quantity == 0:
+                    delete_position_strategy(code)
+
         elif int(s_gubun)==1:
             print("* 잔고 출력(self.balance)")
             print(self.balance)
             
     def get_order(self):
+        old_strategy_map = {
+            code: info.get("strategy_name")
+            for code, info in self.order.items()
+            if info.get("strategy_name")
+        }   
+        self.order={}
         self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
         self.dynamicCall("SetInputValue(QString, QString)", "전체종목구분", "0")
         self.dynamicCall("SetInputValue(QString, QString)", "체결구분", "0")
@@ -291,9 +308,15 @@ class Kiwoom(QAxWidget):
         self.dynamicCall("CommRqData(QString, QString, int, QString)", "opt10075_req", "opt10075", 0, "0002")
 
         self.tr_event_loop.exec_()
+        for code, strategy_name in old_strategy_map.items():
+            if code in self.order and strategy_name:
+                self.order[code]["strategy_name"] = strategy_name
+
         return self.tr_data
 
     def get_balance(self):
+        self.balance={}
+
         self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
         self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
         self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")

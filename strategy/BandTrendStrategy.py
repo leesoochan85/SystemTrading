@@ -7,32 +7,43 @@ import numpy as np
 import pandas as pd
 from PyQt5.QtCore import QThread
 
-from api.Kiwoom import Kiwoom
 from util.const import get_fid
-from util.db_helper import check_table_exists, execute_sql, insert_df_to_db
+from util.db_helper import (
+    check_table_exists, 
+    execute_sql, 
+    insert_df_to_db,
+    save_position_strategy,
+    get_position_strategy,
+    delete_position_strategy,
+    )
 from util.make_up_universe import get_universe
 from util.notifier import send_message
 from util.time_helper import check_transaction_closed, check_transaction_open
 
 
 class BandTrendStrategy(QThread):
-    def __init__(self):
+    def __init__(self, kiwoom, auto_init=True):
         super().__init__()
         self.strategy_name = "BandTrendStrategy"
-        self.kiwoom = Kiwoom()
+        self.kiwoom = kiwoom
         self.universe = {}
         self.deposit = 0
         self.is_init_success = False
-        self.init_strategy()
+
+        if auto_init:
+            self.init_strategy()
 
     def init_strategy(self):
         try:
-            self.check_and_get_universe()
-            self.check_and_get_price_data()
             self.kiwoom.get_order()
             self.kiwoom.get_balance()
+
+            self.check_and_get_universe()
+            self.check_and_get_price_data()
+            
             self.deposit = self.kiwoom.get_deposit()
             self.set_universe_real_time()
+
             self.is_init_success = True
             send_message("[BandTrendStrategy] 초기화 완료")
         except Exception:
@@ -46,28 +57,44 @@ class BandTrendStrategy(QThread):
         universe_df = universe_df[universe_df["종목코드"].str.fullmatch(r"\d{6}", na=False)]
         universe_df = universe_df.drop_duplicates(subset=["종목코드"])
 
+        self.universe = {
+            code: {"code_name": name, "holding": False}
+            for code, name in zip(universe_df["종목코드"], universe_df["종목명"])
+        }
+        
+
+        for code, balance_info in self.kiwoom.balance.items():
+            code = str(code).strip().zfill(6)
+            code_name = balance_info.get("종목명") or self.kiwoom.get_master_code_name(code) or code
+
+            if code not in self.universe:
+                self.universe[code] = {
+                    "code_name": code_name,
+                    "holding": True,
+                }
+                print(f"[보유종목 유니버스 추가] {code} {code_name}")
+            else:
+                self.universe[code]["holding"] = True
+
         now = datetime.now().strftime("%Y%m%d")
         save_df = pd.DataFrame(
             {
-                "code": universe_df["종목코드"].tolist(),
-                "code_name": universe_df["종목명"].tolist(),
-                "created_at": [now] * len(universe_df),
+                "code": list(self.universe.keys()),
+                "code_name": [v["code_name"] for v in self.universe.values()],
+                "holding": [v.get("holding", False) for v in self.universe.values()],
+                "created_at": [now] * len(self.universe),
             }
         )
         insert_df_to_db(self.strategy_name, "universe", save_df)
-
-        self.universe = {
-            code: {"code_name": name}
-            for code, name in zip(universe_df["종목코드"], universe_df["종목명"])
-        }
         print(self.universe)
 
     def check_and_get_price_data(self):
         for idx, code in enumerate(self.universe.keys(), start=1):
             print(f"{idx}/{len(self.universe)}) {code}")
-            if check_transaction_closed() and not check_table_exists(self.strategy_name, code):
+            if not check_table_exists(self.strategy_name, code):
                 price_df = self.kiwoom.get_price_data(code)
                 insert_df_to_db(self.strategy_name, code, price_df)
+                self.universe[code]["price_df"] = price_df
                 continue
 
             if check_transaction_closed():
@@ -78,17 +105,33 @@ class BandTrendStrategy(QThread):
                 if not last_date or last_date[0] != now:
                     price_df = self.kiwoom.get_price_data(code)
                     insert_df_to_db(self.strategy_name, code, price_df)
-            else:
-                sql = "select * from '{}'".format(code)
-                cur = execute_sql(self.strategy_name, sql)
-                cols = [column[0] for column in cur.description]
-                price_df = pd.DataFrame.from_records(data=cur.fetchall(), columns=cols)
-                price_df = price_df.set_index("index")
-                self.universe[code]["price_df"] = price_df
+           
+            sql = "select * from '{}'".format(code)
+            cur = execute_sql(self.strategy_name, sql)
+            cols = [column[0] for column in cur.description]
+            price_df = pd.DataFrame.from_records(data=cur.fetchall(), columns=cols)
+            price_df = price_df.set_index("index")
+            self.universe[code]["price_df"] = price_df
 
     def set_universe_real_time(self):
-        codes = ";".join(map(str, self.universe.keys()))
-        self.kiwoom.set_real_reg("1000", codes, get_fid("체결시간"), "0")
+        fids = ";".join([
+            get_fid("체결시간"),
+            get_fid("현재가"),
+            get_fid("시가"),
+            get_fid("고가"),
+            get_fid("저가"),
+            get_fid("누적거래량"),
+            get_fid("(최우선)매도호가"),
+            get_fid("(최우선)매수호가"),
+        ])
+
+        codes = list(self.universe.keys())
+        chunk_size = 90
+
+        for i in range(0, len(codes), chunk_size):
+            screen_no = str(1200 + (i // chunk_size))
+            code_chunk = ";".join(codes[i:i + chunk_size])
+            self.kiwoom.set_real_reg(screen_no, code_chunk, fids, "0")
 
     def get_today_price_df(self, code):
         if code not in self.universe or "price_df" not in self.universe[code]:
@@ -160,12 +203,22 @@ class BandTrendStrategy(QThread):
     def order_sell(self, code):
         quantity = self.kiwoom.balance[code]["보유수량"]
         ask = self.kiwoom.universe_realtime_transaction_info[code]["(최우선)매도호가"]
+
         if quantity < 1:
-            return
-        result = self.kiwoom.send_order("send_sell_order", "1001", 2, code, quantity, ask, "00")
+            return False
+
+        result = self.kiwoom.send_order("send_sell_order", "2003", 2, code, quantity, ask, "00")
+
         if result == 0:
             send_message(f"[추세추종 매도] {self.universe[code]['code_name']} {quantity}주 {ask}원")
-            self.kiwoom.order[code] = {"주문구분": "매도", "미체결수량": quantity}
+            self.kiwoom.order[code] = {
+                "주문구분": "매도",
+                "미체결수량": quantity,
+                "strategy_name": self.strategy_name,
+            }
+            return True
+
+        return False
 
     def check_buy_signal_and_order(self, code):
         if not check_transaction_open():
@@ -202,11 +255,20 @@ class BandTrendStrategy(QThread):
         if self.deposit < estimated_amount:
             return False
 
-        result = self.kiwoom.send_order("send_buy_order", "1001", 1, code, quantity, bid, "00")
-        if result == 0:
+        result = self.kiwoom.send_order("send_buy_order", "2003", 1, code, quantity, bid, "00")
+        if result == 0:            
             self.deposit -= estimated_amount
+            save_position_strategy(
+                code=code,
+                code_name=self.universe[code]["code_name"],
+                strategy_name=self.strategy_name,
+                quantity=quantity,
+                buy_price=bid,
+            )
             send_message(f"[추세추종 매수] {self.universe[code]['code_name']} {quantity}주 {bid}원")
-            self.kiwoom.order[code] = {"주문구분": "매수", "미체결수량": quantity}
+            self.kiwoom.order[code] = {"주문구분": "매수", 
+                                       "미체결수량": quantity, 
+                                       "strategy_name": self.strategy_name,}
             return True
         return False
 
@@ -224,25 +286,55 @@ class BandTrendStrategy(QThread):
                 buy_order_count += 1
         return buy_order_count
 
-    def run(self):
-        while self.is_init_success:
-            try:
-                if not check_transaction_open():
-                    print("장 시간이 아니므로 대기합니다.")
-                    time.sleep(60)
-                    continue
-                for idx, code in enumerate(self.universe.keys(), start=1):
-                    print(f"[{idx}/{len(self.universe)}_{self.universe[code]['code_name']}]")
-                    time.sleep(0.5)
-                    if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
-                        continue
-                    if code in self.kiwoom.balance:
-                        if self.check_sell_signal(code):
-                            self.order_sell(code)
-                    else:
-                        self.check_buy_signal_and_order(code)
-            except Exception:
-                error_msg = traceback.format_exc()
-                print(error_msg)
-                send_message(error_msg)
-                time.sleep(5)
+    def check_code(self, code):
+        if code not in self.universe:
+            return False
+
+        if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+            return False
+
+        if code in self.kiwoom.balance:
+            owner_strategy = get_position_strategy(code)
+
+            if owner_strategy != self.strategy_name:
+                return False
+
+            if self.check_sell_signal(code):
+                return self.order_sell(code)
+
+            return False
+
+        return self.check_buy_signal_and_order(code)
+
+    # def run(self):
+    #     print("[BandTrendStrategy] run 시작")
+    #     while self.is_init_success:
+    #         try:
+    #             if not check_transaction_open():
+    #                 print("장 시간이 아니므로 대기합니다.")
+    #                 time.sleep(60)
+    #                 continue
+
+    #             # 장중 잔고 변동을 주기적으로 반영한다.
+    #             self.kiwoom.get_balance()
+
+    #             for idx, code in enumerate(self.universe.keys(), start=1):
+    #                 print(f"[{self.strategy_name}] [{idx}/{len(self.universe)}_{self.universe[code]['code_name']}]")
+    #                 time.sleep(0.5)
+    #                 # if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+    #                 #     continue
+    #                 # if code in self.kiwoom.balance:
+    #                 #     owner_strategy =get_position_strategy(code)
+
+    #                 #     if owner_strategy != self.strategy_name:
+    #                 #         continue
+
+    #                 #     if self.check_sell_signal(code):
+    #                 #         self.order_sell(code)
+    #                 # else:
+    #                 #     self.check_buy_signal_and_order(code)
+    #         except Exception:
+    #             error_msg = traceback.format_exc()
+    #             print(error_msg)
+    #             send_message(error_msg)
+    #             time.sleep(5)

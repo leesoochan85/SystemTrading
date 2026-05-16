@@ -3,10 +3,11 @@ from strategy.RSIStrategy import *
 from strategy.BandTrendStrategy import *
 from strategy.BandReversionStrategy import *
 from strategy.HighBreakoutStrategy import *
+from strategy.StrategyManager import StrategyManager
 import sys
 
 app=QApplication(sys.argv)
-# kiwoom = Kiwoom()
+kiwoom = Kiwoom()
 # kospi_code_list=kiwoom.get_code_list_by_market("0")
 # print(kospi_code_list)
 # for code in kospi_code_list:
@@ -40,17 +41,33 @@ app=QApplication(sys.argv)
 # codes = '005930;007700;000660;'
 # kiwoom.set_real_reg("1000", codes, fids, "0")
 
-rsi_strategy = RSIStrategy()
-rsi_strategy.start()
+print("RSI 객체 생성 시작")
+rsi_strategy = RSIStrategy(kiwoom, auto_init=False)
+print("RSI 객체 생성 완료")
 
-high_breakout_strategy = HighBreakoutStrategy()
-high_breakout_strategy.start()
+print("HighBreakout 객체 생성 시작")
+high_breakout_strategy = HighBreakoutStrategy(kiwoom, auto_init=False)
+print("HighBreakout 객체 생성 완료")
 
-# band_combine_strategy = BandCombine()
-# # band_combine_strategy.start()
+print("BandTrend 객체 생성 시작")
+band_trend_strategy = BandTrendStrategy(kiwoom, auto_init=False)
+print("BandTrend 객체 생성 완료")
 
-# band_trebd_strategy = BandTrendStrategy()
-# band_trebd_strategy.start()
+print("BandReversion 객체 생성 시작")
+band_reversion_strategy = BandReversionStrategy(kiwoom, auto_init=False)
+print("BandReversion 객체 생성 완료")
 
+print("전략 매니저 시작")
+manager = StrategyManager(
+    kiwoom,
+    [
+        rsi_strategy,
+        high_breakout_strategy,
+        band_trend_strategy,
+        band_reversion_strategy,
+    ],
+)
+manager.start()
+print("전략 매니저 시작 완료")
 
 app.exec_()

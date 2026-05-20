@@ -38,6 +38,10 @@ class StrategyManager(QObject):
 
         self.last_news_sent_at = 0
         self.news_send_interval = 600  # 10분
+        
+        self.market_open_interval = 1000        # 1초
+        self.market_closed_interval = 300000    # 5분
+        self.current_timer_interval = None
 
     def start(self):
         print("[StrategyManager] start 호출")
@@ -51,9 +55,19 @@ class StrategyManager(QObject):
         self.initialize_strategies()
 
         # 1초마다 한 종목씩 검사
-        self.timer.start(1000)
-        print("[StrategyManager] 타이머 시작")
+        self.set_timer_interval(self.market_closed_interval)
+        print("[StrategyManager] 타이머 시작")  
 
+    def set_timer_interval(self, interval_ms):
+        if self.current_timer_interval == interval_ms:
+            return
+
+        self.timer.start(interval_ms)
+        self.current_timer_interval = interval_ms
+
+        print(f"[StrategyManager] 타이머 간격 변경: {interval_ms / 1000:.0f}초")
+        
+        
     def get_code_name(self, code):
         for strategy in self.strategies:
             if code in strategy.universe:
@@ -203,8 +217,11 @@ class StrategyManager(QObject):
 
             # 전략 검사는 장중에만 실행
             if not check_transaction_open():
-                print("[StrategyManager] 장 시간이 아니므로 전략 검사는 대기합니다.")
+                self.set_timer_interval(self.market_closed_interval)
+                print("[StrategyManager] 장 시간이 아니므로 5분 후 다시 확인합니다.")
                 return
+
+            self.set_timer_interval(self.market_open_interval)
 
             if not self.universe_codes:
                 print("[StrategyManager] 검사할 유니버스가 없습니다.")

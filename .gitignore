@@ -14,3 +14,15 @@ env/
 
 .vscode/
 .env
+
+kiwoom/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+*.sqlite3
+*.xlsx
+*.csv
+.env
+.vscode/

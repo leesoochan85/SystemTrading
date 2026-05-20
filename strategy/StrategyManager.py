@@ -212,12 +212,18 @@ class StrategyManager(QObject):
 
             # 한 바퀴 시작 시점에만 계좌 상태 갱신
             if self.current_index == 0:
-                print("[StrategyManager] 루프 시작 - 미체결/잔고 조회")
+                print("[StrategyManager] 루프 시작 - 미체결 조회 전")
                 self.kiwoom.get_order()
+                print("[StrategyManager] 미체결 조회 완료")
+
+                print("[StrategyManager] 잔고 조회 전")
                 self.kiwoom.get_balance()
+                print("[StrategyManager] 잔고 조회 완료")
 
                 if time.time() - self.last_deposit_sync_at >= self.deposit_sync_interval:
+                    print("[StrategyManager] 예수금 동기화 전")
                     self.sync_deposit_from_kiwoom()
+                    print("[StrategyManager] 예수금 동기화 완료")
                 else:
                     self.sync_deposit_to_strategies()
 

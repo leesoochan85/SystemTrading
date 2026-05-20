@@ -113,6 +113,7 @@ class HighBreakoutStrategy(QThread):
 
             if not check_table_exists(self.strategy_name, code):
                 price_df = self.kiwoom.get_price_data(code)
+                time.sleep(4)
                 insert_df_to_db(self.strategy_name, code, price_df)
                 self.universe[code]["price_df"] = price_df
                 continue

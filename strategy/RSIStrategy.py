@@ -16,6 +16,7 @@ from util.make_up_universe import get_universe
 from util.notifier import send_message
 from util.const import get_fid
 from util.time_helper import (
+    check_adjacent_transaction_closed_for_buying,
     check_transaction_closed,
     check_transaction_open,
 )
@@ -229,6 +230,8 @@ class RSIStrategy(QThread):
             return False
         
     def check_buy_signal_and_order(self, code):
+        if check_adjacent_transaction_closed_for_buying():
+            return False
         if not check_transaction_open():
             return False
 
@@ -274,7 +277,7 @@ class RSIStrategy(QThread):
             return False
 
         amount = quantity * bid
-        estimated_amount = math.floor(amount * 1.00015)
+        estimated_amount = math.floor(amount * 1.00035)
 
         if self.deposit < estimated_amount:
             return False
@@ -297,6 +300,7 @@ class RSIStrategy(QThread):
                 "주문구분": "매수",
                 "미체결수량": quantity,
                 "strategy_name": self.strategy_name,
+                "order_time": time.time(),
             }
             return True
 

@@ -9,6 +9,7 @@ from util.db_helper import (
     init_sent_news_table,
     is_news_sent,
     save_sent_news,
+    delete_position_strategy,
 )
 from datetime import datetime
 from util.news_helper import (
@@ -38,10 +39,15 @@ class StrategyManager(QObject):
 
         self.last_news_sent_at = 0
         self.news_send_interval = 600  # 10분
-        
+
         self.market_open_interval = 1000        # 1초
         self.market_closed_interval = 300000    # 5분
         self.current_timer_interval = None
+
+        self.buy_order_cancel_after = 600 #10분 후 자동취소
+        self.pending_buy_cancellations = {}
+        self.last_order_sync_at = 0
+        self.order_sync_interval = 60  # 장중 미체결/잔고 점검 주기: 60초
 
     def start(self):
         print("[StrategyManager] start 호출")
@@ -55,8 +61,11 @@ class StrategyManager(QObject):
         self.initialize_strategies()
 
         # 1초마다 한 종목씩 검사
-        self.set_timer_interval(self.market_closed_interval)
-        print("[StrategyManager] 타이머 시작")  
+        if check_transaction_open():
+            self.set_timer_interval(self.market_open_interval)
+        else:
+            self.set_timer_interval(self.market_closed_interval)
+        print("[StrategyManager] 타이머 시작")
 
     def set_timer_interval(self, interval_ms):
         if self.current_timer_interval == interval_ms:
@@ -65,9 +74,6 @@ class StrategyManager(QObject):
         self.timer.start(interval_ms)
         self.current_timer_interval = interval_ms
 
-        print(f"[StrategyManager] 타이머 간격 변경: {interval_ms / 1000:.0f}초")
-        
-        
     def get_code_name(self, code):
         for strategy in self.strategies:
             if code in strategy.universe:
@@ -98,6 +104,7 @@ class StrategyManager(QObject):
             print("[StrategyManager] 잔고 조회 시작")
             self.kiwoom.get_balance()
             print("[StrategyManager] 잔고 조회 완료")
+            self.last_order_sync_at = time.time()
 
             print("[StrategyManager] 예수금 조회 시작")
             self.sync_deposit_from_kiwoom()
@@ -207,47 +214,229 @@ class StrategyManager(QObject):
             send_message(error_msg)
             self.last_news_sent_at = now
 
+    def refresh_order_and_balance_state(self, allow_buy_cancel=True):
+        """
+        미체결 주문과 잔고를 최신화한 뒤,
+        취소 완료 여부와 전량 매도 완료 여부를 정리한다.
+        """
+        self.kiwoom.get_order()
+        self.kiwoom.get_balance()
+
+        if allow_buy_cancel:
+            self.cancel_stale_buy_orders()
+
+        self.cleanup_cancelled_buy_positions()
+        self.cleanup_sold_positions()
+
+        self.last_order_sync_at = time.time()
+
+    def cancel_stale_buy_orders(self):
+        now = time.time()
+
+        for code, order_info in list(self.kiwoom.order.items()):
+            try:
+                order_type = str(order_info.get("주문구분", "")).strip()
+                remain_qty = int(order_info.get("미체결수량", 0) or 0)
+                strategy_name = order_info.get("strategy_name", "")
+                order_time = order_info.get("order_time", 0)
+                order_no = order_info.get("주문번호") or order_info.get("order_no") or ""
+
+                # 매수 미체결 주문만 관리
+                if order_type != "매수":
+                    continue
+
+                if remain_qty <= 0:
+                    continue
+
+                # 이미 취소 요청을 보낸 주문이면 다시 보내지 않음
+                if code in self.pending_buy_cancellations:
+                    continue
+
+                # 프로그램 실행 전부터 존재하던 미체결 주문은
+                # 최초 확인 시점부터 10분을 새로 계산
+                if not order_time:
+                    order_info["order_time"] = now
+                    continue
+
+                if now - order_time < self.buy_order_cancel_after:
+                    continue
+
+                if not order_no:
+                    print(f"[StrategyManager] 매수취소 불가 - 주문번호 없음: {code}")
+                    continue
+
+                code_name = self.get_code_name(code)
+
+                result = self.kiwoom.send_order(
+                    "send_buy_cancel_order",
+                    "3001",
+                    3,              # 매수취소
+                    code,
+                    remain_qty,     # 남아 있는 수량만 취소
+                    0,
+                    "00",
+                    order_no,
+                )
+
+                if result == 0:
+                    self.pending_buy_cancellations[code] = {
+                        "strategy_name": strategy_name,
+                        "requested_at": now,
+                        "remaining_quantity": remain_qty,
+                        "missing_confirmations": 0,
+                    }
+
+                    send_message(
+                        f"[매수 미체결 취소요청] {code_name}({code}) "
+                        f"잔량 {remain_qty}주 / 전략: {strategy_name}"
+                    )
+                    print(
+                        f"[StrategyManager] 매수 미체결 취소 요청 완료: "
+                        f"{code} / 잔량 {remain_qty}"
+                    )
+
+                else:
+                    send_message(
+                        f"[매수 미체결 자동취소 실패] {code_name}({code}) "
+                        f"result={result}"
+                    )
+
+            except Exception:
+                error_msg = traceback.format_exc()
+                print(error_msg)
+                send_message(error_msg)
+
+    def cleanup_cancelled_buy_positions(self):
+        """
+        매수 취소 요청 이후 실제 결과를 확인한다.
+
+        - 일부라도 체결되어 잔고가 있으면 전략 DB 유지
+        - 미체결 주문에서도 사라지고 잔고도 없으면
+        전량 미체결 취소 완료로 판단하여 전략 DB 삭제
+        """
+        for code, cancel_info in list(self.pending_buy_cancellations.items()):
+            try:
+                # 아직 미체결 주문 목록에 남아 있으면 취소 처리 중
+                if code in self.kiwoom.order:
+                    cancel_info["missing_confirmations"] = 0
+                    continue
+
+                # 미체결 목록에서 사라졌고 실제 보유가 있으면 일부 체결된 상태
+                if code in self.kiwoom.balance:
+                    quantity = int(self.kiwoom.balance[code].get("보유수량", 0) or 0)
+
+                    if quantity > 0:
+                        self.pending_buy_cancellations.pop(code, None)
+
+                        print(
+                            f"[StrategyManager] 일부 체결 후 잔량 취소 완료 - "
+                            f"포지션 DB 유지: {code} / 보유수량 {quantity}"
+                        )
+                        send_message(
+                            f"[일부 체결 후 잔량 취소 완료] "
+                            f"{self.get_code_name(code)}({code}) "
+                            f"보유수량 {quantity}주 / 포지션 유지"
+                        )
+                        continue
+
+                # 조회 반영 지연 가능성이 있으므로 2회 연속 확인 후 삭제
+                cancel_info["missing_confirmations"] = (
+                    cancel_info.get("missing_confirmations", 0) + 1
+                )
+
+                if cancel_info["missing_confirmations"] < 2:
+                    continue
+
+                delete_position_strategy(code)
+                self.pending_buy_cancellations.pop(code, None)
+
+                print(
+                    f"[StrategyManager] 전량 미체결 매수취소 완료 - "
+                    f"포지션 DB 삭제: {code}"
+                )
+                send_message(
+                    f"[전량 미체결 매수취소 완료] "
+                    f"{self.get_code_name(code)}({code}) 포지션 DB 삭제"
+                )
+
+            except Exception:
+                error_msg = traceback.format_exc()
+                print(error_msg)
+                send_message(error_msg)
+
+    def cleanup_sold_positions(self):
+        for code, order_info in list(self.kiwoom.order.items()):
+            try:
+                order_type = order_info.get("주문구분")
+                remain_qty = int(order_info.get("미체결수량", 0) or 0)
+
+                # 매도 주문이었고 미체결이 없으며 현재 잔고에도 없으면 전량 매도 완료로 판단
+                if order_type != "매도":
+                    continue
+
+                if remain_qty > 0:
+                    continue
+
+                if code in self.kiwoom.balance:
+                    continue
+
+                delete_position_strategy(code)
+                self.kiwoom.order.pop(code, None)
+
+                print(f"[StrategyManager] 전량 매도 완료 - 포지션 DB 삭제: {code}")
+                send_message(f"[전량 매도 완료] {self.get_code_name(code)}({code}) 포지션 DB 삭제")
+
+            except Exception:
+                error_msg = traceback.format_exc()
+                print(error_msg)
+                send_message(error_msg)
+                
     def step(self):
         if not self.is_running or not self.is_initialized:
             return
 
         try:
-            # 장중이 아니어도 뉴스는 전송
+            now = time.time()
+
+            # 뉴스는 장중 여부와 관계없이 10분 간격으로 확인
             self.send_one_economy_news_if_needed()
 
-            # 전략 검사는 장중에만 실행
+            # 장외: 전략 검사는 하지 않고, 5분마다 상태 정리만 수행
             if not check_transaction_open():
                 self.set_timer_interval(self.market_closed_interval)
-                print("[StrategyManager] 장 시간이 아니므로 5분 후 다시 확인합니다.")
+
+                self.refresh_order_and_balance_state(allow_buy_cancel=False)
+
+                print(
+                    "[StrategyManager] 장 시간이 아니므로 "
+                    "주문/잔고 상태만 확인하고 대기합니다."
+                )
                 return
 
+            # 장중: 종목 검사는 1초마다 진행
             self.set_timer_interval(self.market_open_interval)
+
+            # 미체결/잔고 조회는 매초가 아니라 60초마다 수행
+            if now - self.last_order_sync_at >= self.order_sync_interval:
+                self.refresh_order_and_balance_state(allow_buy_cancel=True)
+
+            # 예수금은 기존처럼 5분마다 실제 계좌와 동기화
+            if now - self.last_deposit_sync_at >= self.deposit_sync_interval:
+                self.sync_deposit_from_kiwoom()
+            else:
+                self.sync_deposit_to_strategies()
 
             if not self.universe_codes:
                 print("[StrategyManager] 검사할 유니버스가 없습니다.")
                 return
 
-            # 한 바퀴 시작 시점에만 계좌 상태 갱신
-            if self.current_index == 0:
-                print("[StrategyManager] 루프 시작 - 미체결 조회 전")
-                self.kiwoom.get_order()
-                print("[StrategyManager] 미체결 조회 완료")
-
-                print("[StrategyManager] 잔고 조회 전")
-                self.kiwoom.get_balance()
-                print("[StrategyManager] 잔고 조회 완료")
-
-                if time.time() - self.last_deposit_sync_at >= self.deposit_sync_interval:
-                    print("[StrategyManager] 예수금 동기화 전")
-                    self.sync_deposit_from_kiwoom()
-                    print("[StrategyManager] 예수금 동기화 완료")
-                else:
-                    self.sync_deposit_to_strategies()
-
             code = self.universe_codes[self.current_index]
             code_name = self.get_code_name(code)
 
-            print(f"[Manager] [{self.current_index + 1}/{len(self.universe_codes)}_{code_name}]")
+            print(
+                f"[Manager] "
+                f"[{self.current_index + 1}/{len(self.universe_codes)}_{code_name}]"
+            )
 
             for strategy in self.strategies:
                 if not strategy.is_init_success:

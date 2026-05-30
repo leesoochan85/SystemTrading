@@ -18,7 +18,7 @@ from util.db_helper import (
     )
 from util.make_up_universe import get_universe
 from util.notifier import send_message
-from util.time_helper import check_transaction_closed, check_transaction_open
+from util.time_helper import check_adjacent_transaction_closed_for_buying, check_transaction_closed, check_transaction_open
 
 
 class BandTrendStrategy(QThread):
@@ -222,6 +222,8 @@ class BandTrendStrategy(QThread):
         return False
 
     def check_buy_signal_and_order(self, code):
+        if check_adjacent_transaction_closed_for_buying():
+            return False
         if not check_transaction_open():
             return False
         if code in self.kiwoom.balance:
@@ -269,7 +271,8 @@ class BandTrendStrategy(QThread):
             send_message(f"[추세추종 매수] {self.universe[code]['code_name']} {quantity}주 {bid}원")
             self.kiwoom.order[code] = {"주문구분": "매수", 
                                        "미체결수량": quantity, 
-                                       "strategy_name": self.strategy_name,}
+                                       "strategy_name": self.strategy_name,
+                                       "order_time": time.time(),}
             return True
         return False
 

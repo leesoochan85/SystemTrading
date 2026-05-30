@@ -109,6 +109,10 @@ class Kiwoom(QAxWidget):
                 tax = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "당일매매세금")
 
                 code = code.strip()
+                if code.startswith("A"):
+                    code = code[1:]
+                code = code.zfill(6)
+
                 code_name = code_name.strip()
 
                 order_number = order_number.strip()
@@ -134,6 +138,7 @@ class Kiwoom(QAxWidget):
                     "주문가격": order_price,
                     "현재가": current_price,
                     "매매구분": order_type,
+                    "주문구분": order_type,
                     "미체결수량": left_quantity,
                     "체결량": executed_quantity,
                     "시간": orderd_at,
@@ -155,8 +160,14 @@ class Kiwoom(QAxWidget):
                 total_purchase_price = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "총매입가")
                 available_quantity = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "매매가능수량") 
 
-                code = code.strip()[1:]
+                code = code.strip()
+
+                if code.startswith("A"):
+                    code = code[1:]
+
+                code = code.zfill(6)
                 code_name = code_name.strip()
+
                 quantity = self._to_int(quantity)
                 purchase_price = self._to_int(purchase_price)
                 return_rate = self._to_float(return_rate)
@@ -228,7 +239,15 @@ class Kiwoom(QAxWidget):
         
         for fid in s_fid_list.split(";"):
             if fid in FID_CODES:
-                code = self.dynamicCall("GetChejanData(int)", '9001')[1:]
+                raw_code = str(self.dynamicCall("GetChejanData(int)", "9001")).strip()
+
+                if raw_code.startswith("A"):
+                    code = raw_code[1:]
+                else:
+                    code = raw_code
+
+                code = code.zfill(6)
+
                 data = self.dynamicCall("GetChejanData(int)", fid)
                
                 raw_data = self.dynamicCall("GetChejanData(int)", fid)
@@ -286,20 +305,24 @@ class Kiwoom(QAxWidget):
                     f"{order_info.get('체결가', 0)}원"
                 )
                     
-                order_type = str(order_info.get("주문구분", ""))
-                if "매도" in order_type and left_quantity == 0:
+                order_type = str(order_info.get("주문구분", "")).strip().lstrip("+").lstrip("-")
+
+                if order_type == "매도" and executed_quantity > 0 and left_quantity == 0:
                     delete_position_strategy(code)
+                    print(f"[Kiwoom] 전량 매도 체결 확인 - 포지션 DB 삭제: {code}")
 
         elif int(s_gubun)==1:
             print("* 잔고 출력(self.balance)")
             print(self.balance)
             
     def get_order(self):
-        old_strategy_map = {
-            code: info.get("strategy_name")
+        old_order_meta = {
+            code: {
+                "strategy_name": info.get("strategy_name"),
+                "order_time": info.get("order_time"),
+            }
             for code, info in self.order.items()
-            if info.get("strategy_name")
-        }   
+        }  
         self.order={}
         self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
         self.dynamicCall("SetInputValue(QString, QString)", "전체종목구분", "0")
@@ -308,9 +331,15 @@ class Kiwoom(QAxWidget):
         self.dynamicCall("CommRqData(QString, QString, int, QString)", "opt10075_req", "opt10075", 0, "0002")
 
         self.tr_event_loop.exec_()
-        for code, strategy_name in old_strategy_map.items():
-            if code in self.order and strategy_name:
-                self.order[code]["strategy_name"] = strategy_name
+        for code, old_info in old_order_meta.items():
+            if code not in self.order:
+                continue
+
+            if old_info.get("strategy_name"):
+                self.order[code]["strategy_name"] = old_info["strategy_name"]
+
+            if old_info.get("order_time"):
+                self.order[code]["order_time"] = old_info["order_time"]
 
         return self.tr_data
 

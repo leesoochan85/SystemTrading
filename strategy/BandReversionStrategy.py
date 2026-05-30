@@ -18,7 +18,7 @@ from util.db_helper import (
 )
 from util.make_up_universe import get_universe
 from util.notifier import send_message
-from util.time_helper import check_transaction_closed, check_transaction_open
+from util.time_helper import check_adjacent_transaction_closed_for_buying, check_transaction_closed, check_transaction_open
 
 
 class BandReversionStrategy(QThread):
@@ -232,6 +232,8 @@ class BandReversionStrategy(QThread):
         return False
 
     def check_buy_signal_and_order(self, code):
+        if check_adjacent_transaction_closed_for_buying():
+            return False
         if not check_transaction_open():
             return False
         if code in self.kiwoom.balance:
@@ -281,6 +283,7 @@ class BandReversionStrategy(QThread):
                 "주문구분": "매수",
                 "미체결수량": quantity,
                 "strategy_name": self.strategy_name,
+                "order_time": time.time(),
             }
             return True
         return False

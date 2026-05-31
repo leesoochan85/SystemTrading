@@ -6,8 +6,8 @@ import pandas as pd
 from util.const import *
 from util.notifier import send_message
 from util.db_helper import (
-    delete_position_strategy,
     get_position_detail,
+    save_order_event,
     save_order_log,
     save_trade_fill,
 )
@@ -23,6 +23,7 @@ class Kiwoom(QAxWidget):
         self.order={}
         self.balance={}
         self.universe_realtime_transaction_info = {}
+        self.pending_order_strategy = {}
 
     def _make_kiwoom_instance(self):
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
@@ -228,10 +229,26 @@ class Kiwoom(QAxWidget):
                      code, #매매할 종목코드, ex) "005930"
                      order_quantity, #주문 수량
                      order_price, order_classification,#거래구분 ex) "00": 지정가, "03": 시장가, "05": 조건부지정가, "10": 최유리지정가, "20": 최우선지정가
-                       origin_order_number="" #정정 주문의 주문번호 // 신규주문시는 빈 값
+                       origin_order_number="", #정정 주문의 주문번호 // 신규주문시는 빈 값
+                       strategy_name=""
                        ):
+        code = str(code).zfill(6)
+        order_type_text = {1: "매수", 2: "매도", 3: "매수취소", 4: "매도취소"}.get(order_type, str(order_type))
+        request_id = f"REQ_{time.time_ns()}_{code}"
+        if strategy_name:
+            self.pending_order_strategy[code] = strategy_name
+
         order_result = self.dynamicCall("SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
                                          [rqname, screen_no, self.account_number, order_type, code, order_quantity, order_price, order_classification, origin_order_number])
+
+        save_order_event(
+            event_key=request_id, request_id=request_id, original_order_no=origin_order_number,
+            code=code, code_name=self.get_master_code_name(code), order_type=order_type_text,
+            strategy_name=strategy_name, order_quantity=order_quantity, order_price=order_price,
+            remaining_quantity=order_quantity,
+            order_status="전송요청" if order_result == 0 else f"전송실패({order_result})",
+            event_type="REQUESTED" if order_result == 0 else "FAILED",
+        )
         return order_result
     
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
@@ -312,7 +329,7 @@ class Kiwoom(QAxWidget):
                     .lstrip("-")
                 )
 
-                strategy_name = order_info.get("strategy_name", "")
+                strategy_name = order_info.get("strategy_name", "") or self.pending_order_strategy.get(code, "")
 
                 save_order_log(
                     order_no=order_no,
@@ -324,6 +341,9 @@ class Kiwoom(QAxWidget):
                     order_price=order_info.get("주문가격", 0),
                     remaining_quantity=left_quantity,
                     order_status=order_status,
+                    filled_quantity=executed_quantity,
+                    filled_price=executed_price,
+                    fill_no=fill_no,
                 )
 
                 position_info = None
@@ -350,6 +370,11 @@ class Kiwoom(QAxWidget):
                             if position_info is not None
                             else None
                         ),
+                        buy_date=(
+                            position_info["created_at"]
+                            if position_info is not None
+                            else None
+                        ),
                     )
 
                 if order_status == "체결" or (executed_quantity > 0 and left_quantity == 0):
@@ -361,10 +386,6 @@ class Kiwoom(QAxWidget):
                 )
                     
                 order_type = str(order_info.get("주문구분", "")).strip().lstrip("+").lstrip("-")
-
-                if order_type == "매도" and executed_quantity > 0 and left_quantity == 0:
-                    delete_position_strategy(code)
-                    print(f"[Kiwoom] 전량 매도 체결 확인 - 포지션 DB 삭제: {code}")
 
         elif int(s_gubun)==1:
             print("* 잔고 출력(self.balance)")

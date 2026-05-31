@@ -233,7 +233,7 @@ class HighBreakoutStrategy(QThread):
         if self.deposit < estimated_amount:
             return False
 
-        result = self.kiwoom.send_order("send_buy_order", "2004", 1, code, quantity, bid, "00")
+        result = self.kiwoom.send_order("send_buy_order", "2004", 1, code, quantity, bid, "00", strategy_name=self.strategy_name)
         if result == 0:
             self.deposit -= estimated_amount
 
@@ -241,8 +241,8 @@ class HighBreakoutStrategy(QThread):
                 code=code,
                 code_name=self.universe[code]["code_name"],
                 strategy_name=self.strategy_name,
-                quantity=quantity,
-                buy_price=bid,
+                quantity=0,
+                buy_price=0,
             )
             send_message(
                 f"[신고가돌파 매수] {self.universe[code]['code_name']}({code}) "
@@ -295,7 +295,7 @@ class HighBreakoutStrategy(QThread):
         if ask <= 0:
             return False
 
-        result = self.kiwoom.send_order("send_sell_order", "2004", 2, code, quantity, ask, "00")
+        result = self.kiwoom.send_order("send_sell_order", "2004", 2, code, quantity, ask, "00", strategy_name=self.strategy_name)
         if result == 0:
             send_message(f"[신고가돌파 매도] {self.universe[code]['code_name']}({code}) {quantity}주 {ask}원")
             self.kiwoom.order[code] = {

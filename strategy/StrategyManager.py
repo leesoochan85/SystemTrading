@@ -4,7 +4,7 @@ from PyQt5.QtCore import QObject, QTimer
 
 from util.time_helper import check_transaction_open
 from util.notifier import send_message, get_updates
-from util.const import Telgram_chat_ID
+from util.const import Telegram_chat_ID
 from util.db_helper import (
     init_position_strategy_table,
     init_sent_news_table,
@@ -13,9 +13,12 @@ from util.db_helper import (
     save_sent_news,
     delete_position_strategy,
     get_strategy_position_counts,
+    get_filled_position_codes,   
     get_today_order_count,
     get_today_realized_pnl,
     get_last_sent_news_at,
+    save_daily_equity,
+    save_strategy_daily_summaries,
 )
 from datetime import datetime
 from util.news_helper import (
@@ -334,6 +337,7 @@ class StrategyManager(QObject):
             print("[StrategyManager] 예수금 조회 시작")
             self.sync_deposit_from_kiwoom()
             print("[StrategyManager] 예수금 조회 완료")
+            self.save_performance_snapshot()
 
             for strategy in self.strategies:
                 try:
@@ -439,6 +443,20 @@ class StrategyManager(QObject):
             send_message(error_msg)
             self.last_news_sent_at = now
 
+    def save_performance_snapshot(self):
+        """현재 계좌 상태와 전략별 당일 실적을 monitoring.db에 갱신한다."""
+        evaluation_amount, total_assets = save_daily_equity(
+            deposit=self.deposit,
+            balance=self.kiwoom.balance,
+        )
+        save_strategy_daily_summaries(
+            [strategy.strategy_name for strategy in self.strategies]
+        )
+        print(
+            f"[StrategyManager] 실전 성과 저장: 예수금 {self.deposit:,}원 / "
+            f"평가금액 {evaluation_amount:,}원 / 총자산 {total_assets:,}원"
+        )
+
     def refresh_order_and_balance_state(self, allow_buy_cancel=True):
         """
         미체결 주문과 잔고를 최신화한 뒤,
@@ -454,6 +472,7 @@ class StrategyManager(QObject):
         self.cleanup_sold_positions()
 
         self.last_order_sync_at = time.time()
+        self.save_performance_snapshot()
 
     def cancel_stale_buy_orders(self):
         now = time.time()
@@ -501,6 +520,7 @@ class StrategyManager(QObject):
                     0,
                     "00",
                     order_no,
+                    strategy_name=strategy_name,
                 )
 
                 if result == 0:
@@ -590,32 +610,41 @@ class StrategyManager(QObject):
                 send_message(error_msg)
 
     def cleanup_sold_positions(self):
-        for code, order_info in list(self.kiwoom.order.items()):
+        """
+        실제 체결 포지션 중 현재 계좌 잔고에 더 이상 없는 종목을 정리한다.
+
+        - 일부 매도 후 잔고가 남아 있으면 삭제하지 않는다.
+        - 전량 매도되어 잔고에서 사라졌을 때만 삭제한다.
+        - 미체결 매도 주문이 남아 있으면 아직 삭제하지 않는다.
+        """
+        for code in get_filled_position_codes():
             try:
-                order_type = order_info.get("주문구분")
+                # 아직 실제 잔고에 남아 있으면 일부 매도 또는 보유 중
+                if code in self.kiwoom.balance:
+                    continue
+
+                order_info = self.kiwoom.order.get(code, {})
+                order_type = str(order_info.get("주문구분", "") or "").strip()
                 remain_qty = int(order_info.get("미체결수량", 0) or 0)
 
-                # 매도 주문이었고 미체결이 없으며 현재 잔고에도 없으면 전량 매도 완료로 판단
-                if order_type != "매도":
-                    continue
-
-                if remain_qty > 0:
-                    continue
-
-                if code in self.kiwoom.balance:
+                # 매도 미체결이 남아 있다면 아직 정리하지 않음
+                if order_type == "매도" and remain_qty > 0:
                     continue
 
                 delete_position_strategy(code)
                 self.kiwoom.order.pop(code, None)
 
-                print(f"[StrategyManager] 전량 매도 완료 - 포지션 DB 삭제: {code}")
-                send_message(f"[전량 매도 완료] {self.get_code_name(code)}({code}) 포지션 DB 삭제")
+                print(f"[StrategyManager] 잔고 없음 확인 - 포지션 DB 삭제: {code}")
+                send_message(
+                    f"[전량 매도 완료] "
+                    f"{self.get_code_name(code)}({code}) 포지션 DB 삭제"
+                )
 
             except Exception:
                 error_msg = traceback.format_exc()
                 print(error_msg)
                 send_message(error_msg)
-                
+
     def step(self):
         if not self.is_running or not self.is_initialized:
             return

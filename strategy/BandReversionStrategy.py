@@ -218,7 +218,7 @@ class BandReversionStrategy(QThread):
         if quantity < 1:
             return False
 
-        result = self.kiwoom.send_order("send_sell_order", "2002", 2, code, quantity, ask, "00")
+        result = self.kiwoom.send_order("send_sell_order", "2002", 2, code, quantity, ask, "00", strategy_name=self.strategy_name)
 
         if result == 0:
             send_message(f"[반전 매도] {self.universe[code]['code_name']} {quantity}주 {ask}원")
@@ -268,15 +268,15 @@ class BandReversionStrategy(QThread):
         if self.deposit < estimated_amount:
             return False
 
-        result = self.kiwoom.send_order("send_buy_order", "2002", 1, code, quantity, bid, "00")
+        result = self.kiwoom.send_order("send_buy_order", "2002", 1, code, quantity, bid, "00", strategy_name=self.strategy_name)
         if result == 0:
             self.deposit -= estimated_amount
             save_position_strategy(
                 code=code,
                 strategy_name=self.strategy_name,
                 code_name=self.universe[code]["code_name"],
-                buy_price=bid,
-                quantity=quantity,
+                buy_price=0,
+                quantity=0,
                 )
             send_message(f"[반전 매수] {self.universe[code]['code_name']} {quantity}주 {bid}원")
             self.kiwoom.order[code] = {

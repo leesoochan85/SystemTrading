@@ -5,7 +5,12 @@ import time
 import pandas as pd
 from util.const import *
 from util.notifier import send_message
-from util.db_helper import delete_position_strategy
+from util.db_helper import (
+    delete_position_strategy,
+    get_position_detail,
+    save_order_log,
+    save_trade_fill,
+)
 
 class Kiwoom(QAxWidget):
     def __init__(self):
@@ -296,6 +301,56 @@ class Kiwoom(QAxWidget):
                 left_quantity = order_info.get("미체결수량", 0)
                 executed_price = self._safe_int(order_info.get("체결가", 0))
                 code_name = order_info.get("종목명", code)
+
+                order_no = str(order_info.get("주문번호", "") or "").strip()
+                fill_no = str(order_info.get("체결번호", "") or "").strip()
+
+                order_type = (
+                    str(order_info.get("주문구분", "") or "")
+                    .strip()
+                    .lstrip("+")
+                    .lstrip("-")
+                )
+
+                strategy_name = order_info.get("strategy_name", "")
+
+                save_order_log(
+                    order_no=order_no,
+                    code=code,
+                    code_name=code_name,
+                    order_type=order_type,
+                    strategy_name=strategy_name,
+                    order_quantity=order_info.get("주문수량", 0),
+                    order_price=order_info.get("주문가격", 0),
+                    remaining_quantity=left_quantity,
+                    order_status=order_status,
+                )
+
+                position_info = None
+
+                if order_type == "매도":
+                    position_info = get_position_detail(code)
+
+                if fill_no and executed_quantity > 0 and executed_price > 0:
+                    save_trade_fill(
+                        fill_no=fill_no,
+                        order_no=order_no,
+                        code=code,
+                        code_name=code_name,
+                        order_type=order_type,
+                        strategy_name=(
+                            position_info["strategy_name"]
+                            if position_info is not None
+                            else strategy_name
+                        ),
+                        quantity=executed_quantity,
+                        price=executed_price,
+                        buy_price=(
+                            position_info["buy_price"]
+                            if position_info is not None
+                            else None
+                        ),
+                    )
 
                 if order_status == "체결" or (executed_quantity > 0 and left_quantity == 0):
                     send_message(

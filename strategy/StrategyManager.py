@@ -3,13 +3,19 @@ import traceback
 from PyQt5.QtCore import QObject, QTimer
 
 from util.time_helper import check_transaction_open
-from util.notifier import send_message
+from util.notifier import send_message, get_updates
+from util.const import Telgram_chat_ID
 from util.db_helper import (
     init_position_strategy_table,
     init_sent_news_table,
+    init_monitoring_tables,
     is_news_sent,
     save_sent_news,
     delete_position_strategy,
+    get_strategy_position_counts,
+    get_today_order_count,
+    get_today_realized_pnl,
+    get_last_sent_news_at,
 )
 from datetime import datetime
 from util.news_helper import (
@@ -48,12 +54,19 @@ class StrategyManager(QObject):
         self.pending_buy_cancellations = {}
         self.last_order_sync_at = 0
         self.order_sync_interval = 60  # 장중 미체결/잔고 점검 주기: 60초
+        
+        self.telegram_update_offset = None
+
+        self.command_timer = QTimer()
+        self.command_timer.timeout.connect(self.poll_telegram_commands)
+        self.command_check_interval = 3000  # 3초
 
     def start(self):
         print("[StrategyManager] start 호출")
         self.is_running = True
 
         init_sent_news_table()
+        init_monitoring_tables()
 
         # 프로그램 시작 직후 뉴스 1개 먼저 전송
         self.send_one_economy_news_if_needed()
@@ -65,7 +78,10 @@ class StrategyManager(QObject):
             self.set_timer_interval(self.market_open_interval)
         else:
             self.set_timer_interval(self.market_closed_interval)
+
+        self.command_timer.start(self.command_check_interval)
         print("[StrategyManager] 타이머 시작")
+        print("[StrategyManager] Telegram / status 명령대기")
 
     def set_timer_interval(self, interval_ms):
         if self.current_timer_interval == interval_ms:
@@ -79,6 +95,214 @@ class StrategyManager(QObject):
             if code in strategy.universe:
                 return strategy.universe[code].get("code_name", code)
         return code
+
+    def poll_telegram_commands(self):
+        """
+        Telegram에서 /status, /help 명령을 확인한다.
+
+        주의:
+        - 지정된 TELEGRAM_CHAT_ID의 메시지만 처리한다.
+        - 상태 출력 중 키움 TR 조회를 새로 요청하지 않는다.
+        """
+        try:
+            updates = get_updates(offset=self.telegram_update_offset)
+
+            for update in updates:
+                update_id = update.get("update_id")
+
+                if update_id is not None:
+                    self.telegram_update_offset = update_id + 1
+
+                message = update.get("message", {})
+                chat = message.get("chat", {})
+                incoming_chat_id = str(chat.get("id", ""))
+                text = str(message.get("text", "") or "").strip()
+
+                if incoming_chat_id != str(Telegram_chat_ID):
+                    continue
+
+                command = text.split("@")[0].lower()
+
+                if command == "/status":
+                    send_message(
+                        self.build_status_message(),
+                        chat_id=incoming_chat_id,
+                    )
+
+                elif command == "/help":
+                    send_message(
+                        "[사용 가능한 명령]\n"
+                        "/status - 자동매매 현재 상태 확인",
+                        chat_id=incoming_chat_id,
+                    )
+
+        except Exception:
+            error_msg = traceback.format_exc()
+            print(error_msg)
+
+
+    def build_status_message(self):
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if self.last_order_sync_at:
+            balance_sync_text = datetime.fromtimestamp(
+                self.last_order_sync_at
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        else:
+            balance_sync_text = "아직 동기화되지 않음"
+
+        lines = [
+            "[자동매매 상태]",
+            f"조회 시각: {now_text}",
+            f"잔고/미체결 기준: {balance_sync_text}",
+            f"예수금: {self.deposit:,}원",
+            "",
+        ]
+
+        self._append_balance_status(lines)
+        self._append_strategy_status(lines)
+        self._append_pending_order_status(lines)
+        self._append_today_summary(lines)
+
+        return "\n".join(lines)
+
+
+    def _append_balance_status(self, lines):
+        balance = self.kiwoom.balance
+
+        lines.append(f"[현재 보유 종목] {len(balance)}개")
+
+        if not balance:
+            lines.append("- 없음")
+            lines.append("")
+            return
+
+        for code, info in balance.items():
+            code_name = info.get("종목명", code)
+            quantity = int(info.get("보유수량", 0) or 0)
+            buy_price = int(info.get("매입가", 0) or 0)
+
+            realtime_info = self.kiwoom.universe_realtime_transaction_info.get(code, {})
+            current_price = int(
+                realtime_info.get("현재가")
+                or info.get("현재가", 0)
+                or 0
+            )
+
+            if buy_price > 0:
+                return_rate = (current_price - buy_price) / buy_price * 100
+            else:
+                return_rate = float(info.get("수익률", 0) or 0)
+
+            lines.append(
+                f"- {code_name}({code}) {quantity}주 | "
+                f"매입 {buy_price:,} / 현재 {current_price:,} | "
+                f"{return_rate:+.2f}%"
+            )
+
+        lines.append("")
+
+
+    def _append_strategy_status(self, lines):
+        counts = get_strategy_position_counts()
+
+        lines.append("[전략별 보유 현황]")
+
+        for strategy in self.strategies:
+            count = counts.get(strategy.strategy_name, 0)
+            lines.append(f"- {strategy.strategy_name}: {count}개")
+
+        lines.append("")
+
+
+    def _append_pending_order_status(self, lines):
+        pending_orders = []
+
+        for code, info in self.kiwoom.order.items():
+            remain_quantity = int(info.get("미체결수량", 0) or 0)
+
+            if remain_quantity <= 0:
+                continue
+
+            pending_orders.append((code, info))
+
+        lines.append(f"[미체결 주문] {len(pending_orders)}건")
+
+        if not pending_orders:
+            lines.append("- 없음")
+            lines.append("")
+            return
+
+        for code, info in pending_orders:
+            code_name = info.get("종목명") or self.get_code_name(code)
+            order_type = info.get("주문구분", "-")
+            remain_quantity = int(info.get("미체결수량", 0) or 0)
+            order_price = int(info.get("주문가격", 0) or 0)
+            elapsed_text = self._get_order_elapsed_text(info)
+
+            lines.append(
+                f"- {code_name}({code}) {order_type} "
+                f"{remain_quantity}주 {order_price:,}원 | "
+                f"경과 {elapsed_text}"
+            )
+
+        lines.append("")
+
+
+    def _get_order_elapsed_text(self, order_info):
+        order_time = order_info.get("order_time")
+
+        if order_time:
+            elapsed_seconds = max(0, int(time.time() - float(order_time)))
+            minutes, seconds = divmod(elapsed_seconds, 60)
+            return f"{minutes}분 {seconds}초"
+
+        broker_time = str(order_info.get("시간", "") or "").strip()
+
+        if len(broker_time) == 6 and broker_time.isdigit():
+            try:
+                today = datetime.now().strftime("%Y%m%d")
+                ordered_at = datetime.strptime(
+                    today + broker_time,
+                    "%Y%m%d%H%M%S",
+                )
+                elapsed_seconds = max(
+                    0,
+                    int((datetime.now() - ordered_at).total_seconds()),
+                )
+                minutes, seconds = divmod(elapsed_seconds, 60)
+                return f"{minutes}분 {seconds}초"
+            except ValueError:
+                pass
+
+        return "확인 불가"
+
+
+    def _append_today_summary(self, lines):
+        order_count = get_today_order_count()
+        realized_pnl, excluded_count = get_today_realized_pnl()
+        last_news_sent_at = get_last_sent_news_at()
+
+        if last_news_sent_at:
+            last_news_text = (
+                f"{last_news_sent_at[0:4]}-{last_news_sent_at[4:6]}-"
+                f"{last_news_sent_at[6:8]} "
+                f"{last_news_sent_at[8:10]}:{last_news_sent_at[10:12]}:"
+                f"{last_news_sent_at[12:14]}"
+            )
+        else:
+            last_news_text = "전송 기록 없음"
+
+        lines.append("[오늘 요약]")
+        lines.append(f"- 매도 체결 손익(수수료·세금 전): {realized_pnl:+,}원")
+        lines.append(f"- 주문 횟수: {order_count}건")
+        lines.append(f"- 마지막 뉴스 전송: {last_news_text}")
+
+        if excluded_count > 0:
+            lines.append(
+                f"- 손익 계산 제외 매도 체결: {excluded_count}건 "
+                f"(매입가 기록 없음)"
+            )
 
     def sync_deposit_from_kiwoom(self):
         self.deposit = self.kiwoom.get_deposit()
@@ -96,6 +320,7 @@ class StrategyManager(QObject):
         try:
             init_position_strategy_table()
             init_sent_news_table()
+            init_monitoring_tables()
 
             print("[StrategyManager] 미체결 조회 시작")
             self.kiwoom.get_order()

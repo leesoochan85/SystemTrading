@@ -10,6 +10,7 @@ from util.db_helper import (
     save_order_event,
     save_order_log,
     save_trade_fill,
+    update_latest_sell_trade_costs,
 )
 
 class Kiwoom(QAxWidget):
@@ -24,6 +25,28 @@ class Kiwoom(QAxWidget):
         self.balance={}
         self.universe_realtime_transaction_info = {}
         self.pending_order_strategy = {}
+        
+        # 잔고 조회 안전성 관리
+        self.last_balance_query_success = False
+        self._waiting_for_balance_response = False
+        self.balance_request_timeout_ms = 10000  # 10초
+        
+        # 미체결 주문 조회 안전성 관리
+        self.last_order_query_success = False
+        self._waiting_for_order_response = False
+        self.order_request_timeout_ms = 10000  # 10초
+        
+        # 예수금 조회 안전성 관리
+        self.last_deposit = None
+        self.last_deposit_query_success = False
+        self._waiting_for_deposit_response = False
+        self.deposit_request_timeout_ms = 10000  # 10초
+        
+        # 지연 응답이 새 요청을 덮어쓰지 않도록 요청별 식별자 관리
+        self._safe_tr_request_seq = 0
+        self._active_order_rqname = None
+        self._active_balance_rqname = None
+        self._active_deposit_rqname = None
 
     def _make_kiwoom_instance(self):
         self.setControl("KHOPENAPI.KHOpenAPICtrl.1")
@@ -64,6 +87,18 @@ class Kiwoom(QAxWidget):
         code_name = self.dynamicCall("GetMasterCodeName(QString)", code)
         return code_name
 
+    def _next_safe_rqname(self, prefix):
+        """
+        같은 TR을 반복 요청하더라도 응답을 구분할 수 있도록
+        짧은 고유 요청명을 생성한다.
+        """
+        self._safe_tr_request_seq += 1
+
+        if self._safe_tr_request_seq > 999999:
+            self._safe_tr_request_seq = 1
+
+        return f"{prefix}_{self._safe_tr_request_seq:06d}"
+
     def _on_receive_tr_data(self, screen_no, rqname, trcode, record_name, next, unused1,unused2, unused3, unused4):
         print ("[Kiwoom] _on_receive_tr_data is called {} / {} / {}".format(screen_no,rqname, trcode))
         tr_data_cnt = self.dynamicCall("GetRepeatCnt(QString, QString)", trcode, rqname)
@@ -93,49 +128,123 @@ class Kiwoom(QAxWidget):
 
             self.tr_data=ohlcv
 
-        elif rqname == "opw00001_req": #예수금 데이터 수신
-            deposit = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, 0, "예수금")
-            self.tr_data = self._to_int (deposit)
-            print (self.tr_data)
+        elif rqname.startswith("DEP_"):  # 예수금 데이터 수신
+            # 현재 대기 중인 예수금 요청의 응답만 반영한다.
+            if (
+                rqname != self._active_deposit_rqname
+                or not self._waiting_for_deposit_response
+            ):
+                print(f"[Kiwoom] 지연된 예수금 응답 무시: {rqname}")
+                return
 
-        elif rqname == "opt10075_req":   # 미체결 주문 수신
+            deposit = self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode,
+                rqname,
+                0,
+                "예수금",
+            )
+
+            received_deposit = self._to_int(deposit)
+
+            self.last_deposit = received_deposit
+            self.tr_data = received_deposit
+            self.last_deposit_query_success = True
+            self._waiting_for_deposit_response = False
+            self._active_deposit_rqname = None
+
+            print(f"[Kiwoom] 예수금 조회 정상 완료: {received_deposit:,}원")
+
+        elif rqname.startswith("ORD_"):  # 미체결 주문 수신
+            # 현재 대기 중인 미체결 조회의 응답만 반영한다.
+            if (
+                rqname != self._active_order_rqname
+                or not self._waiting_for_order_response
+            ):
+                print(f"[Kiwoom] 지연된 미체결 주문 응답 무시: {rqname}")
+                return
+
+            received_order = {}
+
             for i in range(tr_data_cnt):
-                code = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목코드")
-                code_name = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목명")
-                order_number = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "주문번호")
-                order_status = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "주문상태")
-                order_quantity = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "주문수량")
-                order_price = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "주문가격")
-                current_price = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가")
-                order_type = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "매매구분")
-                left_quantity = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "미체결수량")
-                executed_quantity = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "체결량")
-                orderd_at = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "시간")
-                fee = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "당일매매수수료")
-                tax = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "당일매매세금")
+                code = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "종목코드"
+                )
+                code_name = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "종목명"
+                )
+                order_number = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "주문번호"
+                )
+                order_status = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "주문상태"
+                )
+                order_quantity = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "주문수량"
+                )
+                order_price = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "주문가격"
+                )
+                current_price = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "현재가"
+                )
+                order_type = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "매매구분"
+                )
+                left_quantity = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "미체결수량"
+                )
+                executed_quantity = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "체결량"
+                )
+                ordered_at = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "시간"
+                )
+                fee = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "당일매매수수료"
+                )
+                tax = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "당일매매세금"
+                )
 
-                code = code.strip()
+                code = str(code).strip()
+
                 if code.startswith("A"):
                     code = code[1:]
+
                 code = code.zfill(6)
+                code_name = str(code_name).strip()
 
-                code_name = code_name.strip()
-
-                order_number = order_number.strip()
+                order_number = str(order_number).strip()
                 order_number = str(int(order_number)) if order_number else ""
 
-                order_status = order_status.strip()
+                order_status = str(order_status).strip()
                 order_quantity = self._to_int(order_quantity)
                 order_price = self._to_int(order_price)
-                current_price = self._to_int(current_price.strip().lstrip("+").lstrip("-"))
-                order_type = order_type.strip().lstrip("+").lstrip("-")
+                current_price = self._to_int(
+                    str(current_price).strip().lstrip("+").lstrip("-")
+                )
+                order_type = str(order_type).strip().lstrip("+").lstrip("-")
                 left_quantity = self._to_int(left_quantity)
                 executed_quantity = self._to_int(executed_quantity)
-                orderd_at = orderd_at.strip()
+                ordered_at = str(ordered_at).strip()
                 fee = self._to_int(fee)
                 tax = self._to_int(tax)
 
-                self.order[code] = {
+                received_order[code] = {
                     "종목코드": code,
                     "종목명": code_name,
                     "주문번호": order_number,
@@ -147,24 +256,68 @@ class Kiwoom(QAxWidget):
                     "주문구분": order_type,
                     "미체결수량": left_quantity,
                     "체결량": executed_quantity,
-                    "시간": orderd_at,
+                    "시간": ordered_at,
                     "당일매매수수료": fee,
                     "당일매매세금": tax,
                 }
 
-            # 중요: 미체결 주문이 0건이어도 항상 tr_data 세팅
+            # 정상 응답이 도착한 경우에만 기존 미체결 주문 목록을 교체한다.
+            # tr_data_cnt == 0은 정상적으로 미체결 주문이 없는 상태이다.
+            self.order = received_order
             self.tr_data = self.order
+            self.last_order_query_success = True
+            self._waiting_for_order_response = False
+            self._active_order_rqname = None
 
-        elif rqname == "opw00018_req": #잔고 데이터 수신
+            print(
+                f"[Kiwoom] 미체결 주문 조회 정상 완료: "
+                f"{len(self.order)}건"
+            )
+        
+        elif rqname.startswith("BAL_"):  # 잔고 데이터 수신
+            # 현재 대기 중인 잔고 조회의 응답만 반영한다.
+            if (
+                rqname != self._active_balance_rqname
+                or not self._waiting_for_balance_response
+            ):
+                print(f"[Kiwoom] 지연된 잔고 응답 무시: {rqname}")
+                return
+
+            received_balance = {}
+
             for i in range(tr_data_cnt):
-                code = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목번호")
-                code_name = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "종목명")
-                quantity = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "보유수량")
-                purchase_price = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "매입가")
-                return_rate = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "수익률(%)")
-                current_price = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "현재가")
-                total_purchase_price = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "총매입가")
-                available_quantity = self.dynamicCall("GetCommData(QString, QString, int, QString)", trcode, rqname, i, "매매가능수량") 
+                code = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "종목번호"
+                )
+                code_name = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "종목명"
+                )
+                quantity = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "보유수량"
+                )
+                purchase_price = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "매입가"
+                )
+                return_rate = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "수익률(%)"
+                )
+                current_price = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "현재가"
+                )
+                total_purchase_price = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "총매입가"
+                )
+                available_quantity = self.dynamicCall(
+                    "GetCommData(QString, QString, int, QString)",
+                    trcode, rqname, i, "매매가능수량"
+                )
 
                 code = code.strip()
 
@@ -181,16 +334,29 @@ class Kiwoom(QAxWidget):
                 total_purchase_price = self._to_int(total_purchase_price)
                 available_quantity = self._to_int(available_quantity)
 
-                self.balance[code] = {'종목명' : code_name,
-                                      '보유수량': quantity,
-                                      '매입가': purchase_price,
-                                      '수익률': return_rate,
-                                      '현재가': current_price,
-                                      '매입금액': total_purchase_price,
-                                      '매매가능수량': available_quantity
-                                      }
-                self.tr_data=self.balance
+                received_balance[code] = {
+                    "종목명": code_name,
+                    "보유수량": quantity,
+                    "매입가": purchase_price,
+                    "수익률": return_rate,
+                    "현재가": current_price,
+                    "매입금액": total_purchase_price,
+                    "매매가능수량": available_quantity,
+                }
 
+            # 정상 응답이 도착한 경우에만 기존 잔고를 새 값으로 교체한다.
+            # tr_data_cnt == 0인 경우도 정상적인 전량 미보유 상태이므로 {}로 교체한다.
+            self.balance = received_balance
+            self.tr_data = self.balance
+            self.last_balance_query_success = True
+            self._waiting_for_balance_response = False
+            self._active_balance_rqname = None
+
+            print(
+                f"[Kiwoom] 잔고 조회 정상 완료: "
+                f"{len(self.balance)}종목"
+            )
+        
         self.tr_event_loop.exit()
         time.sleep(0.5)
 
@@ -217,12 +383,90 @@ class Kiwoom(QAxWidget):
         return df[::-1]
     
     def get_deposit(self):
-        self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
-        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
-        self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "2")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opw00001_req", "opw00001", 0, "0002")
-        self.tr_event_loop.exec_()
-        return self.tr_data
+        """
+        예수금 조회에 실패하거나 응답이 지연되면
+        마지막으로 정상 확인된 예수금을 유지한다.
+        """
+        previous_deposit = self.last_deposit
+
+        self.last_deposit_query_success = False
+        self._waiting_for_deposit_response = True
+
+        deposit_rqname = self._next_safe_rqname("DEP")
+        self._active_deposit_rqname = deposit_rqname
+        
+        try:
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "계좌번호",
+                self.account_number,
+            )
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "비밀번호입력매체구분",
+                "00",
+            )
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "조회구분",
+                "2",
+            )
+
+            request_result = self.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                deposit_rqname,
+                "opw00001",
+                0,
+                "0002",
+            )
+
+            # 키움 환경에 따라 정상 요청 반환값은 None 또는 0일 수 있음
+            if request_result not in (None, 0):
+                self._waiting_for_deposit_response = False
+                self._active_deposit_rqname = None
+                self.last_deposit_query_success = False
+                self.last_deposit = previous_deposit
+
+                print(
+                    f"[Kiwoom] 예수금 조회 요청 실패 "
+                    f"result={request_result} - 마지막 정상 예수금 유지"
+                )
+                return previous_deposit
+
+            QTimer.singleShot(
+                self.deposit_request_timeout_ms,
+                lambda requested_rqname=deposit_rqname:
+                    self._on_deposit_query_timeout(requested_rqname),
+            )
+
+            self.tr_event_loop.exec_()
+
+            if not self.last_deposit_query_success:
+                self.last_deposit = previous_deposit
+
+                print(
+                    "[Kiwoom] 예수금 응답 미확인 - "
+                    "마지막 정상 예수금 유지"
+                )
+
+                return previous_deposit
+
+            return self.last_deposit
+
+        except Exception as e:
+            self._waiting_for_deposit_response = False
+            self._active_deposit_rqname = None
+            self.last_deposit_query_success = False
+            self.last_deposit = previous_deposit
+
+            error_message = (
+                f"[Kiwoom] 예수금 조회 예외 - "
+                f"마지막 정상 예수금 유지: {e}"
+            )
+            print(error_message)
+            send_message(error_message)
+
+            return previous_deposit
     
     def send_order(self, rqname, #요청에 대한 별명, ex) 'send_buy_order'
                    screen_no, order_type,#매수/매도/취소 주문 구분, ex) 1: 매수, 2: 매도, 3: 매수취소, 4: 매도취소
@@ -318,6 +562,20 @@ class Kiwoom(QAxWidget):
                 left_quantity = order_info.get("미체결수량", 0)
                 executed_price = self._safe_int(order_info.get("체결가", 0))
                 code_name = order_info.get("종목명", code)
+                
+                fee_raw = order_info.get("당일매매 수수료")
+                tax_raw = order_info.get("당일매매세금")
+
+                fee = (
+                    self._safe_int(fee_raw)
+                    if fee_raw not in (None, "")
+                    else None
+                )
+                tax = (
+                    self._safe_int(tax_raw)
+                    if tax_raw not in (None, "")
+                    else None
+                )
 
                 order_no = str(order_info.get("주문번호", "") or "").strip()
                 fill_no = str(order_info.get("체결번호", "") or "").strip()
@@ -375,6 +633,8 @@ class Kiwoom(QAxWidget):
                             if position_info is not None
                             else None
                         ),
+                        fee=fee,
+                        tax=tax,
                     )
 
                 if order_status == "체결" or (executed_quantity > 0 and left_quantity == 0):
@@ -387,48 +647,306 @@ class Kiwoom(QAxWidget):
                     
                 order_type = str(order_info.get("주문구분", "")).strip().lstrip("+").lstrip("-")
 
-        elif int(s_gubun)==1:
+        elif int(s_gubun) == 1:
             print("* 잔고 출력(self.balance)")
             print(self.balance)
+
+            if code and code in self.balance:
+                balance_info = self.balance[code]
+
+                fee_raw = balance_info.get("당일매매 수수료")
+                tax_raw = balance_info.get("당일매매세금")
+
+                fee = (
+                    self._safe_int(fee_raw)
+                    if fee_raw not in (None, "")
+                    else None
+                )
+                tax = (
+                    self._safe_int(tax_raw)
+                    if tax_raw not in (None, "")
+                    else None
+                )
+
+                if fee is not None and tax is not None:
+                    update_latest_sell_trade_costs(
+                        code=code,
+                        fee=fee,
+                        tax=tax,
+                    )
             
     def get_order(self):
+        """
+        미체결 주문 조회에 실패하거나 응답이 지연되면
+        기존 주문 목록을 유지한다.
+
+        정상적으로 미체결 주문이 0건인 응답은 성공으로 처리되어
+        self.order = {}로 갱신된다.
+        """
+        previous_order = {
+            code: dict(info)
+            for code, info in self.order.items()
+        }
+
         old_order_meta = {
             code: {
                 "strategy_name": info.get("strategy_name"),
                 "order_time": info.get("order_time"),
             }
-            for code, info in self.order.items()
-        }  
-        self.order={}
-        self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
-        self.dynamicCall("SetInputValue(QString, QString)", "전체종목구분", "0")
-        self.dynamicCall("SetInputValue(QString, QString)", "체결구분", "0")
-        self.dynamicCall("SetInputValue(QString, QString)", "매매구분", "0")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opt10075_req", "opt10075", 0, "0002")
+            for code, info in previous_order.items()
+        }
 
-        self.tr_event_loop.exec_()
-        for code, old_info in old_order_meta.items():
-            if code not in self.order:
-                continue
+        self.last_order_query_success = False
+        self._waiting_for_order_response = True
 
-            if old_info.get("strategy_name"):
-                self.order[code]["strategy_name"] = old_info["strategy_name"]
+        order_rqname = self._next_safe_rqname("ORD")
+        self._active_order_rqname = order_rqname
 
-            if old_info.get("order_time"):
-                self.order[code]["order_time"] = old_info["order_time"]
+        try:
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "계좌번호",
+                self.account_number,
+            )
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "전체종목구분",
+                "0",
+            )
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "체결구분",
+                "0",
+            )
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "매매구분",
+                "0",
+            )
 
-        return self.tr_data
+            request_result = self.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                order_rqname,
+                "opt10075",
+                0,
+                "0002",
+            )
+
+            # 환경에 따라 정상 요청 반환값이 None 또는 0일 수 있으므로 둘 다 허용
+            if request_result not in (None, 0):
+                self._waiting_for_order_response = False
+                self._active_order_rqname = None
+                self.order = previous_order
+                self.tr_data = self.order
+
+                print(
+                    f"[Kiwoom] 미체결 주문 조회 요청 실패 "
+                    f"result={request_result} - 기존 주문 유지"
+                )
+                return self.order
+
+            QTimer.singleShot(
+                self.order_request_timeout_ms,
+                lambda requested_rqname=order_rqname:
+                    self._on_order_query_timeout(requested_rqname),
+            )
+
+            self.tr_event_loop.exec_()
+
+            if not self.last_order_query_success:
+                self.order = previous_order
+                self.tr_data = self.order
+
+                print(
+                    "[Kiwoom] 미체결 주문 응답 미확인 - "
+                    "기존 주문 유지"
+                )
+
+                return self.order
+
+            # 정상 응답으로 교체된 주문 중 계속 남아 있는 주문에는
+            # 전략명과 주문 시작 시각을 다시 연결한다.
+            for code, old_info in old_order_meta.items():
+                if code not in self.order:
+                    continue
+
+                if old_info.get("strategy_name"):
+                    self.order[code]["strategy_name"] = old_info["strategy_name"]
+
+                if old_info.get("order_time"):
+                    self.order[code]["order_time"] = old_info["order_time"]
+
+            return self.order
+
+        except Exception as e:
+            self._waiting_for_order_response = False
+            self._active_order_rqname = None
+            self.last_order_query_success = False
+            self.order = previous_order
+
+            error_message = (
+                f"[Kiwoom] 미체결 주문 조회 예외 - "
+                f"기존 주문 유지: {e}"
+            )
+            print(error_message)
+            send_message(error_message)
+
+            return self.order
+    
+    def _on_order_query_timeout(self, requested_rqname):
+        """
+        현재 진행 중인 미체결 요청이 제한시간 안에 완료되지 않은 경우에만
+        타임아웃으로 처리한다.
+        """
+        if (
+            requested_rqname != self._active_order_rqname
+            or not self._waiting_for_order_response
+        ):
+            return
+
+        self._waiting_for_order_response = False
+        self._active_order_rqname = None
+        self.last_order_query_success = False
+
+        print(
+            "[Kiwoom] 미체결 주문 조회 타임아웃 - "
+            "기존 주문 정보를 유지합니다."
+        )
+
+        self.tr_event_loop.exit()
+
+    def _on_balance_query_timeout(self, requested_rqname):
+        """
+        현재 진행 중인 잔고 요청이 제한시간 안에 완료되지 않은 경우에만
+        타임아웃으로 처리한다.
+        """
+        if (
+            requested_rqname != self._active_balance_rqname
+            or not self._waiting_for_balance_response
+        ):
+            return
+
+        self._waiting_for_balance_response = False
+        self._active_balance_rqname = None
+        self.last_balance_query_success = False
+
+        print(
+            "[Kiwoom] 잔고 조회 타임아웃 - "
+            "기존 잔고 정보를 유지합니다."
+        )
+
+        self.tr_event_loop.exit()    
+    
+    def _on_deposit_query_timeout(self, requested_rqname):
+        """
+        현재 진행 중인 예수금 요청이 제한시간 안에 완료되지 않은 경우에만
+        타임아웃으로 처리한다.
+        """
+        if (
+            requested_rqname != self._active_deposit_rqname
+            or not self._waiting_for_deposit_response
+        ):
+            return
+
+        self._waiting_for_deposit_response = False
+        self._active_deposit_rqname = None
+        self.last_deposit_query_success = False
+
+        print(
+            "[Kiwoom] 예수금 조회 타임아웃 - "
+            "마지막 정상 예수금을 유지합니다."
+        )
+
+        self.tr_event_loop.exit()
 
     def get_balance(self):
-        self.balance={}
+        """
+        잔고 조회에 실패하거나 응답이 지연되면 기존 잔고를 유지한다.
 
-        self.dynamicCall("SetInputValue(QString, QString)", "계좌번호", self.account_number)
-        self.dynamicCall("SetInputValue(QString, QString)", "비밀번호입력매체구분", "00")
-        self.dynamicCall("SetInputValue(QString, QString)", "조회구분", "1")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opw00018_req", "opw00018", 0, "0002")
+        정상적인 빈 잔고 응답은 성공으로 처리되어
+        self.balance = {}로 갱신된다.
+        """
+        previous_balance = {
+            code: dict(info)
+            for code, info in self.balance.items()
+        }
 
-        self.tr_event_loop.exec_()
-        return self.tr_data
+        self.last_balance_query_success = False
+        self._waiting_for_balance_response = True
+
+        balance_rqname = self._next_safe_rqname("BAL")
+        self._active_balance_rqname = balance_rqname
+
+        try:
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "계좌번호",
+                self.account_number,
+            )
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "비밀번호입력매체구분",
+                "00",
+            )
+            self.dynamicCall(
+                "SetInputValue(QString, QString)",
+                "조회구분",
+                "1",
+            )
+
+            request_result = self.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                balance_rqname,
+                "opw00018",
+                0,
+                "0002",
+            )
+
+            if request_result not in (None, 0):
+                self._waiting_for_balance_response = False
+                self._active_balance_rqname = None
+                self.balance = previous_balance
+                self.tr_data = self.balance
+
+                print(
+                    f"[Kiwoom] 잔고 조회 요청 실패 result={request_result} - "
+                    "기존 잔고 유지"
+                )
+                return self.balance
+
+            QTimer.singleShot(
+                self.balance_request_timeout_ms,
+                lambda requested_rqname=balance_rqname:
+                    self._on_balance_query_timeout(requested_rqname),
+            )
+
+            self.tr_event_loop.exec_()
+
+            if not self.last_balance_query_success:
+                self.balance = previous_balance
+                self.tr_data = self.balance
+
+                print(
+                    "[Kiwoom] 잔고 응답 미확인 - "
+                    "기존 잔고 유지"
+                )
+
+            return self.balance
+
+        except Exception as e:
+            self._waiting_for_balance_response = False
+            self._active_balance_rqname = None
+            self.last_balance_query_success = False
+            self.balance = previous_balance
+            self.tr_data = self.balance
+
+            error_message = (
+                f"[Kiwoom] 잔고 조회 예외 - 기존 잔고 유지: {e}"
+            )
+            print(error_message)
+            send_message(error_message)
+
+            return self.balance
     
     def set_real_reg(self, str_screen_no, str_code_list, #실시간 체결 정보 얻어올 종목 전달
                       str_fid_list, #체결 정보 중 제공받을 항목에 해당하는 fid

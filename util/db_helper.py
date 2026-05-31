@@ -34,7 +34,6 @@ def init_position_strategy_table():
             )
         """)
 
-
 def save_position_strategy(code, code_name, strategy_name, quantity, buy_price):
     init_position_strategy_table()
     with sqlite3.connect(POSITION_DB) as con:
@@ -47,7 +46,6 @@ def save_position_strategy(code, code_name, strategy_name, quantity, buy_price):
             int(buy_price or 0), _now_text()
         ))
 
-
 def get_position_strategy(code):
     init_position_strategy_table()
     with sqlite3.connect(POSITION_DB) as con:
@@ -55,7 +53,6 @@ def get_position_strategy(code):
             SELECT strategy_name FROM position_strategy WHERE code = ?
         """, (str(code).zfill(6),)).fetchone()
     return None if row is None else row[0]
-
 
 def get_position_detail(code):
     init_position_strategy_table()
@@ -71,6 +68,32 @@ def get_position_detail(code):
         "quantity": row[3], "buy_price": row[4], "created_at": row[5],
     }
 
+def get_all_position_details():
+    """
+    strategy_position.db의 전체 전략 포지션 정보를 코드 기준 딕셔너리로 반환한다.
+
+    quantity=0, buy_price=0인 매수 예약 행도 포함한다.
+    실제 잔고가 생겼는데 체결 반영이 누락된 경우를 찾기 위함이다.
+    """
+    init_position_strategy_table()
+
+    with sqlite3.connect(POSITION_DB) as con:
+        rows = con.execute("""
+            SELECT code, code_name, strategy_name, quantity, buy_price, created_at
+            FROM position_strategy
+        """).fetchall()
+
+    return {
+        str(row[0]).zfill(6): {
+            "code": str(row[0]).zfill(6),
+            "code_name": row[1],
+            "strategy_name": row[2],
+            "quantity": int(row[3] or 0),
+            "buy_price": float(row[4] or 0),
+            "created_at": row[5],
+        }
+        for row in rows
+    }
 
 def delete_position_strategy(code):
     init_position_strategy_table()
@@ -166,7 +189,6 @@ def check_table_exists(db_name, table_name):
         ).fetchone()
     return row is not None
 
-
 def insert_df_to_db(db_name, table_name, df, option="replace"):
     with sqlite3.connect(f"{db_name}.db") as con:
         df.to_sql(table_name, con, if_exists=option)
@@ -207,6 +229,18 @@ def _migrate_old_order_log_if_needed(con):
     legacy_name = f"order_log_snapshot_legacy_{datetime.now().strftime('%Y%m%d%H%M%S')}"
     con.execute(f"ALTER TABLE order_log RENAME TO {legacy_name}")
     print(f"[DB] 기존 order_log를 {legacy_name}로 보존하고 이벤트 이력 테이블을 생성합니다.")
+
+def _add_column_if_missing(con, table_name, column_name, column_type):
+    columns = {
+        row[1]
+        for row in con.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+
+    if column_name not in columns:
+        con.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+        )
+        print(f"[DB] {table_name}.{column_name} 컬럼을 추가했습니다.")
 
 def init_monitoring_tables():
     with sqlite3.connect(MONITORING_DB) as con:
@@ -261,6 +295,10 @@ def init_monitoring_tables():
                 sell_date TEXT NOT NULL,
                 sell_price INTEGER NOT NULL,
                 realized_pnl INTEGER,
+                gross_realized_pnl INTEGER,
+                fee INTEGER,
+                tax INTEGER,
+                net_realized_pnl INTEGER,
                 return_pct REAL,
                 sell_fill_no TEXT UNIQUE,
                 created_at TEXT NOT NULL
@@ -278,6 +316,41 @@ def init_monitoring_tables():
                 ADD COLUMN sell_order_no TEXT
             """)
 
+        _add_column_if_missing(
+            con,
+            "real_trades",
+            "gross_realized_pnl",
+            "INTEGER",
+        )
+        _add_column_if_missing(
+            con,
+            "real_trades",
+            "fee",
+            "INTEGER",
+        )
+        _add_column_if_missing(
+            con,
+            "real_trades",
+            "tax",
+            "INTEGER",
+        )
+        _add_column_if_missing(
+            con,
+            "real_trades",
+            "net_realized_pnl",
+            "INTEGER",
+        )
+
+        # 기존 저장 데이터는 수수료·세금 전 손익만 알고 있으므로
+        # gross_realized_pnl만 기존 realized_pnl 값으로 이관한다.
+        # 비용을 알 수 없는 과거 데이터의 net_realized_pnl은 NULL로 유지한다.
+        con.execute("""
+            UPDATE real_trades
+            SET gross_realized_pnl = realized_pnl
+            WHERE gross_realized_pnl IS NULL
+              AND realized_pnl IS NOT NULL
+        """)
+
         con.execute("""
             CREATE TABLE IF NOT EXISTS daily_equity (
                 date TEXT PRIMARY KEY,
@@ -285,14 +358,32 @@ def init_monitoring_tables():
                 evaluation_amount INTEGER NOT NULL,
                 total_assets INTEGER NOT NULL,
                 realized_pnl INTEGER NOT NULL,
+                gross_realized_pnl INTEGER,
+                net_realized_pnl INTEGER,
                 updated_at TEXT NOT NULL
             )
         """)
+        _add_column_if_missing(
+            con,
+            "daily_equity",
+            "gross_realized_pnl",
+            "INTEGER",
+        )
+        _add_column_if_missing(
+            con,
+            "daily_equity",
+            "net_realized_pnl",
+            "INTEGER",
+        )
         con.execute("""
             CREATE TABLE IF NOT EXISTS strategy_daily_summary (
                 date TEXT NOT NULL,
                 strategy_name TEXT NOT NULL,
                 realized_pnl INTEGER NOT NULL,
+                gross_realized_pnl INTEGER,
+                fee INTEGER,
+                tax INTEGER,
+                net_realized_pnl INTEGER,
                 invested_amount INTEGER NOT NULL,
                 daily_return_pct REAL NOT NULL,
                 trade_count INTEGER NOT NULL,
@@ -303,6 +394,30 @@ def init_monitoring_tables():
                 PRIMARY KEY (date, strategy_name)
             )
         """)
+        _add_column_if_missing(
+            con,
+            "strategy_daily_summary",
+            "gross_realized_pnl",
+            "INTEGER",
+        )
+        _add_column_if_missing(
+            con,
+            "strategy_daily_summary",
+            "fee",
+            "INTEGER",
+        )
+        _add_column_if_missing(
+            con,
+            "strategy_daily_summary",
+            "tax",
+            "INTEGER",
+        )
+        _add_column_if_missing(
+            con,
+            "strategy_daily_summary",
+            "net_realized_pnl",
+            "INTEGER",
+        )
 
 def save_order_event(
     event_key, code, code_name, order_type, strategy_name="", order_quantity=0,
@@ -363,13 +478,23 @@ def save_trade_fill(
     price,
     buy_price=None,
     buy_date=None,
+    fee=None,
+    tax=None,
 ):
     """
     체결번호 기준으로 체결을 저장한다.
 
-    - 매수 체결이면 실제 체결가 기준으로 position_strategy를 갱신한다.
-    - 매도 체결이면 실제 평균매입가 기준으로 real_trades를 저장한다.
-    - 동일 체결번호가 다시 들어오면 중복 반영하지 않는다.
+    - realized_pnl / gross_realized_pnl:
+      수수료·세금 전 손익
+    - fee / tax:
+      키움에서 확인된 당일 비용 스냅샷
+    - net_realized_pnl:
+      수수료·세금 정보가 확인된 경우에만 계산
+
+    주의:
+    키움 비용 FID는 당일 누적값일 수 있으므로,
+    동일 매도 주문의 분할체결 시 fee/tax를 합산하지 않고
+    가장 최근 수신값으로 교체한다.
     """
     if not fill_no or int(quantity or 0) <= 0 or int(price or 0) <= 0:
         return
@@ -377,7 +502,7 @@ def save_trade_fill(
     init_monitoring_tables()
 
     now = _now_text()
-    realized_pnl = None
+    gross_realized_pnl = None
     return_pct = None
     buy_price_value = None
 
@@ -385,7 +510,7 @@ def save_trade_fill(
         buy_price_value = float(buy_price)
 
     if order_type == "매도" and buy_price_value is not None:
-        realized_pnl = round(
+        gross_realized_pnl = round(
             (int(price) - buy_price_value) * int(quantity)
         )
 
@@ -394,6 +519,22 @@ def save_trade_fill(
             / buy_price_value
             * 100
         )
+
+    received_fee = None if fee is None else int(fee or 0)
+    received_tax = None if tax is None else int(tax or 0)
+
+    if (
+        gross_realized_pnl is not None
+        and received_fee is not None
+        and received_tax is not None
+    ):
+        net_realized_pnl = (
+            gross_realized_pnl
+            - received_fee
+            - received_tax
+        )
+    else:
+        net_realized_pnl = None
 
     with sqlite3.connect(MONITORING_DB) as con:
         cursor = con.execute("""
@@ -421,7 +562,7 @@ def save_trade_fill(
             int(quantity),
             int(price),
             buy_price_value,
-            realized_pnl,
+            gross_realized_pnl,
             now,
         ))
 
@@ -430,15 +571,19 @@ def save_trade_fill(
         if is_new_fill and order_type == "매도":
             normalized_order_no = str(order_no or "").strip()
 
-            # 주문번호가 있으면 같은 매도 주문의 분할체결을 한 거래로 묶는다.
-            # 주문번호가 없는 예외 상황에서는 체결번호별로 저장한다.
             if normalized_order_no:
                 trade_id = f"SELL_ORDER_{normalized_order_no}"
             else:
                 trade_id = f"SELL_FILL_{fill_no}"
 
             existing_trade = con.execute("""
-                SELECT quantity, sell_price, realized_pnl
+                SELECT
+                    quantity,
+                    sell_price,
+                    realized_pnl,
+                    gross_realized_pnl,
+                    fee,
+                    tax
                 FROM real_trades
                 WHERE trade_id = ?
             """, (trade_id,)).fetchone()
@@ -460,11 +605,15 @@ def save_trade_fill(
                         sell_date,
                         sell_price,
                         realized_pnl,
+                        gross_realized_pnl,
+                        fee,
+                        tax,
+                        net_realized_pnl,
                         return_pct,
                         sell_fill_no,
                         created_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     trade_id,
                     str(code).zfill(6),
@@ -476,15 +625,22 @@ def save_trade_fill(
                     buy_price_value,
                     now,
                     new_sell_price,
-                    realized_pnl,
+                    gross_realized_pnl,
+                    gross_realized_pnl,
+                    received_fee,
+                    received_tax,
+                    net_realized_pnl,
                     return_pct,
-                    str(fill_no),   # 최초 체결번호를 대표값으로 보관
+                    str(fill_no),
                     now,
                 ))
+
             else:
                 old_quantity = int(existing_trade[0] or 0)
                 old_sell_price = float(existing_trade[1] or 0)
-                old_realized_pnl = existing_trade[2]
+                old_gross_realized_pnl = existing_trade[3]
+                old_fee = existing_trade[4]
+                old_tax = existing_trade[5]
 
                 total_quantity = old_quantity + new_quantity
 
@@ -493,10 +649,42 @@ def save_trade_fill(
                     + new_quantity * new_sell_price
                 ) / total_quantity
 
-                if old_realized_pnl is None or realized_pnl is None:
-                    total_realized_pnl = None
+                if (
+                    old_gross_realized_pnl is None
+                    or gross_realized_pnl is None
+                ):
+                    total_gross_realized_pnl = None
                 else:
-                    total_realized_pnl = int(old_realized_pnl) + int(realized_pnl)
+                    total_gross_realized_pnl = (
+                        int(old_gross_realized_pnl)
+                        + int(gross_realized_pnl)
+                    )
+
+                # 비용 FID는 누적 스냅샷일 수 있으므로 더하지 않고
+                # 새로 수신한 값이 있으면 최신값으로 교체한다.
+                final_fee = (
+                    received_fee
+                    if received_fee is not None
+                    else old_fee
+                )
+                final_tax = (
+                    received_tax
+                    if received_tax is not None
+                    else old_tax
+                )
+
+                if (
+                    total_gross_realized_pnl is not None
+                    and final_fee is not None
+                    and final_tax is not None
+                ):
+                    total_net_realized_pnl = (
+                        int(total_gross_realized_pnl)
+                        - int(final_fee)
+                        - int(final_tax)
+                    )
+                else:
+                    total_net_realized_pnl = None
 
                 if buy_price_value is not None and buy_price_value > 0:
                     aggregated_return_pct = (
@@ -513,18 +701,25 @@ def save_trade_fill(
                         sell_date = ?,
                         sell_price = ?,
                         realized_pnl = ?,
+                        gross_realized_pnl = ?,
+                        fee = ?,
+                        tax = ?,
+                        net_realized_pnl = ?,
                         return_pct = ?
                     WHERE trade_id = ?
                 """, (
                     total_quantity,
                     now,
                     average_sell_price,
-                    total_realized_pnl,
+                    total_gross_realized_pnl,
+                    total_gross_realized_pnl,
+                    final_fee,
+                    final_tax,
+                    total_net_realized_pnl,
                     aggregated_return_pct,
                     trade_id,
                 ))
 
-    # 같은 체결번호가 다시 수신되어도 평균매입가를 다시 더하지 않는다.
     if is_new_fill and order_type == "매수":
         update_position_from_buy_fill(
             code=code,
@@ -533,11 +728,70 @@ def save_trade_fill(
             fill_quantity=quantity,
             fill_price=price,
         )
+
     if is_new_fill and order_type == "매도":
         reduce_position_from_sell_fill(
             code=code,
             fill_quantity=quantity,
         )
+
+def update_latest_sell_trade_costs(code, fee=None, tax=None):
+    """
+    잔고 체잔 이벤트로 비용 정보가 늦게 도착했을 때,
+    오늘 해당 종목의 가장 최근 매도 거래에 비용을 반영한다.
+
+    주의:
+    동일 종목을 같은 날 여러 차례 완전히 매매한 경우에는
+    당일 누적 비용을 개별 거래에 정확히 배분할 수 없다.
+    """
+    if fee is None or tax is None:
+        return
+
+    init_monitoring_tables()
+
+    today = datetime.now().strftime("%Y%m%d")
+    normalized_code = str(code).zfill(6)
+    fee_value = int(fee or 0)
+    tax_value = int(tax or 0)
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        row = con.execute("""
+            SELECT trade_id, gross_realized_pnl
+            FROM real_trades
+            WHERE code = ?
+              AND sell_date LIKE ?
+              AND gross_realized_pnl IS NOT NULL
+            ORDER BY sell_date DESC
+            LIMIT 1
+        """, (
+            normalized_code,
+            f"{today}%",
+        )).fetchone()
+
+        if row is None:
+            return
+
+        trade_id = row[0]
+        gross_realized_pnl = int(row[1])
+
+        net_realized_pnl = (
+            gross_realized_pnl
+            - fee_value
+            - tax_value
+        )
+
+        con.execute("""
+            UPDATE real_trades
+            SET fee = ?,
+                tax = ?,
+                net_realized_pnl = ?
+            WHERE trade_id = ?
+        """, (
+            fee_value,
+            tax_value,
+            net_realized_pnl,
+            trade_id,
+        ))
 
 def get_filled_position_codes():
     """
@@ -583,67 +837,204 @@ def get_today_order_count():
     return int(row[0] or 0)
 
 def get_today_realized_pnl():
+    """
+    오늘의 총손익과 순손익을 반환한다.
+
+    반환값:
+    - gross_pnl: 수수료·세금 전 손익
+    - net_pnl: 비용이 확인된 거래만 합산한 순손익
+    - missing_buy_price_count: 매입가가 없어 총손익도 계산 못한 거래 수
+    - missing_cost_count: 총손익은 있으나 비용이 없어 순손익 계산 못한 거래 수
+    """
     today = datetime.now().strftime("%Y%m%d")
     init_monitoring_tables()
+
     with sqlite3.connect(MONITORING_DB) as con:
         row = con.execute("""
-            SELECT COALESCE(SUM(realized_pnl), 0),
-                   SUM(CASE WHEN realized_pnl IS NULL THEN 1 ELSE 0 END)
-            FROM real_trades WHERE sell_date LIKE ?
+            SELECT
+                COALESCE(SUM(gross_realized_pnl), 0),
+                COALESCE(SUM(net_realized_pnl), 0),
+                COALESCE(SUM(
+                    CASE WHEN gross_realized_pnl IS NULL THEN 1 ELSE 0 END
+                ), 0),
+                COALESCE(SUM(
+                    CASE
+                        WHEN gross_realized_pnl IS NOT NULL
+                         AND net_realized_pnl IS NULL
+                        THEN 1 ELSE 0
+                    END
+                ), 0)
+            FROM real_trades
+            WHERE sell_date LIKE ?
         """, (f"{today}%",)).fetchone()
-    return int(row[0] or 0), int(row[1] or 0)
+
+    return (
+        int(row[0] or 0),
+        int(row[1] or 0),
+        int(row[2] or 0),
+        int(row[3] or 0),
+    )
 
 def save_daily_equity(deposit, balance):
     init_monitoring_tables()
     today = datetime.now().strftime("%Y%m%d")
+
     evaluation_amount = 0
+
     for info in balance.values():
         quantity = int(info.get("보유수량", 0) or 0)
-        current_price = int(info.get("현재가", 0) or info.get("매입가", 0) or 0)
+        current_price = int(
+            info.get("현재가", 0)
+            or info.get("매입가", 0)
+            or 0
+        )
         evaluation_amount += quantity * current_price
+
     total_assets = int(deposit or 0) + evaluation_amount
-    realized_pnl, _ = get_today_realized_pnl()
+
+    (
+        gross_realized_pnl,
+        net_realized_pnl,
+        _,
+        _,
+    ) = get_today_realized_pnl()
+
     with sqlite3.connect(MONITORING_DB) as con:
         con.execute("""
-            INSERT INTO daily_equity (date, deposit, evaluation_amount, total_assets, realized_pnl, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_equity (
+                date,
+                deposit,
+                evaluation_amount,
+                total_assets,
+                realized_pnl,
+                gross_realized_pnl,
+                net_realized_pnl,
+                updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date) DO UPDATE SET
-                deposit=excluded.deposit, evaluation_amount=excluded.evaluation_amount,
-                total_assets=excluded.total_assets, realized_pnl=excluded.realized_pnl,
-                updated_at=excluded.updated_at
-        """, (today, int(deposit or 0), evaluation_amount, total_assets, realized_pnl, _now_text()))
+                deposit = excluded.deposit,
+                evaluation_amount = excluded.evaluation_amount,
+                total_assets = excluded.total_assets,
+                realized_pnl = excluded.realized_pnl,
+                gross_realized_pnl = excluded.gross_realized_pnl,
+                net_realized_pnl = excluded.net_realized_pnl,
+                updated_at = excluded.updated_at
+        """, (
+            today,
+            int(deposit or 0),
+            evaluation_amount,
+            total_assets,
+            gross_realized_pnl,
+            gross_realized_pnl,
+            net_realized_pnl,
+            _now_text(),
+        ))
+
     return evaluation_amount, total_assets
 
 def save_strategy_daily_summaries(strategy_names):
     init_monitoring_tables()
     init_position_strategy_table()
+
     today = datetime.now().strftime("%Y%m%d")
     counts = get_strategy_position_counts()
+
     with sqlite3.connect(MONITORING_DB) as con:
         for strategy_name in strategy_names:
             row = con.execute("""
-                SELECT COALESCE(SUM(realized_pnl), 0),
-                       COALESCE(SUM(CASE WHEN buy_price IS NOT NULL THEN buy_price * quantity ELSE 0 END), 0),
-                       COUNT(*),
-                       COALESCE(SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END), 0)
-                FROM real_trades WHERE sell_date LIKE ? AND strategy_name = ?
-            """, (f"{today}%", strategy_name)).fetchone()
-            realized_pnl, invested_amount, trade_count, winning_trades = [int(v or 0) for v in row]
-            daily_return_pct = (realized_pnl / invested_amount * 100) if invested_amount else 0.0
-            win_rate_pct = (winning_trades / trade_count * 100) if trade_count else 0.0
+                SELECT
+                    COALESCE(SUM(gross_realized_pnl), 0),
+                    COALESCE(SUM(fee), 0),
+                    COALESCE(SUM(tax), 0),
+                    COALESCE(SUM(net_realized_pnl), 0),
+                    COALESCE(SUM(
+                        CASE
+                            WHEN buy_price IS NOT NULL
+                            THEN buy_price * quantity
+                            ELSE 0
+                        END
+                    ), 0),
+                    COUNT(*),
+                    COALESCE(SUM(
+                        CASE WHEN net_realized_pnl > 0 THEN 1 ELSE 0 END
+                    ), 0)
+                FROM real_trades
+                WHERE sell_date LIKE ?
+                  AND strategy_name = ?
+            """, (
+                f"{today}%",
+                strategy_name,
+            )).fetchone()
+
+            (
+                gross_realized_pnl,
+                fee,
+                tax,
+                net_realized_pnl,
+                invested_amount,
+                trade_count,
+                winning_trades,
+            ) = [int(v or 0) for v in row]
+
+            daily_return_pct = (
+                net_realized_pnl / invested_amount * 100
+                if invested_amount
+                else 0.0
+            )
+
+            win_rate_pct = (
+                winning_trades / trade_count * 100
+                if trade_count
+                else 0.0
+            )
+
             con.execute("""
                 INSERT INTO strategy_daily_summary (
-                    date, strategy_name, realized_pnl, invested_amount, daily_return_pct,
-                    trade_count, winning_trades, win_rate_pct, holding_count, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    date,
+                    strategy_name,
+                    realized_pnl,
+                    gross_realized_pnl,
+                    fee,
+                    tax,
+                    net_realized_pnl,
+                    invested_amount,
+                    daily_return_pct,
+                    trade_count,
+                    winning_trades,
+                    win_rate_pct,
+                    holding_count,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(date, strategy_name) DO UPDATE SET
-                    realized_pnl=excluded.realized_pnl, invested_amount=excluded.invested_amount,
-                    daily_return_pct=excluded.daily_return_pct, trade_count=excluded.trade_count,
-                    winning_trades=excluded.winning_trades, win_rate_pct=excluded.win_rate_pct,
-                    holding_count=excluded.holding_count, updated_at=excluded.updated_at
+                    realized_pnl = excluded.realized_pnl,
+                    gross_realized_pnl = excluded.gross_realized_pnl,
+                    fee = excluded.fee,
+                    tax = excluded.tax,
+                    net_realized_pnl = excluded.net_realized_pnl,
+                    invested_amount = excluded.invested_amount,
+                    daily_return_pct = excluded.daily_return_pct,
+                    trade_count = excluded.trade_count,
+                    winning_trades = excluded.winning_trades,
+                    win_rate_pct = excluded.win_rate_pct,
+                    holding_count = excluded.holding_count,
+                    updated_at = excluded.updated_at
             """, (
-                today, strategy_name, realized_pnl, invested_amount, daily_return_pct,
-                trade_count, winning_trades, win_rate_pct, counts.get(strategy_name, 0), _now_text(),
+                today,
+                strategy_name,
+                gross_realized_pnl,
+                gross_realized_pnl,
+                fee,
+                tax,
+                net_realized_pnl,
+                invested_amount,
+                daily_return_pct,
+                trade_count,
+                winning_trades,
+                win_rate_pct,
+                counts.get(strategy_name, 0),
+                _now_text(),
             ))
 
 def get_last_sent_news_at():

@@ -57,7 +57,7 @@ def get_updates(offset=None, token=Telegram_bot_TOKEN):
         response = requests.get(
             target_url,
             params=params,
-            timeout=3,
+            timeout=1,
         )
         result = response.json()
 

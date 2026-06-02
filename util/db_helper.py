@@ -1078,3 +1078,167 @@ def reduce_position_from_sell_fill(code, fill_quantity):
             new_quantity,
             normalized_code,
         ))
+# ---------------------------------------------------------------------------
+# ORBStrategy 실시간 실행 상태 저장
+# ---------------------------------------------------------------------------
+
+def init_orb_runtime_table():
+    """프로그램 재시작 후에도 당일 ORB 손절/목표/청산 상태를 복구할 수 있게 한다."""
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS orb_runtime_state (
+                trade_date TEXT NOT NULL,
+                code TEXT NOT NULL,
+                code_name TEXT,
+                strategy_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                skip_reason TEXT,
+                first_open INTEGER,
+                first_high INTEGER,
+                first_low INTEGER,
+                first_close INTEGER,
+                signal_price INTEGER,
+                planned_quantity INTEGER,
+                account_equity REAL,
+                available_cash INTEGER,
+                sizing_mode TEXT,
+                risk_budget REAL,
+                entry_price REAL,
+                quantity INTEGER,
+                stop_price REAL,
+                target_price REAL,
+                exit_reason TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (trade_date, code)
+            )
+        """)
+
+
+def save_orb_runtime_state(
+    trade_date,
+    code,
+    code_name,
+    strategy_name,
+    status,
+    skip_reason=None,
+    first_bar=None,
+    signal_price=None,
+    planned_quantity=None,
+    account_equity=None,
+    available_cash=None,
+    sizing_mode=None,
+    risk_budget=None,
+    entry_price=None,
+    quantity=None,
+    stop_price=None,
+    target_price=None,
+    exit_reason=None,
+):
+    """ORB 당일 실행 상태를 upsert 한다. 미지정 항목은 기존 값이 있으면 보존한다."""
+    init_orb_runtime_table()
+    normalized_code = str(code).zfill(6)
+    first_bar = first_bar or {}
+
+    values = {
+        "trade_date": str(trade_date),
+        "code": normalized_code,
+        "code_name": code_name,
+        "strategy_name": strategy_name,
+        "status": status,
+        "skip_reason": skip_reason,
+        "first_open": first_bar.get("open"),
+        "first_high": first_bar.get("high"),
+        "first_low": first_bar.get("low"),
+        "first_close": first_bar.get("close"),
+        "signal_price": signal_price,
+        "planned_quantity": planned_quantity,
+        "account_equity": account_equity,
+        "available_cash": available_cash,
+        "sizing_mode": sizing_mode,
+        "risk_budget": risk_budget,
+        "entry_price": entry_price,
+        "quantity": quantity,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "exit_reason": exit_reason,
+        "updated_at": _now_text(),
+    }
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        existing = con.execute("""
+            SELECT code_name, strategy_name, status, skip_reason,
+                   first_open, first_high, first_low, first_close,
+                   signal_price, planned_quantity, account_equity,
+                   available_cash, sizing_mode, risk_budget, entry_price,
+                   quantity, stop_price, target_price, exit_reason
+            FROM orb_runtime_state
+            WHERE trade_date = ? AND code = ?
+        """, (values["trade_date"], normalized_code)).fetchone()
+
+        if existing is not None:
+            columns = [
+                "code_name", "strategy_name", "status", "skip_reason",
+                "first_open", "first_high", "first_low", "first_close",
+                "signal_price", "planned_quantity", "account_equity",
+                "available_cash", "sizing_mode", "risk_budget", "entry_price",
+                "quantity", "stop_price", "target_price", "exit_reason",
+            ]
+            prior = dict(zip(columns, existing))
+            for column in columns:
+                if column in ("status", "strategy_name"):
+                    continue
+                if values[column] is None:
+                    values[column] = prior[column]
+
+        con.execute("""
+            INSERT INTO orb_runtime_state (
+                trade_date, code, code_name, strategy_name, status, skip_reason,
+                first_open, first_high, first_low, first_close,
+                signal_price, planned_quantity, account_equity, available_cash,
+                sizing_mode, risk_budget, entry_price, quantity, stop_price,
+                target_price, exit_reason, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trade_date, code) DO UPDATE SET
+                code_name = excluded.code_name,
+                strategy_name = excluded.strategy_name,
+                status = excluded.status,
+                skip_reason = excluded.skip_reason,
+                first_open = excluded.first_open,
+                first_high = excluded.first_high,
+                first_low = excluded.first_low,
+                first_close = excluded.first_close,
+                signal_price = excluded.signal_price,
+                planned_quantity = excluded.planned_quantity,
+                account_equity = excluded.account_equity,
+                available_cash = excluded.available_cash,
+                sizing_mode = excluded.sizing_mode,
+                risk_budget = excluded.risk_budget,
+                entry_price = excluded.entry_price,
+                quantity = excluded.quantity,
+                stop_price = excluded.stop_price,
+                target_price = excluded.target_price,
+                exit_reason = excluded.exit_reason,
+                updated_at = excluded.updated_at
+        """, (
+            values["trade_date"], values["code"], values["code_name"],
+            values["strategy_name"], values["status"], values["skip_reason"],
+            values["first_open"], values["first_high"], values["first_low"],
+            values["first_close"], values["signal_price"],
+            values["planned_quantity"], values["account_equity"],
+            values["available_cash"], values["sizing_mode"],
+            values["risk_budget"], values["entry_price"], values["quantity"],
+            values["stop_price"], values["target_price"], values["exit_reason"],
+            values["updated_at"],
+        ))
+
+
+def get_orb_runtime_state(trade_date, code):
+    init_orb_runtime_table()
+    normalized_code = str(code).zfill(6)
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("""
+            SELECT * FROM orb_runtime_state
+            WHERE trade_date = ? AND code = ?
+        """, (str(trade_date), normalized_code)).fetchone()
+    return None if row is None else dict(row)

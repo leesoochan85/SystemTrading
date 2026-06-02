@@ -1,153 +1,165 @@
-import requests 
-from bs4 import BeautifulSoup
-import numpy as np
+"""코스피/코스닥 시가총액 상위 종목으로 매매 유니버스를 구성한다.
+
+구성 기준:
+- KOSPI 시가총액 순위 1~100위
+- KOSDAQ 시가총액 순위 1~100위
+- 총 200종목
+
+주의:
+- ROE, PER, 거래량, 종목명 필터는 사용하지 않는다.
+- 네이버 금융의 시장별 시가총액 순서가 그대로 유니버스 순위가 된다.
+"""
+from pathlib import Path
+
 import pandas as pd
-from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
 
-BASE_URL = 'https://finance.naver.com/sise/sise_market_sum.naver?sosok='
-START_PAGE = 1
-fields = []
-CODES =[0,1]
+BASE_URL = "https://finance.naver.com/sise/sise_market_sum.naver?sosok="
+MARKETS = {
+    "0": "KOSPI",
+    "1": "KOSDAQ",
+}
+TOP_N_PER_MARKET = 100
+ROWS_PER_PAGE = 50
+PAGES_PER_MARKET = TOP_N_PER_MARKET // ROWS_PER_PAGE
 
-headers = {
-    "User-Agent": "Mozilla/5.0"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
 }
 
-now = datetime.now()
-formattedDate = now.strftime("%Y%m%d")
+RAW_OUTPUT_PATH = Path("NaverFinance.xlsx")
+UNIVERSE_OUTPUT_PATH = Path("universe.xlsx")
 
-def execute_crawler():
-    df_total = []
-    
-    for code in CODES:
 
-        res = requests.get(BASE_URL + str(code), headers=headers)
-        page_soup = BeautifulSoup(res.text, 'lxml')
+def _clean_text(value):
+    return " ".join(str(value).split())
 
-        total_page_num = page_soup.select_one('td.pgRR > a')
-        total_page_num = int(total_page_num.get('href').split('=')[-1])
 
-        ipt_html = page_soup.select_one('div.subcnt_sise_item_top')
-        
-        global fields 
-        fields = [item.get('value') for item in ipt_html.select('input')]
+def _to_numeric(series):
+    return pd.to_numeric(
+        series.astype(str).str.replace(",", "", regex=False).replace("N/A", "0"),
+        errors="coerce",
+    )
 
-        result = [crawler(code, str(page)) for page in range(1, total_page_num+1)]
-        result = [df for df in result if not df.empty]
-        
-        if result:
-            df = pd.concat(result, axis=0, ignore_index = True)
-            df_total.append(df)
-    
 
-    df_total = pd.concat(df_total, ignore_index = True)
-    df_total.reset_index(inplace=True, drop=True)
-    df_total.to_excel('NaverFinance.xlsx')
+def crawler(market_code, page):
+    """네이버 금융의 시장별 시총 순위 한 페이지를 읽는다."""
+    url = f"{BASE_URL}{market_code}&page={page}"
+    response = requests.get(url, headers=HEADERS, timeout=10)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.text, "lxml")
 
-    return df_total
-
-def crawler(code, page):
-    url = f"{BASE_URL}{code}&page={page}"
-    res = requests.get(url, headers=headers)
-    res.raise_for_status()
-    page_soup = BeautifulSoup(res.text, 'lxml')
-
-    table_html = page_soup.select_one("div.box_type_l table.type_2, div.box_type_1 table.type_2")
+    table_html = soup.select_one("div.box_type_l table.type_2, div.box_type_1 table.type_2")
     if table_html is None:
-        print(f"[WARN] table_html not found: code={code}, page={page}")
-        return pd.DataFrame()
+        raise RuntimeError(f"시가총액 테이블을 찾지 못했습니다: market={market_code}, page={page}")
 
-    header_data = ["종목코드"] + [th.get_text(" ", strip=True) for th in table_html.select("thead th")][1:-1]
+    table_columns = [
+        th.get_text(" ", strip=True)
+        for th in table_html.select("thead th")
+    ][1:-1]
+    header_data = ["종목코드", "시장", "시장내시총순위"] + table_columns
 
     rows = []
     for tr in table_html.select("tbody tr"):
-        tds = tr.find_all("td")
-        if not tds:
-            continue
-
-        no_td = tr.select_one("td.no")
-        if no_td is None:
-            continue
-
+        rank_td = tr.select_one("td.no")
         name_a = tr.select_one("a.tltle")
-        if name_a is None:
+        if rank_td is None or name_a is None:
             continue
 
         href = name_a.get("href", "")
         if "code=" not in href:
             continue
 
-        stock_code = href.split("code=")[-1].split("&")[0]
-
-        data_tds = tds[1:1 + (len(header_data) - 1)]
-        if len(data_tds) != len(header_data) - 1:
+        stock_code = href.split("code=")[-1].split("&")[0].strip().zfill(6)
+        rank_text = _clean_text(rank_td.get_text(" ", strip=True))
+        if not rank_text.isdigit():
             continue
 
-        row = [stock_code]
-        for td in data_tds:
-            text = td.get_text(" ", strip=True)
-            text = " ".join(text.split())
-            row.append(text)
+        tds = tr.find_all("td")
+        data_tds = tds[1 : 1 + len(table_columns)]
+        if len(data_tds) != len(table_columns):
+            continue
 
+        row = [stock_code, MARKETS[market_code], int(rank_text)]
+        row.extend(_clean_text(td.get_text(" ", strip=True)) for td in data_tds)
         rows.append(row)
-
-    if not rows:
-        return pd.DataFrame(columns=header_data)
 
     return pd.DataFrame(rows, columns=header_data)
 
+
+def execute_crawler():
+    """각 시장 시총 상위 100개씩 총 200개를 수집한다."""
+    market_frames = []
+
+    for market_code, market_name in MARKETS.items():
+        page_frames = [crawler(market_code, page) for page in range(1, PAGES_PER_MARKET + 1)]
+        market_df = pd.concat(page_frames, ignore_index=True)
+        market_df = market_df.drop_duplicates(subset=["종목코드"])
+        market_df = market_df.sort_values("시장내시총순위").head(TOP_N_PER_MARKET)
+
+        if len(market_df) != TOP_N_PER_MARKET:
+            raise RuntimeError(
+                f"{market_name} 상위 {TOP_N_PER_MARKET}종목 수집 실패: "
+                f"실제 {len(market_df)}종목"
+            )
+
+        market_frames.append(market_df)
+
+    universe_df = pd.concat(market_frames, ignore_index=True)
+    if len(universe_df) != TOP_N_PER_MARKET * len(MARKETS):
+        raise RuntimeError(f"전체 유니버스 종목 수 오류: 실제 {len(universe_df)}종목")
+
+    universe_df.to_excel(RAW_OUTPUT_PATH, index=False)
+    return universe_df
+
+
 def get_universe(return_df=False):
-    df = execute_crawler()
+    """전략에서 사용할 KOSPI 100 + KOSDAQ 100 유니버스를 반환한다."""
+    df = execute_crawler().copy()
 
-    mapping = {',': '', 'N/A': '0'}
-    df.replace(mapping, regex=True, inplace=True)
+    df["종목코드"] = df["종목코드"].astype(str).str.strip().str.upper().str.zfill(6)
+    # KRX 단축코드에는 우선주 등 영문자가 포함된 6자리 코드가 존재할 수 있다.
+    # 숫자만 허용하면 시총 상위 종목이 누락되므로 영문/숫자 6자리를 허용한다.
+    df = df[df["종목코드"].str.fullmatch(r"[0-9A-Za-z]{6}", na=False)]
 
-    cols = ['거래량', 'ROE', 'PER']
-    df[cols] = df[cols].astype(float)
+    numeric_columns = ["현재가", "거래량", "시가총액", "PER", "ROE"]
+    for column in numeric_columns:
+        if column in df.columns:
+            df[column] = _to_numeric(df[column])
 
-    df = df[(df['거래량'] > 0) &
-            (df['ROE'] > 0) &
-            (df['PER'] > 0) &
-            (~df['종목명'].str.contains("지주", na=False)) &
-            (~df['종목명'].str.contains("홀딩스", na=False))]
+    desired_columns = [
+        "종목코드",
+        "종목명",
+        "시장",
+        "시장내시총순위",
+        "현재가",
+        "거래량",
+        "시가총액",
+        "PER",
+        "ROE",
+    ]
+    columns_to_save = [column for column in desired_columns if column in df.columns]
+    df["시장"] = pd.Categorical(df["시장"], categories=["KOSPI", "KOSDAQ"], ordered=True)
+    df = df[columns_to_save].sort_values(["시장", "시장내시총순위"]).reset_index(drop=True)
+    df["시장"] = df["시장"].astype(str)
 
-    df['1/PER'] = 1 / df['PER']
-    df['RANK_ROE'] = df['ROE'].rank(method='max', ascending=False)
-    df['RANK_1/PER'] = df['1/PER'].rank(method='max', ascending=False)
-    df['RANK_VALUE'] = (df['RANK_ROE'] + df['RANK_1/PER']) / 2
-    df["종목코드"] = df["종목코드"].astype(str).str.strip()
-    df = df[df["종목코드"].str.fullmatch(r"\d{6}", na=False)]
+    kospi_count = int((df["시장"] == "KOSPI").sum())
+    kosdaq_count = int((df["시장"] == "KOSDAQ").sum())
+    if kospi_count != TOP_N_PER_MARKET or kosdaq_count != TOP_N_PER_MARKET:
+        raise RuntimeError(
+            f"유니버스 구성 오류: KOSPI {kospi_count}개 / KOSDAQ {kosdaq_count}개"
+        )
 
-    df = df.sort_values(by=['RANK_VALUE']).reset_index(drop=True)
-    df = df.loc[:199, ['종목코드', '종목명', '현재가', '거래량', 'PER', 'ROE']]
-
-    df.to_excel('universe.xlsx', index=False)
+    df.to_excel(UNIVERSE_OUTPUT_PATH, index=False)
+    print(f"[유니버스 생성 완료] KOSPI {kospi_count}개 + KOSDAQ {kosdaq_count}개 = {len(df)}개")
 
     if return_df:
         return df
+    return df["종목명"].tolist()
 
-    return df['종목명'].tolist()
 
 if __name__ == "__main__":
-    print('Start!')
+    print("Start!")
     get_universe()
-    print('End')
-
-
-
-
-
-
-
-# res = requests.get(BASE_URL + str(CODES[0]))
-# page_soup = BeautifulSoup(res.text, 'lxml')
-# # print(page_soup)
-
-# total_page_num = page_soup.select_one('td.pgRR > a')
-# print(total_page_num)
-# total_page_num = int(total_page_num.get('href').split('=')[-1])
-# print(total_page_num)
-
-# ipt_html = page_soup.select_one('div.subcnt_sise_item_top')
-# fields = [item.get('value')for item in ipt_html.select('input')]
-# print(fields)
+    print("End")

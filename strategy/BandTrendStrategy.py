@@ -22,6 +22,8 @@ from util.time_helper import check_adjacent_transaction_closed_for_buying, check
 
 
 class BandTrendStrategy(QThread):
+    STOP_LOSS_PCT = -5.0
+
     def __init__(self, kiwoom, auto_init=True):
         super().__init__()
         self.strategy_name = "BandTrendStrategy"
@@ -51,10 +53,14 @@ class BandTrendStrategy(QThread):
             print(error_msg)
             send_message(error_msg)
 
-    def check_and_get_universe(self):
-        universe_df = get_universe(return_df=True).copy()
-        universe_df["종목코드"] = universe_df["종목코드"].astype(str).str.strip().str.zfill(6)
-        universe_df = universe_df[universe_df["종목코드"].str.fullmatch(r"\d{6}", na=False)]
+    def check_and_get_universe(self, shared_universe_df=None):
+        """공통 시총 유니버스를 적용하고, 현재 보유 종목은 매도 관리를 위해 유지한다."""
+        if shared_universe_df is None:
+            universe_df = get_universe(return_df=True).copy()
+        else:
+            universe_df = shared_universe_df.copy()
+        universe_df["종목코드"] = universe_df["종목코드"].astype(str).str.strip().str.upper().str.zfill(6)
+        universe_df = universe_df[universe_df["종목코드"].str.fullmatch(r"[0-9A-Za-z]{6}", na=False)]
         universe_df = universe_df.drop_duplicates(subset=["종목코드"])
 
         self.universe = {
@@ -88,7 +94,27 @@ class BandTrendStrategy(QThread):
         insert_df_to_db(self.strategy_name, "universe", save_df)
         print(self.universe)
 
-    def check_and_get_price_data(self):
+    def check_and_get_price_data(self, shared_price_map=None):
+        """일봉 데이터를 준비한다. Manager 실행 시에는 종목별 1회 조회된 공통 데이터를 공유한다."""
+        if shared_price_map is not None:
+            for code in self.universe.keys():
+                normalized_code = str(code).strip().zfill(6)
+                price_df = shared_price_map.get(normalized_code)
+
+                if price_df is None:
+                    raise KeyError(
+                        f"[공통 일봉 누락] {self.strategy_name} / {normalized_code}"
+                    )
+
+                self.universe[code]["price_df"] = price_df.copy()
+
+            print(
+                f"[{self.strategy_name}] 공통 일봉 적용 완료: "
+                f"{len(self.universe)}종목"
+            )
+            return
+
+        # 전략 단독 실행 또는 기존 호환 경로: 전략 DB에서 자체적으로 일봉을 준비한다.
         for idx, code in enumerate(self.universe.keys(), start=1):
             print(f"{idx}/{len(self.universe)}) {code}")
             if not check_table_exists(self.strategy_name, code):
@@ -105,6 +131,7 @@ class BandTrendStrategy(QThread):
                 now = datetime.now().strftime("%Y%m%d")
                 if not last_date or last_date[0] != now:
                     price_df = self.kiwoom.get_price_data(code)
+                    time.sleep(4) # 키움 장종료 후 일봉 연속 조회 제한 방지
                     insert_df_to_db(self.strategy_name, code, price_df)
            
             sql = "select * from '{}'".format(code)
@@ -188,30 +215,69 @@ class BandTrendStrategy(QThread):
         df.loc[(neg_sum == 0) & (pos_sum == 0), "MFI"] = 50
         return df
 
+    def is_stop_loss_triggered(self, code):
+        """실시간 현재가 기준 수익률이 고정 손절선 이하인지 확인한다."""
+        if code not in self.kiwoom.balance:
+            return False
+
+        balance_info = self.kiwoom.balance[code]
+        purchase_price = balance_info.get("매입가", balance_info.get("매입단가", 0))
+        rt = self.kiwoom.universe_realtime_transaction_info.get(code, {})
+        current_price = rt.get("현재가", balance_info.get("현재가", 0))
+
+        if purchase_price <= 0 or not current_price or current_price <= 0:
+            return False
+
+        return_rate = (current_price - purchase_price) / purchase_price * 100
+        return return_rate <= self.STOP_LOSS_PCT
+
     def check_sell_signal(self, code):
         if code not in self.kiwoom.balance:
             return False
+
+        # 고정 손절은 지표 계산 가능 여부와 무관하게 실시간 가격으로 먼저 판단한다.
+        if self.is_stop_loss_triggered(code):
+            return True
+
         df = self.get_bollinger_df(code)
         if df is None:
             return False
+
         latest = df.iloc[-1]
         pb = latest["percent_b"]
         mfi = latest["MFI"]
         if pd.isna(pb) or pd.isna(mfi):
             return False
+
+        # 기존 추세 약화 청산 조건은 그대로 유지한다.
         return bool(pb < 0.2 and mfi < 20)
 
     def order_sell(self, code):
         quantity = self.kiwoom.balance[code]["보유수량"]
-        ask = self.kiwoom.universe_realtime_transaction_info[code]["(최우선)매도호가"]
-
         if quantity < 1:
             return False
 
-        result = self.kiwoom.send_order("send_sell_order", "2003", 2, code, quantity, ask, "00", strategy_name=self.strategy_name)
+        is_stop_loss = self.is_stop_loss_triggered(code)
+        if is_stop_loss:
+            order_price = 0
+            order_classification = "03"  # 시장가
+            order_label = "[추세추종 손절 시장가 매도]"
+        else:
+            rt = self.kiwoom.universe_realtime_transaction_info.get(code, {})
+            order_price = rt.get("(최우선)매도호가", 0)
+            if order_price <= 0:
+                return False
+            order_classification = "00"  # 지정가
+            order_label = "[추세추종 매도]"
+
+        result = self.kiwoom.send_order(
+            "send_sell_order", "2003", 2, code, quantity,
+            order_price, order_classification, strategy_name=self.strategy_name
+        )
 
         if result == 0:
-            send_message(f"[추세추종 매도] {self.universe[code]['code_name']} {quantity}주 {ask}원")
+            price_text = "시장가" if is_stop_loss else f"{order_price}원"
+            send_message(f"{order_label} {self.universe[code]['code_name']} {quantity}주 {price_text}")
             self.kiwoom.order[code] = {
                 "주문구분": "매도",
                 "미체결수량": quantity,
@@ -270,6 +336,7 @@ class BandTrendStrategy(QThread):
             )
             send_message(f"[추세추종 매수] {self.universe[code]['code_name']} {quantity}주 {bid}원")
             self.kiwoom.order[code] = {"주문구분": "매수", 
+                                       "주문가격": bid,
                                        "미체결수량": quantity, 
                                        "strategy_name": self.strategy_name,
                                        "order_time": time.time(),}

@@ -25,6 +25,10 @@ class Kiwoom(QAxWidget):
         self.balance={}
         self.universe_realtime_transaction_info = {}
         self.pending_order_strategy = {}
+
+        # 주식체결 실시간 틱을 전략이 직접 구독할 수 있도록 한다.
+        # ORBStrategy는 09:00~09:04:59 틱만 집계해 첫 5분봉을 정확히 확정한다.
+        self.realtime_listeners = []
         
         # 잔고 조회 안전성 관리
         self.last_balance_query_success = False
@@ -36,8 +40,18 @@ class Kiwoom(QAxWidget):
         self._waiting_for_order_response = False
         self.order_request_timeout_ms = 10000  # 10초
         
-        # 예수금 조회 안전성 관리
+        # 자금 조회 안전성 관리
+        # last_deposit:
+        #   기존 전략 코드와의 호환성을 위해 "신규 매수에 사용할 금액"을 저장한다.
+        #   실제 값은 100%종목주문가능금액이다.
         self.last_deposit = None
+
+        # 화면 및 성과 기록용 원본 값
+        self.last_cash_deposit = None              # 예수금
+        self.last_general_orderable_cash = None    # 주문가능금액
+        self.last_orderable_cash = None            # 100%종목주문가능금액
+        self.last_d2_estimated_deposit = None      # d+2추정예수금
+
         self.last_deposit_query_success = False
         self._waiting_for_deposit_response = False
         self.deposit_request_timeout_ms = 10000  # 10초
@@ -128,16 +142,16 @@ class Kiwoom(QAxWidget):
 
             self.tr_data=ohlcv
 
-        elif rqname.startswith("DEP_"):  # 예수금 데이터 수신
-            # 현재 대기 중인 예수금 요청의 응답만 반영한다.
+        elif rqname.startswith("DEP_"):  # 자금 데이터 수신
+            # 현재 대기 중인 자금 요청의 응답만 반영한다.
             if (
                 rqname != self._active_deposit_rqname
                 or not self._waiting_for_deposit_response
             ):
-                print(f"[Kiwoom] 지연된 예수금 응답 무시: {rqname}")
+                print(f"[Kiwoom] 지연된 자금 응답 무시: {rqname}")
                 return
 
-            deposit = self.dynamicCall(
+            raw_cash_deposit = self.dynamicCall(
                 "GetCommData(QString, QString, int, QString)",
                 trcode,
                 rqname,
@@ -145,15 +159,60 @@ class Kiwoom(QAxWidget):
                 "예수금",
             )
 
-            received_deposit = self._to_int(deposit)
+            raw_general_orderable_cash = self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode,
+                rqname,
+                0,
+                "주문가능금액",
+            )
 
-            self.last_deposit = received_deposit
-            self.tr_data = received_deposit
+            raw_orderable_cash = self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode,
+                rqname,
+                0,
+                "100%종목주문가능금액",
+            )
+
+            raw_d2_estimated_deposit = self.dynamicCall(
+                "GetCommData(QString, QString, int, QString)",
+                trcode,
+                rqname,
+                0,
+                "d+2추정예수금",
+            )
+
+            cash_deposit = self._to_int(raw_cash_deposit)
+            general_orderable_cash = self._to_int(raw_general_orderable_cash)
+            orderable_cash = self._to_int(raw_orderable_cash)
+            d2_estimated_deposit = self._to_int(raw_d2_estimated_deposit)
+
+            # 자동매수는 미수 사용 없이 현금 100% 기준 금액만 사용한다.
+            # 음수값이 들어오는 경우 신규 매수를 허용하지 않는다.
+            orderable_cash = max(0, orderable_cash)
+
+            self.last_cash_deposit = cash_deposit
+            self.last_general_orderable_cash = general_orderable_cash
+            self.last_orderable_cash = orderable_cash
+            self.last_d2_estimated_deposit = d2_estimated_deposit
+
+            # 기존 전략 코드에서는 last_deposit / get_deposit() 반환값을
+            # 매수 예산으로 사용하므로 100%종목주문가능금액을 전달한다.
+            self.last_deposit = orderable_cash
+            self.tr_data = orderable_cash
+
             self.last_deposit_query_success = True
             self._waiting_for_deposit_response = False
             self._active_deposit_rqname = None
 
-            print(f"[Kiwoom] 예수금 조회 정상 완료: {received_deposit:,}원")
+            print(
+                "[Kiwoom] 자금 조회 정상 완료: "
+                f"예수금 {cash_deposit:,}원 / "
+                f"주문가능금액 {general_orderable_cash:,}원 / "
+                f"100%종목주문가능금액 {orderable_cash:,}원 / "
+                f"D+2추정예수금 {d2_estimated_deposit:,}원"
+            )
 
         elif rqname.startswith("ORD_"):  # 미체결 주문 수신
             # 현재 대기 중인 미체결 조회의 응답만 반영한다.
@@ -363,36 +422,62 @@ class Kiwoom(QAxWidget):
     def get_price_data(self, code):
         self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
         self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-        self.dynamicCall("CommRqData(QString, QString, int, QString)", "opt10081_req", "opt10081", 0, "0001")
+        self.dynamicCall(
+            "CommRqData(QString, QString, int, QString)",
+            "opt10081_req",
+            "opt10081",
+            0,
+            "0001",
+        )
 
         self.tr_event_loop.exec_()
 
         ohlcv = self.tr_data
-        
+
         while self.has_next_tr_data:
+            # 동일 종목의 추가 일봉 페이지 연속조회 제한 방지
+            time.sleep(4)
+
             self.dynamicCall("SetInputValue(QString, QString)", "종목코드", code)
             self.dynamicCall("SetInputValue(QString, QString)", "수정주가구분", "1")
-            self.dynamicCall("CommRqData(QString,QString, int, QString)", "opt10081_req", "opt10081", 2, "0001")
+            self.dynamicCall(
+                "CommRqData(QString, QString, int, QString)",
+                "opt10081_req",
+                "opt10081",
+                2,
+                "0001",
+            )
 
             self.tr_event_loop.exec_()
 
             for key, val in self.tr_data.items():
-                ohlcv[key][-1:]=val
-        df = pd.DataFrame(ohlcv,columns=['open', 'high', 'low', 'close', 'volume'], index=ohlcv['date'])
+                ohlcv[key][-1:] = val
+
+        df = pd.DataFrame(
+            ohlcv,
+            columns=["open", "high", "low", "close", "volume"],
+            index=ohlcv["date"],
+        )
 
         return df[::-1]
     
     def get_deposit(self):
         """
-        예수금 조회에 실패하거나 응답이 지연되면
-        마지막으로 정상 확인된 예수금을 유지한다.
+        신규 매수에 사용할 현금 100% 기준 주문가능금액을 조회한다.
+
+        - 반환값: 100%종목주문가능금액
+        - 예수금, 일반 주문가능금액, D+2추정예수금은
+        별도 속성에 저장하여 상태 출력 및 성과 계산에 사용한다.
+        - 조회 실패 또는 응답 지연 시 마지막 정상 주문가능금액을 유지한다.
         """
         previous_deposit = self.last_deposit
 
         self.last_deposit_query_success = False
         self._waiting_for_deposit_response = True
 
-        deposit_rqname = self._next_safe_rqname("DEP")
+        # 모의투자 opw00001은 반복 조회 시 최초 rqname으로 응답하는 경우가 있으므로
+        # 자금 조회도 고정 요청명을 사용한다.
+        deposit_rqname = "DEP_REQ"
         self._active_deposit_rqname = deposit_rqname
         
         try:
@@ -558,9 +643,15 @@ class Kiwoom(QAxWidget):
             if code and code in self.order:
                 order_info = self.order[code]
                 order_status = order_info.get("주문상태", "")
-                executed_quantity = order_info.get("체결량", 0)
-                left_quantity = order_info.get("미체결수량", 0)
-                executed_price = self._safe_int(order_info.get("체결가", 0))
+                executed_quantity = self._safe_int(order_info.get("체결량", 0))
+                unit_executed_quantity = self._safe_int(order_info.get("단위체결량", 0))
+
+                left_quantity = self._safe_int(order_info.get("미체결수량", 0))
+
+                executed_price = self._safe_int(
+                    order_info.get("단위체결가", 0)
+                    or order_info.get("체결가", 0)
+                )
                 code_name = order_info.get("종목명", code)
                 
                 fee_raw = order_info.get("당일매매 수수료")
@@ -609,7 +700,20 @@ class Kiwoom(QAxWidget):
                 if order_type == "매도":
                     position_info = get_position_detail(code)
 
-                if fill_no and executed_quantity > 0 and executed_price > 0:
+                # position_strategy 및 체결 이력에는 이번 체결 이벤트의 신규 체결량만 반영한다.
+                # 누적 체결량을 더하면 부분 체결 때 DB 수량이 실제 잔고보다 커진다.
+                fill_quantity_for_db = unit_executed_quantity
+                
+                print(
+                    f"[Kiwoom] 체결 DB 반영 확인: {code_name}({code}) / "
+                    f"주문번호={order_no} / 체결번호={fill_no} / "
+                    f"누적체결량={executed_quantity} / "
+                    f"단위체결량={unit_executed_quantity} / "
+                    f"DB반영수량={fill_quantity_for_db} / "
+                    f"미체결수량={left_quantity}"
+                )
+                
+                if fill_no and fill_quantity_for_db > 0 and executed_price > 0:
                     save_trade_fill(
                         fill_no=fill_no,
                         order_no=order_no,
@@ -621,7 +725,7 @@ class Kiwoom(QAxWidget):
                             if position_info is not None
                             else strategy_name
                         ),
-                        quantity=executed_quantity,
+                        quantity=fill_quantity_for_db,
                         price=executed_price,
                         buy_price=(
                             position_info["buy_price"]
@@ -639,11 +743,12 @@ class Kiwoom(QAxWidget):
 
                 if order_status == "체결" or (executed_quantity > 0 and left_quantity == 0):
                     send_message(
-                    f"체결완료: {code_name}({code}) "
-                    f"{order_info.get('주문구분', '')} "
-                    f"{executed_quantity}주 "
-                    f"{order_info.get('체결가', 0)}원"
-                )
+                        f"체결완료: {code_name}({code}) "
+                        f"{order_info.get('주문구분', '')} "
+                        f"이번 체결 {unit_executed_quantity}주 / "
+                        f"누적 체결 {executed_quantity}주 "
+                        f"{executed_price}원"
+                    )
                     
                 order_type = str(order_info.get("주문구분", "")).strip().lstrip("+").lstrip("-")
 
@@ -865,6 +970,10 @@ class Kiwoom(QAxWidget):
 
         정상적인 빈 잔고 응답은 성공으로 처리되어
         self.balance = {}로 갱신된다.
+
+        주의:
+        모의투자 opw00018은 반복 조회 시 최초 rqname으로 응답하는 경우가 있어
+        잔고 조회는 고정 요청명 BAL_REQ를 사용한다.
         """
         previous_balance = {
             code: dict(info)
@@ -874,7 +983,12 @@ class Kiwoom(QAxWidget):
         self.last_balance_query_success = False
         self._waiting_for_balance_response = True
 
-        balance_rqname = self._next_safe_rqname("BAL")
+        # 기존:
+        # balance_rqname = self._next_safe_rqname("BAL")
+        #
+        # 모의투자 환경에서 반복 잔고 조회 응답이 최초 요청명으로 돌아오는 현상을
+        # 피하기 위해 고정 요청명을 사용한다.
+        balance_rqname = "BAL_REQ"
         self._active_balance_rqname = balance_rqname
 
         try:
@@ -948,6 +1062,15 @@ class Kiwoom(QAxWidget):
 
             return self.balance
     
+    def add_realtime_listener(self, listener):
+        """주식체결 실시간 정보 수신 시 호출할 콜백을 등록한다."""
+        if listener not in self.realtime_listeners:
+            self.realtime_listeners.append(listener)
+
+    def remove_realtime_listener(self, listener):
+        if listener in self.realtime_listeners:
+            self.realtime_listeners.remove(listener)
+
     def set_real_reg(self, str_screen_no, str_code_list, #실시간 체결 정보 얻어올 종목 전달
                       str_fid_list, #체결 정보 중 제공받을 항목에 해당하는 fid
                       str_opt_type #실시간 정보 등록/해제 구분, "0": 등록, "1": 해제
@@ -982,7 +1105,7 @@ class Kiwoom(QAxWidget):
             if s_code not in self.universe_realtime_transaction_info:
                 self.universe_realtime_transaction_info.update({s_code: {}})
             
-            self.universe_realtime_transaction_info[s_code].update({
+            tick_data = {
                 "체결시간": signed_at,
                 "현재가": close,
                 "고가": high,
@@ -991,7 +1114,14 @@ class Kiwoom(QAxWidget):
                 "(최우선)매도호가": top_priority_ask,
                 "(최우선)매수호가": top_priority_bid,
                 "누적거래량": accum_volume
-            })
+            }
+            self.universe_realtime_transaction_info[s_code].update(tick_data)
+
+            for listener in list(self.realtime_listeners):
+                try:
+                    listener(s_code, dict(tick_data))
+                except Exception as e:
+                    print(f"[Kiwoom] 실시간 리스너 오류: {e}")
     
     def get_fid(search_value): #const 파일에서 fid 이름으로 fid 번호 찾는 함수
         keys = [key for key, value in FID_CODES.items() if value == search_value]

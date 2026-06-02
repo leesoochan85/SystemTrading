@@ -3,6 +3,7 @@ from strategy.RSIStrategy import *
 from strategy.BandTrendStrategy import *
 from strategy.BandReversionStrategy import *
 from strategy.HighBreakoutStrategy import *
+from strategy.ORBStrategy import *
 from strategy.StrategyManager import StrategyManager
 import sys
 
@@ -57,10 +58,15 @@ print("BandReversion 객체 생성 시작")
 band_reversion_strategy = BandReversionStrategy(kiwoom, auto_init=False)
 print("BandReversion 객체 생성 완료")
 
+print("ORB 객체 생성 시작")
+orb_strategy = ORBStrategy(kiwoom, auto_init=False)
+print("ORB 객체 생성 완료")
+
 print("전략 매니저 시작")
 manager = StrategyManager(
     kiwoom,
     [
+        orb_strategy,
         rsi_strategy,
         high_breakout_strategy,
         band_trend_strategy,

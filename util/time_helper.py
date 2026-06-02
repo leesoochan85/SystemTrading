@@ -102,3 +102,16 @@ def check_adjacent_transaction_closed_for_buying(now=None):
         return True
 
     return BUY_CUTOFF_TIME <= now.time() <= REGULAR_CLOSE_TIME
+
+def milliseconds_until_market_open(now=None):
+    """오늘 거래일의 장 시작 전이면 개장 시각까지 남은 밀리초를 반환한다."""
+    now = now or datetime.now()
+
+    if not is_market_business_day(now):
+        return None
+
+    open_dt = datetime.combine(now.date(), get_market_open_time(now))
+    if now >= open_dt:
+        return None
+
+    return max(0, int((open_dt - now).total_seconds() * 1000))

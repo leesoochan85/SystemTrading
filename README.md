@@ -1,9 +1,5 @@
 # SystemTrading 작업 환경 세팅 가이드
 
-Kiwoom OpenAPI+ 기반 자동매매 프로그램입니다.  
-RSI, 신고가 돌파, 볼린저 밴드 추세/반전 전략을 사용하며, Telegram 알림과 네이버 경제 뉴스 전송 기능을 포함합니다.
-
----
 
 ## 1. 새 PC에서 프로젝트 받기
 
@@ -248,152 +244,7 @@ Telegram 오류 의미:
 
 ---
 
-## 8. 조회 제한 -209 대응
-
-아래 팝업이 뜨면 Kiwoom TR 조회 제한에 걸린 것입니다.
-
-```text
-조회횟수 제한 : -209
-현재 고객님 프로그램에서 과도한 조회요청이 발생되고 있습니다.
-```
-
-원인:
-
-```text
-새 PC에서는 DB가 비어 있어서 각 전략이 200개 종목 가격 데이터를 대량 조회함.
-전략 4개 기준 최대 800회 이상 TR 조회 가능.
-```
-
-대응 방법:
-
-```text
-1. main.py 종료
-2. 10~30분 대기
-3. 기존 PC의 .db 파일을 새 PC로 복사
-4. 또는 get_price_data 호출 사이에 time.sleep(4) 추가
-```
-
-테스트용으로 유니버스 수를 줄일 수도 있습니다.
-
-`util/make_up_universe.py`:
-
-```python
-df = df.loc[:199, ['종목코드', '종목명', '현재가', '거래량', 'PER', 'ROE']]
-```
-
-테스트 시:
-
-```python
-df = df.loc[:9, ['종목코드', '종목명', '현재가', '거래량', 'PER', 'ROE']]
-```
-
----
-
-## 9. 기존 PC에서 복사하면 좋은 DB 파일
-
-새 PC에서 대량 TR 조회를 피하려면 기존 PC의 DB 파일을 복사합니다.
-
-```text
-RSIStrategy.db
-HighBreakoutStrategy.db
-BandTrendStrategy.db
-BandReversionStrategy.db
-strategy_position.db
-sent_news.db
-universe_price.db
-```
-
-복사 위치:
-
-```text
-C:\Users\사용자명\Downloads\SystemTrading
-```
-
----
-
-## 10. 실행 방법
-
-모든 설정 완료 후:
-
-```cmd
-cd C:\Users\사용자명\Downloads\SystemTrading
-kiwoom\Scripts\activate
-python main.py
-```
-
-정상 흐름:
-
-```text
-Kiwoom 로그인
-미체결 조회
-잔고 조회
-예수금 조회
-전략 초기화
-통합 유니버스 생성
-타이머 시작
-장 시간이 아니면 대기
-장중이면 전략 검사 시작
-```
-
-장외에는 매수/매도 주문이 나가지 않습니다.  
-장중에 전략 조건이 충족되면 주문이 발생합니다.
-
----
-
-## 11. 자동매매 동작 조건
-
-프로그램이 정상적으로 초기화되어 계속 실행 중이면, 장 시작 후 전략 검사가 진행됩니다.
-
-```text
-프로그램 실행
-→ Kiwoom 로그인 성공
-→ 전략 초기화 완료
-→ 타이머 시작
-→ 장외에는 대기
-→ 장중에는 유니버스 종목 순차 검사
-→ 매수 조건 충족 시 매수 주문
-→ 보유 종목의 매도 조건 충족 시 매도 주문
-```
-
-단, “무조건 매수/매도”가 아니라 조건이 충족되어야 주문이 발생합니다.
-
----
-
-## 12. Git 작업 흐름
-
-수정 상태 확인:
-
-```cmd
-git status
-```
-
-변경 파일 추가:
-
-```cmd
-git add .
-```
-
-커밋:
-
-```cmd
-git commit -m "수정 내용"
-```
-
-GitHub에 업로드:
-
-```cmd
-git push
-```
-
-원격 최신 코드 받기:
-
-```cmd
-git pull
-```
-
----
-
-## 13. 자주 발생한 오류 정리
+## 8. 자주 발생한 오류 정리
 
 ### git 명령어 인식 안 됨
 
@@ -461,7 +312,7 @@ python -c "from PyQt5.QAxContainer import QAxWidget; print('QAx OK')"
 
 ---
 
-## 14. 주의사항
+## 9. 주의사항
 
 ```text
 1. main.py 실행 전 Kiwoom OpenAPI 버전처리 완료
@@ -472,3 +323,210 @@ python -c "from PyQt5.QAxContainer import QAxWidget; print('QAx OK')"
 6. BotFather 토큰이 노출되면 즉시 재발급
 7. 처음 세팅하는 PC에서는 유니버스 수를 줄이거나 TR 요청 간격을 늘려 테스트 권장
 ```
+
+# SystemTrading
+
+Kiwoom OpenAPI+ 기반의 국내 주식 자동매매 프로젝트입니다.
+
+
+
+## 현재 실행 전략
+
+`main.py` 기준 활성 전략은 3개입니다.
+
+1. **HighBreakoutStrategy**
+   - 직전 60거래일 신고가 돌파
+   - 거래량 및 거래대금 필터
+   - -5% 손절 / MA20 이탈 시 시장가 전량매도
+
+2. **PullbackTrendStrategy**
+   - MA5 > MA20 > MA60 정배열
+   - MA20 부근 눌림목 진입
+   - -5% 손절
+   - 거래량 +15% & 음봉 매도
+   - 전고점 30% 부분익절
+   - 다음 거래일 거래량 감소 시 잔량 매도
+
+3. **ValueQualityStrategy**
+   - TTM PER 0~15
+   - PBR 0~1
+   - 매출총이익률 30~95%
+   - 총자산회전율 1~10
+   - -10% 손절 / +30% 익절
+
+## 핵심 구조
+
+```text
+64bit marketdata Python
+    ↓
+pykrx / 외부 과거 데이터
+    ↓
+market_history.db
+    ↓
+32bit Kiwoom 자동매매
+    ↓
+StrategyManager
+    ├─ HighBreakout
+    ├─ PullbackTrend
+    └─ ValueQuality
+    ↓
+실시간 이벤트 기반 감시
+    ↓
+조건 충족 시 주문
+```
+
+## 실시간 FID
+
+2026-08-15 기준 공통 실시간 FID를 8개에서 4개로 축소했습니다.
+
+```text
+현재가
+시가
+누적거래량
+(최우선)매수호가
+```
+
+`StrategyManager`가 event-driven 전략별 필요 FID의 합집합을 계산하고,
+`Kiwoom.py`도 해당 FID만 `GetCommRealData`로 읽습니다.
+
+## 자금/리스크 정책
+
+- 전략별 고정 예산 배분 없음
+- 하나의 계좌 공용 현금 사용
+- 종목당 총자산 최대 10%
+- 계좌 전체 보유 + 신규매수 미체결 + 예약 종목 최대 10개
+- 실제 매수 주문은 StrategyManager를 통해 중앙 관리
+
+## Telegram
+
+Telegram은 계속 사용합니다.
+
+사용 용도:
+
+- 매수/매도 주문 및 체결 알림
+- 상태(`/status`) 확인
+- ValueQualityStrategy 보유종목의 한경 컨센서스 기업 리포트
+
+**기존 네이버 일반 경제뉴스 자동 전송 기능은 제거했습니다.**
+
+따라서 `util/notifier.py`는 삭제하면 안 됩니다.
+
+## 한경 기업 리포트
+
+ValueQualityStrategy 실제 보유종목에 대해서만 확인합니다.
+
+```text
+30분마다 확인
+    ↓
+마지막 확인 report_id 이후만 검사
+    ↓
+보유종목과 일치하는 새 리포트
+    ↓
+Telegram 전송
+```
+
+리포트 상태/중복 전송 정보는 `value_quality.db`에 저장합니다.
+
+## 주요 DB
+
+### 유지
+
+```text
+market_history.db
+strategy_position.db
+monitoring.db
+value_quality.db
+```
+
+`universe_price.db`는 기존 db_helper 호환 코드 정리가 끝날 때까지 유지합니다.
+
+### 제거된 레거시 DB
+
+코드 참조가 없는 경우 정리 스크립트가 아래 파일을 백업 후 삭제합니다.
+
+```text
+sent_news.db
+RSIStrategy.db
+BandTrendStrategy.db
+BandReversionStrategy.db
+HighBreakoutStrategy.db
+ORBStrategy.db
+```
+
+## 실행 환경
+
+### 자동매매
+
+```text
+Windows
+Python 3.9 32-bit
+PyQt5 QAxContainer
+Kiwoom OpenAPI+
+```
+
+### 과거 데이터 수집
+
+```text
+64-bit conda env: marketdata
+pykrx
+pandas
+numpy
+```
+
+## 현재 중요 파일
+
+```text
+main.py
+
+api/
+  Kiwoom.py
+
+strategy/
+  StrategyManager.py
+  HighBreakoutStrategy.py
+  PullbackTrendStrategy.py
+  ValueQualityStrategy.py
+
+util/
+  market_history.py
+  value_quality_data.py
+  hankyung_report_helper.py
+  db_helper.py
+  notifier.py
+  time_helper.py
+  const.py
+```
+
+## 2026-08-15 정리
+
+- 일반 경제뉴스 자동 전송 제거
+- `sent_news.db` 관련 코드 제거
+- 사용하지 않는 RSI/Band/ORB 전략 정리
+- 과거 전략별 DB 정리
+- 한경 컨센서스 리포트만 ValueQuality 보유종목에 전송
+- 한경 리포트 검사 주기 30분
+- 실시간 FID 8개 → 4개 축소
+- HighBreakout MA20 이탈 매도 시장가 통일
+- StrategyManager에서 전략별 FID 합집합 관리
+- Kiwoom 실시간 콜백도 필요한 FID만 조회
+
+## 다음 거래일 장중 확인
+
+아래 로그를 확인합니다.
+
+```text
+[Kiwoom] 주식체결 실시간 FID 적용: 4개 / [...]
+[StrategyManager] event-driven 공통 실시간 등록:
+...종목 / 3전략 공유 / FID 4개 [...]
+```
+
+추가 확인:
+
+- 현재가/시가/누적거래량/최우선매수호가 정상 수신
+- HighBreakout 매수/시장가 매도 정상
+- PullbackTrend 매수/매도 정상
+- ValueQuality 매수/손절/익절 정상
+- CPU/메모리 사용량
+- 실시간 틱 처리 지연 여부
+
+> `api/Kiwoom.before_fid_opt_*.py` 백업은 장중 FID 최적화가 정상임을 확인할 때까지 삭제하지 않습니다.

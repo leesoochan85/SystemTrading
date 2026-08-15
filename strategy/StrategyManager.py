@@ -20,7 +20,6 @@ from util.market_history import (
 from util.db_helper import (
     POSITION_DB,
     init_position_strategy_table,
-    init_sent_news_table,
     init_monitoring_tables,
     delete_position_strategy,
     get_position_strategy,
@@ -165,7 +164,6 @@ class StrategyManager(QObject):
         self.is_running = True
 
         init_position_strategy_table()
-        init_sent_news_table()
         init_monitoring_tables()
 
         self.initialize_strategies()

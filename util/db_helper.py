@@ -4,8 +4,6 @@ from datetime import datetime
 
 MONITORING_DB = "monitoring.db"
 POSITION_DB = "strategy_position.db"
-SENT_NEWS_DB = "sent_news.db"
-
 conn = sqlite3.connect("universe_price.db", isolation_level=None)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS balance(
@@ -196,28 +194,6 @@ def insert_df_to_db(db_name, table_name, df, option="replace"):
 def execute_sql(db_name, sql, params=None):
     con = sqlite3.connect(f"{db_name}.db")
     return con.execute(sql, params or {})
-
-def init_sent_news_table():
-    with sqlite3.connect(SENT_NEWS_DB) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS sent_news (
-                link TEXT PRIMARY KEY, title TEXT, source TEXT, sent_at TEXT
-            )
-        """)
-
-def is_news_sent(link):
-    init_sent_news_table()
-    with sqlite3.connect(SENT_NEWS_DB) as con:
-        row = con.execute("SELECT 1 FROM sent_news WHERE link = ? LIMIT 1", (link,)).fetchone()
-    return row is not None
-
-def save_sent_news(link, title, source="naver_economy"):
-    init_sent_news_table()
-    with sqlite3.connect(SENT_NEWS_DB) as con:
-        con.execute("""
-            INSERT OR IGNORE INTO sent_news (link, title, source, sent_at)
-            VALUES (?, ?, ?, ?)
-        """, (link, title, source, _now_text()))
 
 def _migrate_old_order_log_if_needed(con):
     columns = con.execute("PRAGMA table_info(order_log)").fetchall()
@@ -1036,12 +1012,6 @@ def save_strategy_daily_summaries(strategy_names):
                 counts.get(strategy_name, 0),
                 _now_text(),
             ))
-
-def get_last_sent_news_at():
-    init_sent_news_table()
-    with sqlite3.connect(SENT_NEWS_DB) as con:
-        row = con.execute("SELECT sent_at FROM sent_news ORDER BY sent_at DESC LIMIT 1").fetchone()
-    return None if row is None else row[0]
 
 def reduce_position_from_sell_fill(code, fill_quantity):
     """

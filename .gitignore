@@ -7,24 +7,23 @@ __pycache__/
 venv/
 env/
 
-
 *.sqlite3
 *.xlsx
 *.csv
-
+*.db
 *_test*.db
 *.db-wal
 *.db-shm
 
 .vscode/
 .env
+cleanup_backup_*/
 
 kiwoom/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.db
 *.sqlite3
 *.xlsx
 *.csv

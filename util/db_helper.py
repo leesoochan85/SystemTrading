@@ -1242,3 +1242,99 @@ def get_orb_runtime_state(trade_date, code):
             WHERE trade_date = ? AND code = ?
         """, (str(trade_date), normalized_code)).fetchone()
     return None if row is None else dict(row)
+
+
+# ---------------------------------------------------------------------------
+# PullbackTrendStrategy 전고점 부분청산 상태 저장
+# ---------------------------------------------------------------------------
+
+def init_pullback_runtime_table():
+    """전고점 도달/부분청산 상태를 재시작 후에도 복구할 수 있게 한다."""
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS pullback_runtime_state (
+                code TEXT PRIMARY KEY,
+                strategy_name TEXT NOT NULL,
+                previous_high REAL,
+                high_touch_date TEXT,
+                high_touch_volume INTEGER,
+                partial_exit_requested INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+
+def get_pullback_runtime_state(code):
+    init_pullback_runtime_table()
+    normalized_code = str(code).zfill(6)
+    with sqlite3.connect(MONITORING_DB) as con:
+        row = con.execute("""
+            SELECT code, strategy_name, previous_high, high_touch_date,
+                   high_touch_volume, partial_exit_requested, updated_at
+            FROM pullback_runtime_state
+            WHERE code = ?
+        """, (normalized_code,)).fetchone()
+    if row is None:
+        return None
+    return {
+        "code": row[0],
+        "strategy_name": row[1],
+        "previous_high": row[2],
+        "high_touch_date": row[3],
+        "high_touch_volume": int(row[4] or 0),
+        "partial_exit_requested": bool(row[5]),
+        "updated_at": row[6],
+    }
+
+
+def save_pullback_runtime_state(
+    code,
+    strategy_name,
+    previous_high=None,
+    high_touch_date=None,
+    high_touch_volume=None,
+    partial_exit_requested=None,
+):
+    """눌림목 전고점 상태를 upsert한다. None 필드는 기존 값을 유지한다."""
+    init_pullback_runtime_table()
+    normalized_code = str(code).zfill(6)
+    existing = get_pullback_runtime_state(normalized_code) or {}
+
+    values = {
+        "previous_high": previous_high if previous_high is not None else existing.get("previous_high"),
+        "high_touch_date": high_touch_date if high_touch_date is not None else existing.get("high_touch_date"),
+        "high_touch_volume": int(high_touch_volume) if high_touch_volume is not None else int(existing.get("high_touch_volume", 0) or 0),
+        "partial_exit_requested": int(bool(partial_exit_requested)) if partial_exit_requested is not None else int(bool(existing.get("partial_exit_requested", False))),
+    }
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.execute("""
+            INSERT INTO pullback_runtime_state (
+                code, strategy_name, previous_high, high_touch_date,
+                high_touch_volume, partial_exit_requested, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(code) DO UPDATE SET
+                strategy_name=excluded.strategy_name,
+                previous_high=excluded.previous_high,
+                high_touch_date=excluded.high_touch_date,
+                high_touch_volume=excluded.high_touch_volume,
+                partial_exit_requested=excluded.partial_exit_requested,
+                updated_at=excluded.updated_at
+        """, (
+            normalized_code,
+            strategy_name,
+            values["previous_high"],
+            values["high_touch_date"],
+            values["high_touch_volume"],
+            values["partial_exit_requested"],
+            _now_text(),
+        ))
+
+
+def delete_pullback_runtime_state(code):
+    init_pullback_runtime_table()
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.execute(
+            "DELETE FROM pullback_runtime_state WHERE code = ?",
+            (str(code).zfill(6),),
+        )

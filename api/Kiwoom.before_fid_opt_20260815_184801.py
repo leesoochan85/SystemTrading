@@ -29,13 +29,6 @@ class Kiwoom(QAxWidget):
         # 주식체결 실시간 틱을 전략이 직접 구독할 수 있도록 한다.
         # ORBStrategy는 09:00~09:04:59 틱만 집계해 첫 5분봉을 정확히 확정한다.
         self.realtime_listeners = []
-
-        self.stock_realtime_fid_names = {
-            "현재가",
-            "시가",
-            "누적거래량",
-            "(최우선)매수호가",
-        }
         
         # 잔고 조회 안전성 관리
         self.last_balance_query_success = False
@@ -1069,25 +1062,6 @@ class Kiwoom(QAxWidget):
 
             return self.balance
     
-    def set_stock_realtime_fid_names(self, fid_names):
-        normalized = {
-            str(name).strip()
-            for name in (fid_names or [])
-            if str(name).strip()
-        }
-
-        if not normalized:
-            raise ValueError(
-                "주식체결 실시간 FID 목록은 비어 있을 수 없습니다."
-            )
-
-        self.stock_realtime_fid_names = normalized
-
-        print(
-            "[Kiwoom] 주식체결 실시간 FID 적용: "
-            f"{len(normalized)}개 / {sorted(normalized)}"
-        )
-
     def add_realtime_listener(self, listener):
         """주식체결 실시간 정보 수신 시 호출할 콜백을 등록한다."""
         if listener not in self.realtime_listeners:
@@ -1124,52 +1098,46 @@ class Kiwoom(QAxWidget):
             pass        #일단 많이 사용하지 않아서 구현하지 않음. 필요하면 구현할 예정
         
         elif real_type == "주식체결":
-            tick_data = {}
+            signed_at =self.dynamicCall("GetCommRealData(QString, int)",s_code, get_fid("체결시간"))
+            close = self.dynamicCall("GetCommRealData(QString, int)", s_code, get_fid("현재가"))
+            close = abs(int(close))
+            high = self.dynamicCall("GetCommRealData(QString, int)", s_code, get_fid("고가"))
+            high = abs(int(high))
+            open = self.dynamicCall("GetCommRealData(QString, int)", s_code, get_fid("시가"))
+            open = abs(int(open))
+            low = self.dynamicCall("GetCommRealData(QString, int)", s_code, get_fid("저가"))
+            low = abs(int(low))
+            top_priority_ask = self.dynamicCall("GetCommRealData(QString, int)", s_code, get_fid("(최우선)매도호가"))
+            top_priority_ask = abs(int(top_priority_ask))
+            top_priority_bid = self.dynamicCall("GetCommRealData(QString, int)", s_code, get_fid("(최우선)매수호가"))
+            top_priority_bid = abs(int(top_priority_bid))
+            accum_volume = self.dynamicCall("GetCommRealData(QString, int)", s_code, get_fid("누적거래량"))
+            accum_volume = abs(int(accum_volume))
+            
+            #print(s_code, signed_at, close, high, open, low, top_priority_ask, top_priority_bid, accum_volume)
+            #수신 정보가 너무 많아져 프린트 주석처리
+            
+            if s_code not in self.universe_realtime_transaction_info:
+                self.universe_realtime_transaction_info.update({s_code: {}})
+            
+            tick_data = {
+                "체결시간": signed_at,
+                "현재가": close,
+                "고가": high,
+                "시가": open,
+                "저가": low,
+                "(최우선)매도호가": top_priority_ask,
+                "(최우선)매수호가": top_priority_bid,
+                "누적거래량": accum_volume
+            }
+            self.universe_realtime_transaction_info[s_code].update(tick_data)
 
-            for fid_name in sorted(
-                self.stock_realtime_fid_names
-            ):
-                raw_value = self.dynamicCall(
-                    "GetCommRealData(QString, int)",
-                    s_code,
-                    get_fid(fid_name),
-                )
-
-                if fid_name == "체결시간":
-                    value = str(raw_value).strip()
-                else:
-                    value = abs(
-                        self._safe_int(raw_value)
-                    )
-
-                tick_data[fid_name] = value
-
-            if (
-                s_code
-                not in self.universe_realtime_transaction_info
-            ):
-                self.universe_realtime_transaction_info[
-                    s_code
-                ] = {}
-
-            self.universe_realtime_transaction_info[
-                s_code
-            ].update(tick_data)
-
-            for listener in list(
-                self.realtime_listeners
-            ):
+            for listener in list(self.realtime_listeners):
                 try:
-                    listener(
-                        s_code,
-                        dict(tick_data),
-                    )
+                    listener(s_code, dict(tick_data))
                 except Exception as e:
-                    print(
-                        "[Kiwoom] 실시간 리스너 오류: "
-                        f"{e}"
-                    )
-
+                    print(f"[Kiwoom] 실시간 리스너 오류: {e}")
+    
     def get_fid(search_value): #const 파일에서 fid 이름으로 fid 번호 찾는 함수
         keys = [key for key, value in FID_CODES.items() if value == search_value]
         return keys[0]

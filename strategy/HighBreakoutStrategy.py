@@ -3,432 +3,750 @@ import math
 import time
 import traceback
 
-import numpy as np
-import pandas as pd
 from PyQt5.QtCore import QThread
 
 from util.const import get_fid
 from util.db_helper import (
-    check_table_exists,
-    execute_sql,
-    insert_df_to_db,
     save_position_strategy,
     get_position_strategy,
-    delete_position_strategy,
 )
-from util.make_up_universe import get_universe
+from util.market_history import (
+    MIN_HISTORY_DAYS,
+    get_db_path as get_market_history_db_path,
+    load_breakout_metrics,
+    load_company_stock_master,
+)
 from util.notifier import send_message
-from util.time_helper import check_adjacent_transaction_closed_for_buying, check_transaction_closed, check_transaction_open
+from util.time_helper import (
+    check_adjacent_transaction_closed_for_buying,
+    check_transaction_open,
+)
 
 
 class HighBreakoutStrategy(QThread):
+    """KOSPI+KOSDAQ 기업주식 전체를 실시간 이벤트로 감시하는 신고가 전략.
+
+    핵심 구조
+    ---------
+    - 과거 일봉은 market_history.db에서만 읽는다.
+    - 장 시작 전에 직전 60일 최고가/20일 평균거래량/20일 평균거래대금을 종목별 1회 계산한다.
+    - 장중에는 pandas rolling을 반복하지 않고 실시간 틱 숫자만 비교한다.
+    - 종목을 1초마다 순회하지 않고 Kiwoom 주식체결 이벤트가 온 종목만 즉시 검사한다.
+    - 매수 수량/예산/계좌 전체 보유수 제한은 StrategyManager가 담당한다.
     """
-    신고가 돌파 전략
 
-    매수 조건:
-      - 현재가가 직전 BREAKOUT_WINDOW일 동안의 최고가를 돌파
-      - 오늘 누적거래량이 직전 20일 평균 거래량 이상
-      - 보유/미체결 포함 최대 MAX_POSITIONS개까지만 보유
-
-    매도 조건:
-      - 현재가가 20일 이동평균선 아래로 내려감
-      - 또는 매입가 대비 STOP_LOSS_PCT 이하로 하락
-
-    중요:
-      - 매번 새 유니버스를 만들더라도 현재 보유 종목은 반드시 self.universe에 합친다.
-      - 따라서 보유 종목은 실시간 등록 대상이 되고, run()에서 매도 조건을 계속 확인한다.
-    """
+    strategy_name = "HighBreakoutStrategy"
+    event_driven = True
 
     BREAKOUT_WINDOW = 60
     VOLUME_AVG_WINDOW = 20
-    MAX_POSITIONS = 10
-    BUY_FEE_RATE = 0.00035
+    MIN_AVG_TRADING_VALUE = 2_000_000_000  # 최근 20봉 평균 거래대금 최소 20억원
     STOP_LOSS_PCT = -5.0
+
+    REALTIME_CHUNK_SIZE = 90
+    REALTIME_SCREEN_START = 3000
+    MAX_REALTIME_SCREENS = 190
 
     def __init__(self, kiwoom, auto_init=True):
         super().__init__()
-        self.strategy_name = "HighBreakoutStrategy"
         self.kiwoom = kiwoom
         self.universe = {}
-        self.deposit = 0
         self.is_init_success = False
+        self.breakout_metrics = {}
+
+        self.listener_registered = False
+        self.realtime_registered = False
+
+        self.order_guard = None
+        self.buy_order_handler = None
+
+        self.market_history_db_path = get_market_history_db_path()
+        self.last_signal_log_at = {}
 
         if auto_init:
             self.init_strategy()
 
-    def init_strategy(self):
+    def set_order_guard(self, callback):
+        """Manager의 계좌/예수금 안전상태를 실시간 주문 직전에 확인한다."""
+        self.order_guard = callback
+
+    def set_buy_order_handler(self, callback):
+        """실제 매수 수량/자금 예약/SendOrder를 Manager에 위임한다."""
+        self.buy_order_handler = callback
+
+    def _order_allowed(self):
+        if self.order_guard is None:
+            return self.is_init_success
+
         try:
-            # 보유 종목을 유니버스에 강제 포함해야 하므로 잔고를 먼저 가져온다.
+            return bool(self.order_guard())
+        except Exception:
+            return False
+
+    def init_strategy(self):
+        """
+        단독 실행 호환용.
+
+        main.py에서는 auto_init=False로 만들고 StrategyManager가 초기화하므로
+        일반 실행에서는 이 경로를 사용하지 않는다.
+        """
+        try:
             self.kiwoom.get_order()
             self.kiwoom.get_balance()
 
             self.check_and_get_universe()
             self.check_and_get_price_data()
-
-            self.deposit = self.kiwoom.get_deposit()
             self.set_universe_real_time()
+
             self.is_init_success = True
-            send_message("[HighBreakoutStrategy] 초기화 완료")
+            send_message(
+                "[HighBreakoutStrategy] "
+                "전체 기업주식 실시간 초기화 완료"
+            )
+
         except Exception:
             error_msg = traceback.format_exc()
             print(error_msg)
             send_message(error_msg)
 
     def check_and_get_universe(self, shared_universe_df=None):
-        """공통 시총 유니버스를 적용하고, 현재 보유 종목은 매도 관리를 위해 유지한다."""
-        if shared_universe_df is None:
-            universe_df = get_universe(return_df=True).copy()
-        else:
-            universe_df = shared_universe_df.copy()
-        universe_df["종목코드"] = universe_df["종목코드"].astype(str).str.strip().str.upper().str.zfill(6)
-        universe_df = universe_df[universe_df["종목코드"].str.fullmatch(r"[0-9A-Za-z]{6}", na=False)]
-        universe_df = universe_df.drop_duplicates(subset=["종목코드"])
+        """market_history.db의 KOSPI+KOSDAQ 기업주식 마스터를 사용한다."""
+        master_df = load_company_stock_master(
+            db_path=self.market_history_db_path
+        )
+
+        if master_df.empty:
+            raise RuntimeError(
+                "stock_master가 비어 있습니다. "
+                "64bit Python으로 bootstrap_market_history.py를 "
+                "먼저 실행하세요."
+            )
 
         self.universe = {
-            code: {"code_name": name, "holding": False}
-            for code, name in zip(universe_df["종목코드"], universe_df["종목명"])
+            str(code).strip().upper().zfill(6): {
+                "code_name": str(name).strip() or str(code),
+                "market": str(market),
+                "holding": False,
+            }
+            for code, name, market in zip(
+                master_df["code"],
+                master_df["code_name"],
+                master_df["market"],
+            )
         }
 
-        # 핵심 수정: 현재 보유 중인 종목은 새 유니버스 조건과 관계없이 강제 포함한다.
-        for code, balance_info in self.kiwoom.balance.items():
-            code = str(code).strip().zfill(6)
-            code_name = balance_info.get("종목명") or self.kiwoom.get_master_code_name(code) or code
+        # 시총/상장상태 변화와 무관하게 기존 보유 종목은 매도 관리를 위해 유지한다.
+        for raw_code, balance_info in self.kiwoom.balance.items():
+            code = str(raw_code).strip().upper().zfill(6)
+            code_name = (
+                balance_info.get("종목명")
+                or self.kiwoom.get_master_code_name(code)
+                or code
+            )
+
             if code not in self.universe:
-                self.universe[code] = {"code_name": code_name, "holding": True}
-                print(f"[보유종목 유니버스 추가] {code} {code_name}")
+                self.universe[code] = {
+                    "code_name": code_name,
+                    "market": "HOLDING",
+                    "holding": True,
+                }
             else:
                 self.universe[code]["holding"] = True
 
-        now = datetime.now().strftime("%Y%m%d")
-        save_df = pd.DataFrame(
-            {
-                "code": list(self.universe.keys()),
-                "code_name": [v["code_name"] for v in self.universe.values()],
-                "holding": [v.get("holding", False) for v in self.universe.values()],
-                "created_at": [now] * len(self.universe),
-            }
+        print(
+            f"[HighBreakout] 기업주식 유니버스: "
+            f"{len(self.universe)}종목"
         )
-        insert_df_to_db(self.strategy_name, "universe", save_df)
-        print(self.universe)
 
     def check_and_get_price_data(self, shared_price_map=None):
-        """일봉 데이터를 준비한다. Manager 실행 시에는 종목별 1회 조회된 공통 데이터를 공유한다."""
-        if shared_price_map is not None:
-            for code in self.universe.keys():
-                normalized_code = str(code).strip().zfill(6)
-                price_df = shared_price_map.get(normalized_code)
-
-                if price_df is None:
-                    raise KeyError(
-                        f"[공통 일봉 누락] {self.strategy_name} / {normalized_code}"
-                    )
-
-                self.universe[code]["price_df"] = price_df.copy()
-
-            print(
-                f"[{self.strategy_name}] 공통 일봉 적용 완료: "
-                f"{len(self.universe)}종목"
-            )
-            return
-
-        # 전략 단독 실행 또는 기존 호환 경로: 전략 DB에서 자체적으로 일봉을 준비한다.
-        for idx, code in enumerate(list(self.universe.keys()), start=1):
-            print(f"{idx}/{len(self.universe)}) {code}")
-
-            if not check_table_exists(self.strategy_name, code):
-                price_df = self.kiwoom.get_price_data(code)
-                time.sleep(4)
-                insert_df_to_db(self.strategy_name, code, price_df)
-                self.universe[code]["price_df"] = price_df
-                continue
-
-            if check_transaction_closed():
-                sql = "select max('{}') from '{}'".format("date", code)
-                cur = execute_sql(self.strategy_name, sql)
-                last_date = cur.fetchone()
-                now = datetime.now().strftime("%Y%m%d")
-                if not last_date or last_date[0] != now:
-                    price_df = self.kiwoom.get_price_data(code)
-                    time.sleep(4) # 키움 장종료 후 일봉 연속 조회 제한 방지
-                    insert_df_to_db(self.strategy_name, code, price_df)
-
-            sql = "select * from '{}'".format(code)
-            cur = execute_sql(self.strategy_name, sql)
-            cols = [column[0] for column in cur.description]
-            price_df = pd.DataFrame.from_records(data=cur.fetchall(), columns=cols)
-            price_df = price_df.set_index("index")
-            self.universe[code]["price_df"] = price_df
-
-    def set_universe_real_time(self):
-        # 키움 실시간 등록은 종목 수가 많아질 수 있으므로 화면번호를 나누어 등록한다.
+        """신고가 계산에 필요한 요약 지표만 메모리에 올린다."""
         codes = list(self.universe.keys())
-        fids = ";".join(
-            [
-                get_fid("체결시간"),
-                get_fid("현재가"),
-                get_fid("시가"),
-                get_fid("고가"),
-                get_fid("저가"),
-                get_fid("누적거래량"),
-                get_fid("(최우선)매도호가"),
-                get_fid("(최우선)매수호가"),
-            ]
+
+        metrics = load_breakout_metrics(
+            codes,
+            breakout_window=self.BREAKOUT_WINDOW,
+            volume_window=self.VOLUME_AVG_WINDOW,
+            ma_window=20,
+            db_path=self.market_history_db_path,
         )
 
-        chunk_size = 90
-        for i in range(0, len(codes), chunk_size):
-            screen_no = str(1300 + (i // chunk_size))
-            code_chunk = ";".join(codes[i : i + chunk_size])
-            self.kiwoom.set_real_reg(screen_no, code_chunk, fids, "0")
-            print(f"[실시간 등록] screen={screen_no}, count={len(codes[i : i + chunk_size])}")
+        self.breakout_metrics = metrics
+        missing = [
+            code
+            for code in codes
+            if code not in metrics
+        ]
 
-    def get_today_price_df(self, code):
-        if code not in self.universe or "price_df" not in self.universe[code]:
+        print(
+            "[HighBreakout] 신고가 기준값 준비: "
+            f"{len(metrics)}/{len(codes)}종목 / "
+            f"이력부족 {len(missing)}종목"
+        )
+
+        if not metrics:
+            raise RuntimeError(
+                "신고가 계산 가능한 종목이 없습니다. "
+                f"최소 {MIN_HISTORY_DAYS}거래일을 구축하세요."
+            )
+
+    def get_realtime_candidate_codes(self):
+        """신규매수 가능 종목 + 이 전략 기존 보유종목."""
+        eligible_codes = set(
+            self.breakout_metrics.keys()
+        )
+
+        holding_codes = {
+            str(code).strip().upper().zfill(6)
+            for code in self.kiwoom.balance
+            if get_position_strategy(code)
+            == self.strategy_name
+        }
+
+        return sorted(
+            eligible_codes | holding_codes
+        )
+
+    def get_required_realtime_fids(self):
+        return {
+            "현재가",
+            "누적거래량",
+            "(최우선)매수호가",
+        }
+
+    def set_universe_real_time(
+        self,
+        register_market=True,
+        codes_override=None,
+        force_refresh=False,
+        fid_names_override=None,
+    ):
+        if not self.listener_registered:
+            self.kiwoom.add_realtime_listener(
+                self.on_realtime_tick
+            )
+            self.listener_registered = True
+
+        # Manager가 두 전략의 후보 합집합을 한 번 등록하기 위해
+        # 초기화 단계에서는 listener만 붙일 수 있다.
+        if not register_market:
+            return
+
+        if (
+            self.realtime_registered
+            and not force_refresh
+        ):
+            return
+
+        codes = (
+            sorted(
+                set(
+                    str(code)
+                    .strip()
+                    .upper()
+                    .zfill(6)
+                    for code in codes_override
+                )
+            )
+            if codes_override is not None
+            else self.get_realtime_candidate_codes()
+        )
+
+        required_screens = (
+            math.ceil(
+                len(codes)
+                / self.REALTIME_CHUNK_SIZE
+            )
+            if codes
+            else 0
+        )
+
+        if required_screens > self.MAX_REALTIME_SCREENS:
+            raise RuntimeError(
+                "신고가 실시간 등록에 "
+                f"{required_screens}개 화면이 필요합니다. "
+                f"안전 한도 {self.MAX_REALTIME_SCREENS}개를 "
+                "초과했습니다."
+            )
+
+        fid_names = (
+            set(fid_names_override)
+            if fid_names_override is not None
+            else self.get_required_realtime_fids()
+        )
+        fids = ";".join(
+            get_fid(name)
+            for name in sorted(fid_names)
+        )
+
+        for i in range(
+            0,
+            len(codes),
+            self.REALTIME_CHUNK_SIZE,
+        ):
+            screen_no = str(
+                self.REALTIME_SCREEN_START
+                + (i // self.REALTIME_CHUNK_SIZE)
+            )
+            code_chunk = ";".join(
+                codes[
+                    i : i
+                    + self.REALTIME_CHUNK_SIZE
+                ]
+            )
+
+            result = self.kiwoom.set_real_reg(
+                screen_no,
+                code_chunk,
+                fids,
+                "0",
+            )
+
+            if result not in (0, None):
+                raise RuntimeError(
+                    "실시간 등록 실패: "
+                    f"screen={screen_no}, "
+                    f"result={result}"
+                )
+
+        self.realtime_registered = True
+
+        print(
+            "[HighBreakout] 공통 실시간 이벤트 등록 완료: "
+            f"{len(codes)}종목 / "
+            f"{required_screens}화면"
+        )
+
+    def on_realtime_tick(self, raw_code, tick):
+        """체결 이벤트가 들어온 종목만 즉시 검사한다."""
+        code = (
+            str(raw_code)
+            .strip()
+            .upper()
+            .zfill(6)
+        )
+
+        if (
+            code not in self.universe
+            or not self.is_init_success
+        ):
+            return
+
+        if not self._order_allowed():
+            return
+
+        order_info = self.kiwoom.order.get(
+            code,
+            {},
+        )
+
+        if int(
+            order_info.get("미체결수량", 0)
+            or 0
+        ) > 0:
+            return
+
+        try:
+            if code in self.kiwoom.balance:
+                if (
+                    get_position_strategy(code)
+                    != self.strategy_name
+                ):
+                    return
+
+                if self.check_sell_signal(
+                    code,
+                    tick=tick,
+                ):
+                    self.order_sell(
+                        code,
+                        tick=tick,
+                    )
+
+                return
+
+            self.check_buy_signal_and_order(
+                code,
+                tick=tick,
+            )
+
+        except Exception as exc:
+            print(
+                "[HighBreakout] 실시간 검사 오류 "
+                f"{code}: {exc}"
+            )
+
+    def _metric(self, code):
+        return self.breakout_metrics.get(
+            str(code)
+            .strip()
+            .upper()
+            .zfill(6)
+        )
+
+    def _dynamic_ma20(
+        self,
+        code,
+        current_price,
+    ):
+        metric = self._metric(code)
+
+        if not metric:
             return None
-        if code not in self.kiwoom.universe_realtime_transaction_info:
-            return None
 
-        rt = self.kiwoom.universe_realtime_transaction_info[code]
-        today = datetime.now().strftime("%Y%m%d")
-        df = self.universe[code]["price_df"].copy()
-        df.loc[today] = [rt["시가"], rt["고가"], rt["저가"], rt["현재가"], rt["누적거래량"]]
+        if (
+            int(
+                metric.get(
+                    "ma19_count",
+                    0,
+                )
+                or 0
+            )
+            == 19
+        ):
+            return (
+                float(
+                    metric["ma19_close_sum"]
+                )
+                + float(current_price)
+            ) / 20.0
 
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df
+        return (
+            float(
+                metric.get("ma20", 0)
+                or 0
+            )
+            or None
+        )
 
-    def get_signal_df(self, code):
-        df = self.get_today_price_df(code)
-        min_len = max(self.BREAKOUT_WINDOW, self.VOLUME_AVG_WINDOW, 20) + 2
-        if df is None or len(df) < min_len:
-            return None
-
-        df = df.copy()
-        df["prev_highest_high"] = df["high"].shift(1).rolling(window=self.BREAKOUT_WINDOW).max()
-        df["volume_ma20"] = df["volume"].shift(1).rolling(window=self.VOLUME_AVG_WINDOW).mean()
-        df["ma20"] = df["close"].rolling(window=20).mean()
-        return df
-
-    def check_buy_signal_and_order(self, code):
-        if check_adjacent_transaction_closed_for_buying():
+    def check_buy_signal_and_order(
+        self,
+        code,
+        tick=None,
+    ):
+        if (
+            check_adjacent_transaction_closed_for_buying()
+            or not check_transaction_open()
+        ):
             return False
-        if not check_transaction_open():
-            return False
+
         if code in self.kiwoom.balance:
             return False
-        if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+
+        order_info = self.kiwoom.order.get(
+            code,
+            {},
+        )
+
+        if int(
+            order_info.get("미체결수량", 0)
+            or 0
+        ) > 0:
             return False
 
-        df = self.get_signal_df(code)
-        if df is None:
+        metric = self._metric(code)
+        if not metric:
             return False
 
-        latest = df.iloc[-1]
-        current_price = latest["close"]
-        prev_highest_high = latest["prev_highest_high"]
-        volume = latest["volume"]
-        volume_ma20 = latest["volume_ma20"]
+        rt = (
+            tick
+            or self.kiwoom
+            .universe_realtime_transaction_info
+            .get(code, {})
+        )
 
-        if pd.isna(prev_highest_high) or pd.isna(volume_ma20):
+        current_price = int(
+            rt.get("현재가", 0) or 0
+        )
+        volume = int(
+            rt.get("누적거래량", 0) or 0
+        )
+
+        breakout_price = float(
+            metric.get(
+                "breakout_price",
+                0,
+            )
+            or 0
+        )
+        volume_ma20 = float(
+            metric.get(
+                "volume_ma20",
+                0,
+            )
+            or 0
+        )
+        trading_value_ma20 = float(
+            metric.get(
+                "trading_value_ma20",
+                0,
+            )
+            or 0
+        )
+
+        if (
+            current_price <= 0
+            or breakout_price <= 0
+            or volume_ma20 < 0
+            or trading_value_ma20 <= 0
+        ):
             return False
 
-        # 신고가 돌파: 오늘 현재가가 직전 N일 최고가를 넘어섰을 때
-        if not (current_price > prev_highest_high and volume >= volume_ma20):
+        # 신고가 + 거래량 + 유동성 필터
+        if not (
+            current_price > breakout_price
+            and volume >= volume_ma20
+            and trading_value_ma20 >= self.MIN_AVG_TRADING_VALUE
+        ):
             return False
 
-        if (self.get_balance_count() + self.get_buy_order_count()) >= self.MAX_POSITIONS:
-            return False
+        bid = int(
+            rt.get(
+                "(최우선)매수호가",
+                0,
+            )
+            or 0
+        )
 
-        rt = self.kiwoom.universe_realtime_transaction_info.get(code)
-        if not rt:
-            return False
-
-        bid = rt["(최우선)매수호가"]
         if bid <= 0:
             return False
 
-        remain_slots = self.MAX_POSITIONS - (self.get_balance_count() + self.get_buy_order_count())
-        budget = self.deposit / remain_slots
-        quantity = math.floor(budget / bid)
-        if quantity < 1:
+        if self.buy_order_handler is None:
+            print(
+                "[HighBreakout] "
+                "Manager buy_order_handler가 "
+                "연결되지 않았습니다."
+            )
             return False
 
-        amount = quantity * bid
-        estimated_amount = math.floor(amount * (1 + self.BUY_FEE_RATE))
-        if self.deposit < estimated_amount:
+        order = self.buy_order_handler(
+            strategy_name=self.strategy_name,
+            code=code,
+            code_name=self.universe[code][
+                "code_name"
+            ],
+            price=bid,
+            rqname="send_buy_order",
+            screen_no="2004",
+        )
+
+        if order is None:
             return False
 
-        result = self.kiwoom.send_order("send_buy_order", "2004", 1, code, quantity, bid, "00", strategy_name=self.strategy_name)
-        if result == 0:
-            self.deposit -= estimated_amount
+        quantity = int(
+            order["quantity"]
+        )
 
-            save_position_strategy(
-                code=code,
-                code_name=self.universe[code]["code_name"],
-                strategy_name=self.strategy_name,
-                quantity=0,
-                buy_price=0,
-            )
-            send_message(
-                f"[신고가돌파 매수] {self.universe[code]['code_name']}({code}) "
-                f"{quantity}주 {bid}원 / 직전{self.BREAKOUT_WINDOW}일 최고가 {int(prev_highest_high)}원 돌파"
-            )
-            self.kiwoom.order[code] = {"주문구분": "매수", 
-                                       "주문가격": bid,
-                                       "미체결수량": quantity, 
-                                       "strategy_name": self.strategy_name,
-                                       "order_time": time.time(),}
-            return True
+        save_position_strategy(
+            code=code,
+            code_name=self.universe[code][
+                "code_name"
+            ],
+            strategy_name=self.strategy_name,
+            quantity=0,
+            buy_price=0,
+        )
 
-        send_message(f"[신고가돌파 매수 실패] {self.universe[code]['code_name']}({code}) result={result}")
-        return False
+        send_message(
+            f"[신고가돌파 매수] "
+            f"{self.universe[code]['code_name']}"
+            f"({code}) "
+            f"{quantity}주 {bid:,}원 / "
+            f"직전{self.BREAKOUT_WINDOW}일 최고가 "
+            f"{int(breakout_price):,}원 돌파 / "
+            f"누적거래량 {volume:,} / "
+            f"20일 평균거래대금 "
+            f"{trading_value_ma20 / 100_000_000:,.1f}억원"
+        )
 
-    def is_stop_loss_triggered(self, code):
-        """실시간 현재가 기준 수익률이 고정 손절선 이하인지 확인한다."""
+        return True
+
+    def is_stop_loss_triggered(
+        self,
+        code,
+        tick=None,
+    ):
         if code not in self.kiwoom.balance:
             return False
 
-        balance_info = self.kiwoom.balance[code]
-        purchase_price = balance_info.get("매입가", balance_info.get("매입단가", 0))
-        rt = self.kiwoom.universe_realtime_transaction_info.get(code, {})
-        current_price = rt.get("현재가", balance_info.get("현재가", 0))
+        balance_info = self.kiwoom.balance[
+            code
+        ]
 
-        if purchase_price <= 0 or not current_price or current_price <= 0:
+        purchase_price = float(
+            balance_info.get(
+                "매입가",
+                balance_info.get(
+                    "매입단가",
+                    0,
+                ),
+            )
+            or 0
+        )
+
+        rt = (
+            tick
+            or self.kiwoom
+            .universe_realtime_transaction_info
+            .get(code, {})
+        )
+
+        current_price = float(
+            rt.get(
+                "현재가",
+                balance_info.get(
+                    "현재가",
+                    0,
+                ),
+            )
+            or 0
+        )
+
+        if (
+            purchase_price <= 0
+            or current_price <= 0
+        ):
             return False
 
-        return_rate = (current_price - purchase_price) / purchase_price * 100
-        return return_rate <= self.STOP_LOSS_PCT
+        return (
+            (
+                current_price
+                - purchase_price
+            )
+            / purchase_price
+            * 100
+        ) <= self.STOP_LOSS_PCT
 
-    def check_sell_signal(self, code):
+    def check_sell_signal(
+        self,
+        code,
+        tick=None,
+    ):
         if code not in self.kiwoom.balance:
             return False
 
-        # -5% 손절은 이동평균 계산 가능 여부와 무관하게 먼저 판단한다.
-        if self.is_stop_loss_triggered(code):
+        if self.is_stop_loss_triggered(
+            code,
+            tick=tick,
+        ):
             return True
 
-        df = self.get_signal_df(code)
-        if df is None:
+        rt = (
+            tick
+            or self.kiwoom
+            .universe_realtime_transaction_info
+            .get(code, {})
+        )
+
+        current_price = float(
+            rt.get("현재가", 0) or 0
+        )
+
+        if current_price <= 0:
             return False
 
-        latest = df.iloc[-1]
-        current_price = latest["close"]
-        ma20 = latest["ma20"]
-        if pd.isna(current_price) or pd.isna(ma20):
+        ma20 = self._dynamic_ma20(
+            code,
+            current_price,
+        )
+
+        if ma20 is None:
             return False
 
-        # 손절이 아닌 기존 추세 청산: 20일선 이탈 시 지정가 매도한다.
-        return bool(current_price < ma20)
+        return current_price < ma20
 
-    def order_sell(self, code):
+    def order_sell(
+        self,
+        code,
+        tick=None,
+    ):
         balance_info = self.kiwoom.balance[code]
-        quantity = balance_info.get("매매가능수량", 0) or balance_info.get("보유수량", 0)
+
+        quantity = int(
+            balance_info.get("매매가능수량", 0)
+            or balance_info.get("보유수량", 0)
+            or 0
+        )
+
         if quantity < 1:
             return False
 
-        is_stop_loss = self.is_stop_loss_triggered(code)
-        if is_stop_loss:
-            order_price = 0
-            order_classification = "03"  # 시장가
-            order_label = "[신고가돌파 손절 시장가 매도]"
-        else:
-            rt = self.kiwoom.universe_realtime_transaction_info.get(code, {})
-            order_price = rt.get("(최우선)매도호가", 0)
-            if order_price <= 0:
-                return False
-            order_classification = "00"  # 지정가
-            order_label = "[신고가돌파 매도]"
+        is_stop_loss = self.is_stop_loss_triggered(
+            code,
+            tick=tick,
+        )
+
+        order_label = (
+            "[신고가돌파 손절 시장가 매도]"
+            if is_stop_loss
+            else "[신고가돌파 MA20 이탈 시장가 매도]"
+        )
 
         result = self.kiwoom.send_order(
-            "send_sell_order", "2004", 2, code, quantity,
-            order_price, order_classification, strategy_name=self.strategy_name
+            "send_sell_order",
+            "2004",
+            2,
+            code,
+            quantity,
+            0,
+            "03",
+            strategy_name=self.strategy_name,
         )
-        if result == 0:
-            price_text = "시장가" if is_stop_loss else f"{order_price}원"
-            send_message(f"{order_label} {self.universe[code]['code_name']}({code}) {quantity}주 {price_text}")
-            self.kiwoom.order[code] = {
-                "주문구분": "매도",
-                "미체결수량": quantity,
-                "strategy_name": self.strategy_name,
-            }
-            return True
-        send_message(f"{order_label} 주문 실패: {self.universe[code]['code_name']}({code}) result={result}")
-        return False
 
-    def get_balance_count(self):
-        balance_count = len(self.kiwoom.balance)
-        for code in self.kiwoom.order.keys():
-            if (
-                code in self.kiwoom.balance
-                and self.kiwoom.order[code].get("주문구분") == "매도"
-                and self.kiwoom.order[code].get("미체결수량", 0) == 0
-            ):
-                balance_count -= 1
-        return balance_count
+        if result != 0:
+            send_message(
+                f"{order_label} 주문 실패: "
+                f"{self.universe[code]['code_name']}"
+                f"({code}) result={result}"
+            )
+            return False
 
-    def get_buy_order_count(self):
-        buy_order_count = 0
-        for code in self.kiwoom.order.keys():
-            if (
-                code not in self.kiwoom.balance
-                and self.kiwoom.order[code].get("주문구분") == "매수"
-                and self.kiwoom.order[code].get("미체결수량", 0) > 0
-            ):
-                buy_order_count += 1
-        return buy_order_count
+        self.kiwoom.order[code] = {
+            "주문구분": "매도",
+            "주문가격": 0,
+            "미체결수량": quantity,
+            "strategy_name": self.strategy_name,
+            "order_time": time.time(),
+        }
+
+        send_message(
+            f"{order_label} "
+            f"{self.universe[code]['code_name']}"
+            f"({code}) {quantity}주 시장가"
+        )
+
+        return True
 
     def check_code(self, code):
+        """Manager 호환용. 신규매수는 실시간 이벤트에서 처리한다."""
+        code = (
+            str(code)
+            .strip()
+            .upper()
+            .zfill(6)
+        )
+
         if code not in self.universe:
             return False
 
-        if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
+        order_info = self.kiwoom.order.get(
+            code,
+            {},
+        )
+
+        if int(
+            order_info.get("미체결수량", 0)
+            or 0
+        ) > 0:
             return False
 
         if code in self.kiwoom.balance:
-            owner_strategy = get_position_strategy(code)
-
-            if owner_strategy != self.strategy_name:
+            if (
+                get_position_strategy(code)
+                != self.strategy_name
+            ):
                 return False
 
             if self.check_sell_signal(code):
                 return self.order_sell(code)
 
-            return False
-
-        return self.check_buy_signal_and_order(code)
-
-    # def run(self):
-    #     print("[HighBreakoutStrategy] run 시작")
-    #     while self.is_init_success:
-    #         try:
-    #             if not check_transaction_open():
-    #                 print("장 시간이 아니므로 대기합니다.")
-    #                 time.sleep(60)
-    #                 continue
-
-    #             # 장중 잔고 변동을 주기적으로 반영한다.
-    #             self.kiwoom.get_balance()
-
-    #             for idx, code in enumerate(list(self.universe.keys()), start=1):
-    #                 print(f"[{self.strategy_name}] [{idx}/{len(self.universe)}_{self.universe[code]['code_name']}]")
-    #                 time.sleep(0.5)
-
-    #                 if code in self.kiwoom.order and self.kiwoom.order[code].get("미체결수량", 0) > 0:
-    #                     continue
-
-    #                 if code in self.kiwoom.balance:
-    #                     owner_strategy = get_position_strategy(code)
-
-    #                     if owner_strategy != self.strategy_name:
-    #                         continue
-
-    #                     if self.check_sell_signal(code):
-    #                         self.order_sell(code)
-    #                 else:
-    #                     self.check_buy_signal_and_order(code)
-
-    #         except Exception:
-    #             error_msg = traceback.format_exc()
-    #             print(error_msg)
-    #             send_message(error_msg)
-    #             time.sleep(5)
+        return False

@@ -7,10 +7,14 @@ __pycache__/
 venv/
 env/
 
-*.db
+
 *.sqlite3
 *.xlsx
 *.csv
+
+*_test*.db
+*.db-wal
+*.db-shm
 
 .vscode/
 .env

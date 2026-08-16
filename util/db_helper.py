@@ -1,9 +1,12 @@
+import json
 import sqlite3
 from datetime import datetime
 
 
 MONITORING_DB = "monitoring.db"
 POSITION_DB = "strategy_position.db"
+SENT_NEWS_DB = "sent_news.db"
+
 conn = sqlite3.connect("universe_price.db", isolation_level=None)
 cur = conn.cursor()
 cur.execute('''CREATE TABLE IF NOT EXISTS balance(
@@ -195,6 +198,28 @@ def execute_sql(db_name, sql, params=None):
     con = sqlite3.connect(f"{db_name}.db")
     return con.execute(sql, params or {})
 
+def init_sent_news_table():
+    with sqlite3.connect(SENT_NEWS_DB) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS sent_news (
+                link TEXT PRIMARY KEY, title TEXT, source TEXT, sent_at TEXT
+            )
+        """)
+
+def is_news_sent(link):
+    init_sent_news_table()
+    with sqlite3.connect(SENT_NEWS_DB) as con:
+        row = con.execute("SELECT 1 FROM sent_news WHERE link = ? LIMIT 1", (link,)).fetchone()
+    return row is not None
+
+def save_sent_news(link, title, source="naver_economy"):
+    init_sent_news_table()
+    with sqlite3.connect(SENT_NEWS_DB) as con:
+        con.execute("""
+            INSERT OR IGNORE INTO sent_news (link, title, source, sent_at)
+            VALUES (?, ?, ?, ?)
+        """, (link, title, source, _now_text()))
+
 def _migrate_old_order_log_if_needed(con):
     columns = con.execute("PRAGMA table_info(order_log)").fetchall()
     if not columns:
@@ -351,6 +376,30 @@ def init_monitoring_tables():
             "net_realized_pnl",
             "INTEGER",
         )
+
+        # 웹 실시간 보유현황용 최신 스냅샷.
+        # 이 테이블은 "현재 상태"만 보존하며, 5초 간격으로 전체 교체한다.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS position_snapshot (
+                code TEXT PRIMARY KEY,
+                code_name TEXT,
+                strategy_name TEXT,
+                quantity INTEGER NOT NULL,
+                available_quantity INTEGER NOT NULL,
+                buy_price REAL NOT NULL,
+                current_price REAL NOT NULL,
+                purchase_amount REAL NOT NULL,
+                evaluation_amount REAL NOT NULL,
+                unrealized_pnl REAL NOT NULL,
+                return_pct REAL NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_position_snapshot_strategy
+            ON position_snapshot(strategy_name)
+        """)
+
         con.execute("""
             CREATE TABLE IF NOT EXISTS strategy_daily_summary (
                 date TEXT NOT NULL,
@@ -394,6 +443,273 @@ def init_monitoring_tables():
             "net_realized_pnl",
             "INTEGER",
         )
+
+
+        # 전략별 웹 성과곡선.
+        #
+        # 주의:
+        # 전략별 현금 예산을 분리하지 않는 현재 구조에서는
+        # 각 전략에 실제 "현금 잔액"을 귀속할 수 없다.
+        # 따라서 이 테이블의 return_on_deployed_capital_pct는
+        # 누적 실현+미실현 손익 / 실제 누적 배치 매입원금이다.
+        # 실제 독립 계좌 NAV 수익률과는 구분한다.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_equity_snapshot (
+                snapshot_at TEXT NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+
+                holding_count INTEGER NOT NULL DEFAULT 0,
+
+                open_cost_basis REAL NOT NULL DEFAULT 0,
+                market_value REAL NOT NULL DEFAULT 0,
+                unrealized_pnl REAL NOT NULL DEFAULT 0,
+
+                cumulative_gross_realized_pnl REAL NOT NULL DEFAULT 0,
+                cumulative_fee REAL NOT NULL DEFAULT 0,
+                cumulative_tax REAL NOT NULL DEFAULT 0,
+                cumulative_net_realized_pnl REAL NOT NULL DEFAULT 0,
+
+                total_pnl REAL NOT NULL DEFAULT 0,
+
+                lifetime_sold_cost_basis REAL NOT NULL DEFAULT 0,
+                deployed_capital REAL NOT NULL DEFAULT 0,
+                return_on_deployed_capital_pct REAL NOT NULL DEFAULT 0,
+
+                return_method TEXT NOT NULL DEFAULT 'DEPLOYED_CAPITAL_ROI',
+
+                PRIMARY KEY (
+                    strategy_name,
+                    snapshot_at
+                )
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_strategy_equity_date
+            ON strategy_equity_snapshot(
+                strategy_name,
+                snapshot_date,
+                snapshot_at
+            )
+        """)
+
+        # 웹 전략 분석용: 전략 조건 충족 신호를 주문/체결과 별도로 보존한다.
+        # signal_key는 전략+종목+날짜+신호종류+사유코드 단위로 유일하다.
+        # 같은 신호가 장중 여러 틱에서 반복되어도 한 행만 유지하고 hit_count만 증가시킨다.
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_signal_log (
+                signal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_key TEXT UNIQUE NOT NULL,
+                signal_date TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+                code TEXT NOT NULL,
+                code_name TEXT,
+                signal_type TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                signal_reason TEXT,
+                current_price REAL,
+                condition_data TEXT,
+                order_attempted INTEGER NOT NULL DEFAULT 0,
+                order_result TEXT,
+                blocked_reason TEXT,
+                first_detected_at TEXT NOT NULL,
+                last_detected_at TEXT NOT NULL,
+                hit_count INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_strategy_signal_strategy_date
+            ON strategy_signal_log(strategy_name, signal_date)
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_strategy_signal_code_date
+            ON strategy_signal_log(code, signal_date)
+        """)
+
+
+def _json_dumps_safe(value):
+    """전략 조건 스냅샷을 한글이 깨지지 않는 JSON 문자열로 변환한다."""
+    if value is None:
+        return None
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def build_strategy_signal_key(
+    strategy_name,
+    code,
+    signal_type,
+    reason_code,
+    signal_date=None,
+):
+    signal_date = signal_date or datetime.now().strftime("%Y%m%d")
+    return "|".join([
+        str(strategy_name),
+        str(code).strip().zfill(6),
+        str(signal_date),
+        str(signal_type).upper(),
+        str(reason_code).upper(),
+    ])
+
+
+def save_strategy_signal(
+    strategy_name,
+    code,
+    code_name,
+    signal_type,
+    reason_code,
+    signal_reason="",
+    current_price=None,
+    condition_data=None,
+    order_attempted=False,
+    order_result=None,
+    blocked_reason=None,
+    detected_at=None,
+):
+    """전략 조건 충족을 monitoring.db에 저장한다.
+
+    동일한 전략/종목/날짜/신호종류/사유코드는 한 행으로 유지한다.
+    반복 틱에서는 hit_count와 last_detected_at을 갱신한다.
+    주문 결과가 새로 들어오면 기존 행의 주문 상태도 함께 갱신한다.
+    """
+    init_monitoring_tables()
+
+    now_text = str(detected_at or _now_text())
+    signal_date = now_text[:8] if len(now_text) >= 8 else datetime.now().strftime("%Y%m%d")
+    normalized_code = str(code).strip().zfill(6)
+    signal_type = str(signal_type).upper()
+    reason_code = str(reason_code).upper()
+    signal_key = build_strategy_signal_key(
+        strategy_name=strategy_name,
+        code=normalized_code,
+        signal_type=signal_type,
+        reason_code=reason_code,
+        signal_date=signal_date,
+    )
+
+    condition_json = _json_dumps_safe(condition_data)
+    attempted = 1 if order_attempted else 0
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.execute("""
+            INSERT INTO strategy_signal_log (
+                signal_key, signal_date, strategy_name, code, code_name,
+                signal_type, reason_code, signal_reason, current_price,
+                condition_data, order_attempted, order_result, blocked_reason,
+                first_detected_at, last_detected_at, hit_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                code_name = excluded.code_name,
+                signal_reason = excluded.signal_reason,
+                current_price = excluded.current_price,
+                condition_data = excluded.condition_data,
+                order_attempted = CASE
+                    WHEN excluded.order_attempted = 1 THEN 1
+                    ELSE strategy_signal_log.order_attempted
+                END,
+                order_result = CASE
+                    WHEN excluded.order_result IS NOT NULL THEN excluded.order_result
+                    ELSE strategy_signal_log.order_result
+                END,
+                blocked_reason = CASE
+                    WHEN excluded.order_result = 'ORDER_SENT' THEN NULL
+                    WHEN excluded.blocked_reason IS NOT NULL THEN excluded.blocked_reason
+                    ELSE strategy_signal_log.blocked_reason
+                END,
+                last_detected_at = excluded.last_detected_at,
+                hit_count = strategy_signal_log.hit_count + 1
+        """, (
+            signal_key,
+            signal_date,
+            str(strategy_name),
+            normalized_code,
+            str(code_name or normalized_code),
+            signal_type,
+            reason_code,
+            str(signal_reason or ""),
+            None if current_price is None else float(current_price),
+            condition_json,
+            attempted,
+            order_result,
+            blocked_reason,
+            now_text,
+            now_text,
+        ))
+
+    return signal_key
+
+
+def update_strategy_signal_order_result(
+    signal_key,
+    order_attempted,
+    order_result,
+    blocked_reason=None,
+):
+    """이미 저장된 전략 신호에 실제 주문 시도/결과를 연결한다."""
+    if not signal_key:
+        return False
+
+    init_monitoring_tables()
+    with sqlite3.connect(MONITORING_DB) as con:
+        cursor = con.execute("""
+            UPDATE strategy_signal_log
+            SET order_attempted = ?,
+                order_result = ?,
+                blocked_reason = ?,
+                last_detected_at = ?
+            WHERE signal_key = ?
+        """, (
+            1 if order_attempted else 0,
+            str(order_result or ""),
+            blocked_reason,
+            _now_text(),
+            str(signal_key),
+        ))
+    return cursor.rowcount > 0
+
+
+def get_strategy_signals(
+    strategy_name=None,
+    signal_type=None,
+    signal_date=None,
+    limit=500,
+):
+    """향후 FastAPI에서 바로 사용할 수 있는 전략 신호 조회 함수."""
+    init_monitoring_tables()
+
+    where = []
+    params = []
+    if strategy_name:
+        where.append("strategy_name = ?")
+        params.append(str(strategy_name))
+    if signal_type:
+        where.append("signal_type = ?")
+        params.append(str(signal_type).upper())
+    if signal_date:
+        where.append("signal_date = ?")
+        params.append(str(signal_date))
+
+    sql = "SELECT * FROM strategy_signal_log"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY last_detected_at DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(sql, params).fetchall()
+
+    result = []
+    for row in rows:
+        item = dict(row)
+        raw = item.get("condition_data")
+        if raw:
+            try:
+                item["condition_data"] = json.loads(raw)
+            except Exception:
+                pass
+        result.append(item)
+    return result
 
 def save_order_event(
     event_key, code, code_name, order_type, strategy_name="", order_quantity=0,
@@ -1013,6 +1329,12 @@ def save_strategy_daily_summaries(strategy_names):
                 _now_text(),
             ))
 
+def get_last_sent_news_at():
+    init_sent_news_table()
+    with sqlite3.connect(SENT_NEWS_DB) as con:
+        row = con.execute("SELECT sent_at FROM sent_news ORDER BY sent_at DESC LIMIT 1").fetchone()
+    return None if row is None else row[0]
+
 def reduce_position_from_sell_fill(code, fill_quantity):
     """
     실제 매도 체결 수량만큼 position_strategy 수량을 감소시킨다.
@@ -1048,6 +1370,766 @@ def reduce_position_from_sell_fill(code, fill_quantity):
             new_quantity,
             normalized_code,
         ))
+
+# ---------------------------------------------------------------------------
+# PullbackTrendStrategy 실시간 실행 상태 저장
+# ---------------------------------------------------------------------------
+
+
+
+def save_strategy_equity_snapshots(
+    strategy_names,
+    snapshot_at=None,
+):
+    """전략별 실제 거래 기반 성과 스냅샷을 저장한다.
+
+    계산 기준
+    ---------
+    open_cost_basis:
+        현재 보유주식 매입원금(position_snapshot.purchase_amount)
+
+    market_value:
+        현재 보유주식 평가금액(position_snapshot.evaluation_amount)
+
+    unrealized_pnl:
+        현재 평가금액 - 현재 매입원금
+
+    cumulative_net_realized_pnl:
+        real_trades의 전체 누적 순실현손익.
+        과거 데이터에 net 값이 없으면 gross/realized_pnl을 순서대로 fallback한다.
+
+    lifetime_sold_cost_basis:
+        지금까지 매도 완료된 수량의 매입원금 합계.
+
+    deployed_capital:
+        lifetime_sold_cost_basis + 현재 보유 매입원금.
+        즉 지금까지 전략이 실제로 주식에 배치한 누적 매입원금이다.
+
+    return_on_deployed_capital_pct:
+        (누적 순실현손익 + 현재 미실현손익) / deployed_capital * 100
+
+    전략별 현금이 분리되어 있지 않으므로 이 값은 독립 계좌 NAV 수익률이 아니다.
+    """
+    init_monitoring_tables()
+
+    normalized_names = [
+        str(name)
+        for name in dict.fromkeys(strategy_names or [])
+        if str(name).strip()
+    ]
+
+    if not normalized_names:
+        return []
+
+    now_text = str(
+        snapshot_at
+        or _now_text()
+    )
+    snapshot_date = (
+        now_text[:8]
+        if len(now_text) >= 8
+        else datetime.now().strftime("%Y%m%d")
+    )
+
+    saved = []
+
+    with sqlite3.connect(
+        MONITORING_DB,
+        timeout=15,
+    ) as con:
+        con.row_factory = sqlite3.Row
+        con.execute(
+            "PRAGMA busy_timeout = 15000"
+        )
+        con.execute(
+            "PRAGMA journal_mode = WAL"
+        )
+        con.execute(
+            "PRAGMA synchronous = NORMAL"
+        )
+
+        for strategy_name in normalized_names:
+            open_row = con.execute("""
+                SELECT
+                    COUNT(*) AS holding_count,
+                    COALESCE(
+                        SUM(purchase_amount),
+                        0
+                    ) AS open_cost_basis,
+                    COALESCE(
+                        SUM(evaluation_amount),
+                        0
+                    ) AS market_value,
+                    COALESCE(
+                        SUM(unrealized_pnl),
+                        0
+                    ) AS unrealized_pnl
+                FROM position_snapshot
+                WHERE strategy_name = ?
+                  AND quantity > 0
+            """, (
+                strategy_name,
+            )).fetchone()
+
+            realized_row = con.execute("""
+                SELECT
+                    COALESCE(
+                        SUM(
+                            COALESCE(
+                                gross_realized_pnl,
+                                realized_pnl,
+                                0
+                            )
+                        ),
+                        0
+                    ) AS gross_realized_pnl,
+
+                    COALESCE(
+                        SUM(
+                            COALESCE(
+                                fee,
+                                0
+                            )
+                        ),
+                        0
+                    ) AS fee,
+
+                    COALESCE(
+                        SUM(
+                            COALESCE(
+                                tax,
+                                0
+                            )
+                        ),
+                        0
+                    ) AS tax,
+
+                    COALESCE(
+                        SUM(
+                            COALESCE(
+                                net_realized_pnl,
+                                gross_realized_pnl,
+                                realized_pnl,
+                                0
+                            )
+                        ),
+                        0
+                    ) AS net_realized_pnl,
+
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN buy_price IS NOT NULL
+                                THEN buy_price * quantity
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ) AS sold_cost_basis
+                FROM real_trades
+                WHERE strategy_name = ?
+            """, (
+                strategy_name,
+            )).fetchone()
+
+            holding_count = int(
+                open_row["holding_count"]
+                or 0
+            )
+            open_cost_basis = float(
+                open_row["open_cost_basis"]
+                or 0
+            )
+            market_value = float(
+                open_row["market_value"]
+                or 0
+            )
+            unrealized_pnl = float(
+                open_row["unrealized_pnl"]
+                or 0
+            )
+
+            cumulative_gross_realized_pnl = float(
+                realized_row["gross_realized_pnl"]
+                or 0
+            )
+            cumulative_fee = float(
+                realized_row["fee"]
+                or 0
+            )
+            cumulative_tax = float(
+                realized_row["tax"]
+                or 0
+            )
+            cumulative_net_realized_pnl = float(
+                realized_row["net_realized_pnl"]
+                or 0
+            )
+            lifetime_sold_cost_basis = float(
+                realized_row["sold_cost_basis"]
+                or 0
+            )
+
+            total_pnl = (
+                cumulative_net_realized_pnl
+                + unrealized_pnl
+            )
+
+            deployed_capital = (
+                lifetime_sold_cost_basis
+                + open_cost_basis
+            )
+
+            return_pct = (
+                total_pnl
+                / deployed_capital
+                * 100.0
+                if deployed_capital > 0
+                else 0.0
+            )
+
+            con.execute("""
+                INSERT INTO strategy_equity_snapshot (
+                    snapshot_at,
+                    snapshot_date,
+                    strategy_name,
+                    holding_count,
+
+                    open_cost_basis,
+                    market_value,
+                    unrealized_pnl,
+
+                    cumulative_gross_realized_pnl,
+                    cumulative_fee,
+                    cumulative_tax,
+                    cumulative_net_realized_pnl,
+
+                    total_pnl,
+
+                    lifetime_sold_cost_basis,
+                    deployed_capital,
+                    return_on_deployed_capital_pct,
+
+                    return_method
+                )
+                VALUES (
+                    ?, ?, ?, ?,
+                    ?, ?, ?,
+                    ?, ?, ?, ?,
+                    ?,
+                    ?, ?, ?,
+                    'DEPLOYED_CAPITAL_ROI'
+                )
+                ON CONFLICT(
+                    strategy_name,
+                    snapshot_at
+                ) DO UPDATE SET
+                    snapshot_date = excluded.snapshot_date,
+                    holding_count = excluded.holding_count,
+
+                    open_cost_basis = excluded.open_cost_basis,
+                    market_value = excluded.market_value,
+                    unrealized_pnl = excluded.unrealized_pnl,
+
+                    cumulative_gross_realized_pnl =
+                        excluded.cumulative_gross_realized_pnl,
+                    cumulative_fee = excluded.cumulative_fee,
+                    cumulative_tax = excluded.cumulative_tax,
+                    cumulative_net_realized_pnl =
+                        excluded.cumulative_net_realized_pnl,
+
+                    total_pnl = excluded.total_pnl,
+
+                    lifetime_sold_cost_basis =
+                        excluded.lifetime_sold_cost_basis,
+                    deployed_capital = excluded.deployed_capital,
+                    return_on_deployed_capital_pct =
+                        excluded.return_on_deployed_capital_pct,
+                    return_method = excluded.return_method
+            """, (
+                now_text,
+                snapshot_date,
+                strategy_name,
+                holding_count,
+
+                open_cost_basis,
+                market_value,
+                unrealized_pnl,
+
+                cumulative_gross_realized_pnl,
+                cumulative_fee,
+                cumulative_tax,
+                cumulative_net_realized_pnl,
+
+                total_pnl,
+
+                lifetime_sold_cost_basis,
+                deployed_capital,
+                return_pct,
+            ))
+
+            saved.append({
+                "snapshot_at": now_text,
+                "snapshot_date": snapshot_date,
+                "strategy_name": strategy_name,
+                "holding_count": holding_count,
+                "open_cost_basis": open_cost_basis,
+                "market_value": market_value,
+                "unrealized_pnl": unrealized_pnl,
+                "cumulative_gross_realized_pnl": (
+                    cumulative_gross_realized_pnl
+                ),
+                "cumulative_fee": cumulative_fee,
+                "cumulative_tax": cumulative_tax,
+                "cumulative_net_realized_pnl": (
+                    cumulative_net_realized_pnl
+                ),
+                "total_pnl": total_pnl,
+                "lifetime_sold_cost_basis": (
+                    lifetime_sold_cost_basis
+                ),
+                "deployed_capital": deployed_capital,
+                "return_on_deployed_capital_pct": (
+                    return_pct
+                ),
+                "return_method": "DEPLOYED_CAPITAL_ROI",
+            })
+
+    return saved
+
+
+def get_latest_strategy_equity_snapshot(
+    strategy_name,
+):
+    init_monitoring_tables()
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("""
+            SELECT *
+            FROM strategy_equity_snapshot
+            WHERE strategy_name = ?
+            ORDER BY snapshot_at DESC
+            LIMIT 1
+        """, (
+            str(strategy_name),
+        )).fetchone()
+
+    return dict(row) if row else None
+
+
+def get_strategy_equity_snapshots(
+    strategy_name,
+    date_from=None,
+    date_to=None,
+    limit=2000,
+):
+    init_monitoring_tables()
+
+    where = [
+        "strategy_name = ?"
+    ]
+    params = [
+        str(strategy_name)
+    ]
+
+    if date_from:
+        where.append(
+            "snapshot_date >= ?"
+        )
+        params.append(
+            str(date_from)
+        )
+
+    if date_to:
+        where.append(
+            "snapshot_date <= ?"
+        )
+        params.append(
+            str(date_to)
+        )
+
+    params.append(
+        max(
+            1,
+            min(
+                int(limit or 2000),
+                10000,
+            ),
+        )
+    )
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            f"""
+            SELECT *
+            FROM strategy_equity_snapshot
+            WHERE {' AND '.join(where)}
+            ORDER BY snapshot_at ASC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+
+    return [
+        dict(row)
+        for row in rows
+    ]
+
+def save_position_snapshot(balance, realtime_price_map=None):
+    """현재 실제 보유종목을 monitoring.db.position_snapshot에 저장한다.
+
+    - balance: Kiwoom.balance
+    - realtime_price_map: Kiwoom.universe_realtime_transaction_info
+
+    정상 잔고 조회가 확인된 상태에서 StrategyManager가 호출한다.
+    현재 보유종목 전체를 한 트랜잭션에서 DELETE + INSERT 하므로
+    전량매도된 종목은 다음 스냅샷에서 자동으로 사라진다.
+    """
+    init_monitoring_tables()
+    init_position_strategy_table()
+
+    if balance is None:
+        return 0
+
+    realtime_price_map = realtime_price_map or {}
+    position_details = get_all_position_details()
+    now_text = _now_text()
+    rows = []
+
+    for raw_code, raw_info in dict(balance).items():
+        code = str(raw_code).strip().upper().zfill(6)
+        info = raw_info or {}
+
+        quantity = int(info.get("보유수량", 0) or 0)
+        if quantity <= 0:
+            continue
+
+        available_quantity = int(
+            info.get("매매가능수량", 0)
+            or info.get("주문가능수량", 0)
+            or quantity
+        )
+
+        buy_price = float(
+            info.get("매입가")
+            or info.get("매입단가")
+            or 0
+        )
+
+        rt = realtime_price_map.get(code, {}) or {}
+        current_price = float(
+            rt.get("현재가")
+            or info.get("현재가")
+            or buy_price
+            or 0
+        )
+
+        purchase_amount = float(
+            info.get("매입금액")
+            or info.get("총매입가")
+            or (buy_price * quantity)
+            or 0
+        )
+
+        evaluation_amount = float(
+            max(0, current_price)
+            * max(0, quantity)
+        )
+
+        unrealized_pnl = (
+            evaluation_amount
+            - purchase_amount
+        )
+
+        if purchase_amount > 0:
+            return_pct = (
+                unrealized_pnl
+                / purchase_amount
+                * 100.0
+            )
+        else:
+            return_pct = float(
+                info.get("수익률", 0)
+                or info.get("손익율", 0)
+                or 0
+            )
+
+        position = position_details.get(code, {})
+        strategy_name = (
+            position.get("strategy_name")
+            or get_position_strategy(code)
+        )
+
+        code_name = str(
+            info.get("종목명")
+            or position.get("code_name")
+            or code
+        ).strip()
+
+        rows.append((
+            code,
+            code_name,
+            strategy_name,
+            quantity,
+            max(0, available_quantity),
+            buy_price,
+            current_price,
+            purchase_amount,
+            evaluation_amount,
+            unrealized_pnl,
+            return_pct,
+            now_text,
+        ))
+
+    # FastAPI가 동시에 읽더라도 커밋 전의 일관된 이전 스냅샷 또는
+    # 커밋 후의 새 스냅샷만 보도록 하나의 트랜잭션으로 교체한다.
+    with sqlite3.connect(
+        MONITORING_DB,
+        timeout=15,
+    ) as con:
+        con.execute("PRAGMA busy_timeout = 15000")
+        con.execute("PRAGMA journal_mode = WAL")
+        con.execute("PRAGMA synchronous = NORMAL")
+
+        con.execute(
+            "DELETE FROM position_snapshot"
+        )
+
+        if rows:
+            con.executemany("""
+                INSERT INTO position_snapshot (
+                    code,
+                    code_name,
+                    strategy_name,
+                    quantity,
+                    available_quantity,
+                    buy_price,
+                    current_price,
+                    purchase_amount,
+                    evaluation_amount,
+                    unrealized_pnl,
+                    return_pct,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, rows)
+
+    return len(rows)
+
+
+def get_position_snapshots(strategy_name=None):
+    """웹/API 점검용 최신 보유 스냅샷 조회."""
+    init_monitoring_tables()
+
+    sql = """
+        SELECT
+            code,
+            code_name,
+            strategy_name,
+            quantity,
+            available_quantity,
+            buy_price,
+            current_price,
+            purchase_amount,
+            evaluation_amount,
+            unrealized_pnl,
+            return_pct,
+            updated_at
+        FROM position_snapshot
+    """
+    params = []
+
+    if strategy_name:
+        sql += " WHERE strategy_name = ?"
+        params.append(str(strategy_name))
+
+    sql += " ORDER BY strategy_name, code"
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            sql,
+            params,
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+def init_pullback_runtime_table():
+    """눌림목 전략의 전고점 부분익절/다음날 거래량 비교 상태를 저장한다."""
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS pullback_runtime_state (
+                code TEXT PRIMARY KEY,
+                strategy_name TEXT NOT NULL,
+                previous_high REAL,
+                high_touch_date TEXT,
+                high_touch_volume INTEGER NOT NULL DEFAULT 0,
+                partial_exit_requested INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )
+        """)
+
+
+def save_pullback_runtime_state(
+    code,
+    strategy_name,
+    previous_high=None,
+    high_touch_date=None,
+    high_touch_volume=None,
+    partial_exit_requested=None,
+):
+    """
+    눌림목 전략 실행 상태를 저장한다.
+
+    None으로 전달된 값은 기존 값이 있으면 보존한다.
+    따라서 전고점 터치 당일에는 high_touch_volume만 계속 갱신할 수 있다.
+    """
+    init_pullback_runtime_table()
+
+    normalized_code = str(code).strip().upper().zfill(6)
+    now_text = _now_text()
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        row = con.execute("""
+            SELECT
+                strategy_name,
+                previous_high,
+                high_touch_date,
+                high_touch_volume,
+                partial_exit_requested
+            FROM pullback_runtime_state
+            WHERE code = ?
+        """, (normalized_code,)).fetchone()
+
+        if row is None:
+            con.execute("""
+                INSERT INTO pullback_runtime_state (
+                    code,
+                    strategy_name,
+                    previous_high,
+                    high_touch_date,
+                    high_touch_volume,
+                    partial_exit_requested,
+                    updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                normalized_code,
+                str(strategy_name),
+                None if previous_high is None else float(previous_high),
+                None if high_touch_date is None else str(high_touch_date),
+                int(high_touch_volume or 0),
+                1 if bool(partial_exit_requested) else 0,
+                now_text,
+            ))
+            return
+
+        (
+            stored_strategy_name,
+            stored_previous_high,
+            stored_high_touch_date,
+            stored_high_touch_volume,
+            stored_partial_exit_requested,
+        ) = row
+
+        new_strategy_name = (
+            str(strategy_name)
+            if strategy_name not in (None, "")
+            else stored_strategy_name
+        )
+        new_previous_high = (
+            float(previous_high)
+            if previous_high is not None
+            else stored_previous_high
+        )
+
+        # high_touch_date는 신규 진입 시 명시적으로 None을 넣어 초기화해야 하는 경우가 있다.
+        # save_position 직후에는 기존 행을 먼저 delete한 뒤 저장하므로 None은 정상적으로 NULL 저장된다.
+        # 기존 행 업데이트에서 None은 "값 유지"로 취급한다.
+        new_high_touch_date = (
+            str(high_touch_date)
+            if high_touch_date is not None
+            else stored_high_touch_date
+        )
+        new_high_touch_volume = (
+            int(high_touch_volume)
+            if high_touch_volume is not None
+            else int(stored_high_touch_volume or 0)
+        )
+        new_partial_exit_requested = (
+            1 if bool(partial_exit_requested) else 0
+            if partial_exit_requested is not None
+            else int(stored_partial_exit_requested or 0)
+        )
+
+        con.execute("""
+            UPDATE pullback_runtime_state
+            SET
+                strategy_name = ?,
+                previous_high = ?,
+                high_touch_date = ?,
+                high_touch_volume = ?,
+                partial_exit_requested = ?,
+                updated_at = ?
+            WHERE code = ?
+        """, (
+            new_strategy_name,
+            new_previous_high,
+            new_high_touch_date,
+            new_high_touch_volume,
+            new_partial_exit_requested,
+            now_text,
+            normalized_code,
+        ))
+
+
+def get_pullback_runtime_state(code):
+    """종목의 눌림목 런타임 상태를 dict로 반환한다."""
+    init_pullback_runtime_table()
+
+    normalized_code = str(code).strip().upper().zfill(6)
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.row_factory = sqlite3.Row
+        row = con.execute("""
+            SELECT
+                code,
+                strategy_name,
+                previous_high,
+                high_touch_date,
+                high_touch_volume,
+                partial_exit_requested,
+                updated_at
+            FROM pullback_runtime_state
+            WHERE code = ?
+        """, (normalized_code,)).fetchone()
+
+    if row is None:
+        return None
+
+    result = dict(row)
+    result["high_touch_volume"] = int(result.get("high_touch_volume") or 0)
+    result["partial_exit_requested"] = bool(
+        result.get("partial_exit_requested")
+    )
+    return result
+
+
+def delete_pullback_runtime_state(code):
+    """전량매도 완료 또는 신규 진입 초기화 시 눌림목 런타임 상태를 삭제한다."""
+    init_pullback_runtime_table()
+
+    normalized_code = str(code).strip().upper().zfill(6)
+
+    with sqlite3.connect(MONITORING_DB) as con:
+        con.execute(
+            "DELETE FROM pullback_runtime_state WHERE code = ?",
+            (normalized_code,),
+        )
+
+
 # ---------------------------------------------------------------------------
 # ORBStrategy 실시간 실행 상태 저장
 # ---------------------------------------------------------------------------
@@ -1212,99 +2294,3 @@ def get_orb_runtime_state(trade_date, code):
             WHERE trade_date = ? AND code = ?
         """, (str(trade_date), normalized_code)).fetchone()
     return None if row is None else dict(row)
-
-
-# ---------------------------------------------------------------------------
-# PullbackTrendStrategy 전고점 부분청산 상태 저장
-# ---------------------------------------------------------------------------
-
-def init_pullback_runtime_table():
-    """전고점 도달/부분청산 상태를 재시작 후에도 복구할 수 있게 한다."""
-    with sqlite3.connect(MONITORING_DB) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS pullback_runtime_state (
-                code TEXT PRIMARY KEY,
-                strategy_name TEXT NOT NULL,
-                previous_high REAL,
-                high_touch_date TEXT,
-                high_touch_volume INTEGER,
-                partial_exit_requested INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            )
-        """)
-
-
-def get_pullback_runtime_state(code):
-    init_pullback_runtime_table()
-    normalized_code = str(code).zfill(6)
-    with sqlite3.connect(MONITORING_DB) as con:
-        row = con.execute("""
-            SELECT code, strategy_name, previous_high, high_touch_date,
-                   high_touch_volume, partial_exit_requested, updated_at
-            FROM pullback_runtime_state
-            WHERE code = ?
-        """, (normalized_code,)).fetchone()
-    if row is None:
-        return None
-    return {
-        "code": row[0],
-        "strategy_name": row[1],
-        "previous_high": row[2],
-        "high_touch_date": row[3],
-        "high_touch_volume": int(row[4] or 0),
-        "partial_exit_requested": bool(row[5]),
-        "updated_at": row[6],
-    }
-
-
-def save_pullback_runtime_state(
-    code,
-    strategy_name,
-    previous_high=None,
-    high_touch_date=None,
-    high_touch_volume=None,
-    partial_exit_requested=None,
-):
-    """눌림목 전고점 상태를 upsert한다. None 필드는 기존 값을 유지한다."""
-    init_pullback_runtime_table()
-    normalized_code = str(code).zfill(6)
-    existing = get_pullback_runtime_state(normalized_code) or {}
-
-    values = {
-        "previous_high": previous_high if previous_high is not None else existing.get("previous_high"),
-        "high_touch_date": high_touch_date if high_touch_date is not None else existing.get("high_touch_date"),
-        "high_touch_volume": int(high_touch_volume) if high_touch_volume is not None else int(existing.get("high_touch_volume", 0) or 0),
-        "partial_exit_requested": int(bool(partial_exit_requested)) if partial_exit_requested is not None else int(bool(existing.get("partial_exit_requested", False))),
-    }
-
-    with sqlite3.connect(MONITORING_DB) as con:
-        con.execute("""
-            INSERT INTO pullback_runtime_state (
-                code, strategy_name, previous_high, high_touch_date,
-                high_touch_volume, partial_exit_requested, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(code) DO UPDATE SET
-                strategy_name=excluded.strategy_name,
-                previous_high=excluded.previous_high,
-                high_touch_date=excluded.high_touch_date,
-                high_touch_volume=excluded.high_touch_volume,
-                partial_exit_requested=excluded.partial_exit_requested,
-                updated_at=excluded.updated_at
-        """, (
-            normalized_code,
-            strategy_name,
-            values["previous_high"],
-            values["high_touch_date"],
-            values["high_touch_volume"],
-            values["partial_exit_requested"],
-            _now_text(),
-        ))
-
-
-def delete_pullback_runtime_state(code):
-    init_pullback_runtime_table()
-    with sqlite3.connect(MONITORING_DB) as con:
-        con.execute(
-            "DELETE FROM pullback_runtime_state WHERE code = ?",
-            (str(code).zfill(6),),
-        )

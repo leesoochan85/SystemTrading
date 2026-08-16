@@ -12,6 +12,8 @@ from util.db_helper import (
     get_pullback_runtime_state,
     save_position_strategy,
     save_pullback_runtime_state,
+    save_strategy_signal,
+    update_strategy_signal_order_result,
 )
 from util.market_history import (
     MIN_HISTORY_DAYS,
@@ -81,6 +83,7 @@ class PullbackTrendStrategy(QThread):
 
         self.order_guard = None
         self.buy_order_handler = None
+        self.buy_rejection_reason_handler = None
 
         self.market_history_db_path = (
             get_market_history_db_path()
@@ -95,6 +98,22 @@ class PullbackTrendStrategy(QThread):
     def set_buy_order_handler(self, callback):
         """매수 수량/중앙 예산 예약/실제 주문을 Manager에 위임한다."""
         self.buy_order_handler = callback
+
+    def set_buy_rejection_reason_handler(self, callback):
+        """Manager의 신규매수 거절 사유 조회기를 연결한다."""
+        self.buy_rejection_reason_handler = callback
+
+    def _get_buy_rejection_reason(self, code):
+        if self.buy_rejection_reason_handler is None:
+            return "StrategyManager에서 신규매수를 승인하지 않음"
+
+        try:
+            return (
+                self.buy_rejection_reason_handler(code)
+                or "StrategyManager에서 신규매수를 승인하지 않음"
+            )
+        except Exception:
+            return "StrategyManager 신규매수 거절 사유 조회 실패"
 
     def _order_allowed(self):
         if self.order_guard is None:
@@ -248,20 +267,11 @@ class PullbackTrendStrategy(QThread):
             eligible_codes | holding_codes
         )
 
-    def get_required_realtime_fids(self):
-        return {
-            "현재가",
-            "시가",
-            "누적거래량",
-            "(최우선)매수호가",
-        }
-
     def set_universe_real_time(
         self,
         register_market=True,
         codes_override=None,
         force_refresh=False,
-        fid_names_override=None,
     ):
         if not self.listener_registered:
             self.kiwoom.add_realtime_listener(
@@ -312,14 +322,17 @@ class PullbackTrendStrategy(QThread):
                 "초과했습니다."
             )
 
-        fid_names = (
-            set(fid_names_override)
-            if fid_names_override is not None
-            else self.get_required_realtime_fids()
-        )
         fids = ";".join(
-            get_fid(name)
-            for name in sorted(fid_names)
+            [
+                get_fid("체결시간"),
+                get_fid("현재가"),
+                get_fid("시가"),
+                get_fid("고가"),
+                get_fid("저가"),
+                get_fid("누적거래량"),
+                get_fid("(최우선)매도호가"),
+                get_fid("(최우선)매수호가"),
+            ]
         )
 
         for i in range(
@@ -402,6 +415,11 @@ class PullbackTrendStrategy(QThread):
         raw_code,
         tick,
     ):
+        """전략 신호 판정을 주문 가능 여부보다 먼저 수행한다.
+
+        따라서 계좌 안전중지, 최대 보유수, 예산 부족, 미체결 주문 등으로
+        실제 주문이 막혀도 완전한 전략 BUY/SELL 신호는 monitoring.db에 남는다.
+        """
         code = (
             str(raw_code)
             .strip()
@@ -413,20 +431,6 @@ class PullbackTrendStrategy(QThread):
             code not in self.universe
             or not self.is_init_success
         ):
-            return
-
-        if not self._order_allowed():
-            return
-
-        order_info = self.kiwoom.order.get(
-            code,
-            {},
-        )
-
-        if int(
-            order_info.get("미체결수량", 0)
-            or 0
-        ) > 0:
             return
 
         try:
@@ -441,24 +445,15 @@ class PullbackTrendStrategy(QThread):
                     code,
                     tick,
                 )
+                return
 
-            else:
-                # 체결 반영/전량매도 정리 중 동일 전략의 DB row가 남아 있으면
-                # 즉시 재매수하지 않는다.
-                if (
-                    get_position_strategy(code)
-                    == self.strategy_name
-                ):
-                    return
-
-                delete_pullback_runtime_state(
-                    code
-                )
-
-                self.check_buy_signal_and_order(
-                    code,
-                    tick=tick,
-                )
+            # 체결 반영/전량매도 정리 중 동일 전략의 DB row가 남아 있으면
+            # 즉시 재매수하지 않는다. 이 상태는 전략 조건이 아니라 운영 상태이므로
+            # 매수 신호를 판정한 뒤 BLOCKED로 기록한다.
+            self.check_buy_signal_and_order(
+                code,
+                tick=tick,
+            )
 
         except Exception as exc:
             print(
@@ -466,34 +461,15 @@ class PullbackTrendStrategy(QThread):
                 f"{code}: {exc}"
             )
 
-    def check_buy_signal_and_order(
+    def _get_buy_signal(
         self,
         code,
         tick=None,
     ):
-        if (
-            check_adjacent_transaction_closed_for_buying()
-            or not check_transaction_open()
-        ):
-            return False
-
-        if code in self.kiwoom.balance:
-            return False
-
-        order_info = self.kiwoom.order.get(
-            code,
-            {},
-        )
-
-        if int(
-            order_info.get("미체결수량", 0)
-            or 0
-        ) > 0:
-            return False
-
+        """순수 눌림목 매수조건만 판정한다."""
         metric = self._metric(code)
         if not metric:
-            return False
+            return None
 
         rt = (
             tick
@@ -507,7 +483,7 @@ class PullbackTrendStrategy(QThread):
         )
 
         if current_price <= 0:
-            return False
+            return None
 
         mas = self._dynamic_mas(
             code,
@@ -515,12 +491,12 @@ class PullbackTrendStrategy(QThread):
         )
 
         if mas is None:
-            return False
+            return None
 
         ma5, ma20, ma60 = mas
 
         if ma20 <= 0:
-            return False
+            return None
 
         distance = (
             current_price
@@ -529,17 +505,137 @@ class PullbackTrendStrategy(QThread):
         )
 
         if not (ma5 > ma20 > ma60):
-            return False
+            return None
 
         if not (
             self.DISTANCE_MIN_PCT
             <= distance
             <= self.DISTANCE_MAX_PCT
         ):
-            return False
+            return None
 
         if current_price < ma20:
+            return None
+
+        return {
+            "reason_code": "PULLBACK_ENTRY",
+            "signal_reason": (
+                "MA5 > MA20 > MA60 정배열 + "
+                f"MA20 이격도 {self.DISTANCE_MIN_PCT:.0f}~"
+                f"{self.DISTANCE_MAX_PCT:.0f}% + 현재가 MA20 이상"
+            ),
+            "current_price": current_price,
+            "condition_data": {
+                "current_price": current_price,
+                "ma5": ma5,
+                "ma20": ma20,
+                "ma60": ma60,
+                "distance_pct": distance,
+                "distance_min_pct": self.DISTANCE_MIN_PCT,
+                "distance_max_pct": self.DISTANCE_MAX_PCT,
+                "current_price_above_ma20": current_price >= ma20,
+                "previous_high": float(
+                    metric.get("previous_high", 0) or 0
+                ),
+            },
+        }
+
+    def check_buy_signal_and_order(
+        self,
+        code,
+        tick=None,
+    ):
+        # 장외 틱은 매수 신호로 기록하지 않는다.
+        if not check_transaction_open():
             return False
+
+        signal = self._get_buy_signal(
+            code,
+            tick=tick,
+        )
+
+        if signal is None:
+            return False
+
+        code_name = self.universe[code][
+            "code_name"
+        ]
+
+        signal_key = save_strategy_signal(
+            strategy_name=self.strategy_name,
+            code=code,
+            code_name=code_name,
+            signal_type="BUY",
+            reason_code=signal["reason_code"],
+            signal_reason=signal["signal_reason"],
+            current_price=signal["current_price"],
+            condition_data=signal["condition_data"],
+        )
+
+        # 아래부터는 전략 조건이 아니라 실제 주문 가능 여부다.
+        if check_adjacent_transaction_closed_for_buying():
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "15:15 이후 신규매수 제한 시간",
+            )
+            return False
+
+        if code in self.kiwoom.balance:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "이미 보유 중인 종목",
+            )
+            return False
+
+        # 체결 반영/전량매도 정리 중 DB row가 남아 있으면 재매수 차단.
+        if (
+            get_position_strategy(code)
+            == self.strategy_name
+        ):
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "기존 전략 포지션 DB 정리/체결 반영 대기",
+            )
+            return False
+
+        order_info = self.kiwoom.order.get(
+            code,
+            {},
+        )
+
+        if int(
+            order_info.get("미체결수량", 0)
+            or 0
+        ) > 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "동일 종목 미체결 주문 존재",
+            )
+            return False
+
+        if not self._order_allowed():
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "StrategyManager 주문 안전조건 미충족",
+            )
+            return False
+
+        rt = (
+            tick
+            or self.kiwoom
+            .universe_realtime_transaction_info
+            .get(code, {})
+        )
 
         bid = int(
             rt.get(
@@ -550,39 +646,57 @@ class PullbackTrendStrategy(QThread):
         )
 
         if bid <= 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "최우선 매수호가를 확인할 수 없음",
+            )
             return False
 
         if self.buy_order_handler is None:
-            print(
-                "[PullbackTrend] "
-                "Manager buy_order_handler가 "
-                "연결되지 않았습니다."
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "Manager buy_order_handler 미연결",
             )
             return False
 
         order = self.buy_order_handler(
             strategy_name=self.strategy_name,
             code=code,
-            code_name=self.universe[code][
-                "code_name"
-            ],
+            code_name=code_name,
             price=bid,
             rqname="pullback_buy",
             screen_no="2101",
         )
 
         if order is None:
+            update_strategy_signal_order_result(
+                signal_key,
+                order_attempted=False,
+                order_result="BLOCKED",
+                blocked_reason=(
+                    self._get_buy_rejection_reason(code)
+                ),
+            )
             return False
 
         quantity = int(
             order["quantity"]
         )
 
+        update_strategy_signal_order_result(
+            signal_key,
+            order_attempted=True,
+            order_result="ORDER_SENT",
+            blocked_reason=None,
+        )
+
         save_position_strategy(
             code=code,
-            code_name=self.universe[code][
-                "code_name"
-            ],
+            code_name=code_name,
             strategy_name=self.strategy_name,
             quantity=0,
             buy_price=0,
@@ -591,6 +705,7 @@ class PullbackTrendStrategy(QThread):
         # 과거 동일 종목 거래의 전고점 상태는 신규 진입 시 초기화.
         delete_pullback_runtime_state(code)
 
+        metric = self._metric(code) or {}
         save_pullback_runtime_state(
             code=code,
             strategy_name=self.strategy_name,
@@ -606,15 +721,17 @@ class PullbackTrendStrategy(QThread):
             partial_exit_requested=False,
         )
 
+        data = signal["condition_data"]
+
         send_message(
             f"[눌림목 매수] "
-            f"{self.universe[code]['code_name']}"
+            f"{code_name}"
             f"({code}) "
             f"{quantity}주 {bid:,}원 / "
-            f"MA5 {ma5:,.1f} > "
-            f"MA20 {ma20:,.1f} > "
-            f"MA60 {ma60:,.1f} / "
-            f"이격도 {distance:.2f}%"
+            f"MA5 {data['ma5']:,.1f} > "
+            f"MA20 {data['ma20']:,.1f} > "
+            f"MA60 {data['ma60']:,.1f} / "
+            f"이격도 {data['distance_pct']:.2f}%"
         )
 
         return True
@@ -800,108 +917,375 @@ class PullbackTrendStrategy(QThread):
             and current_volume < touch_volume
         )
 
-    def manage_position(self, code, tick):
-        current_price = float(tick.get("현재가", 0) or 0)
+    def get_sell_signal(
+        self,
+        code,
+        tick,
+    ):
+        """매도 우선순위를 유지하면서 순수 SELL 신호를 반환한다."""
+        current_price = float(
+            tick.get("현재가", 0) or 0
+        )
+
         if current_price <= 0:
-            return False
+            return None
 
-        # 1. 위험 청산은 전고점 부분익절보다 우선한다.
-        if self.is_stop_loss_triggered(code, tick=tick):
-            return self.order_sell(
-                code,
-                ratio=1.0,
-                reason="-5% 고정손절",
-            )
+        balance_info = self.kiwoom.balance.get(
+            code,
+            {},
+        )
 
-        mas = self._dynamic_mas(code, current_price)
-        if mas is not None:
-            _, ma20, _ = mas
-            if current_price < ma20:
-                return self.order_sell(
-                    code,
-                    ratio=1.0,
-                    reason="20일선 이탈",
-                )
-
-        if self._bearish_volume_exit(code, tick):
-            return self.order_sell(
-                code,
-                ratio=1.0,
-                reason="전일대비 거래량 15% 이상 증가 + 음봉",
-            )
-
-        metric = self._metric(code)
-        if not metric:
-            return False
-
-        state = get_pullback_runtime_state(code) or {}
-        previous_high = float(
-            state.get("previous_high")
-            or metric.get("previous_high", 0)
+        purchase_price = float(
+            balance_info.get("매입가")
+            or balance_info.get("매입단가")
             or 0
         )
 
+        return_rate = None
+        if purchase_price > 0:
+            return_rate = (
+                (current_price - purchase_price)
+                / purchase_price
+                * 100.0
+            )
+
+        # 1. -5% 고정손절
+        if (
+            return_rate is not None
+            and return_rate <= self.STOP_LOSS_PCT
+        ):
+            return {
+                "reason_code": "STOP_LOSS",
+                "signal_reason": "-5% 고정손절",
+                "current_price": current_price,
+                "ratio": 1.0,
+                "condition_data": {
+                    "purchase_price": purchase_price,
+                    "current_price": current_price,
+                    "return_pct": return_rate,
+                    "stop_loss_pct": self.STOP_LOSS_PCT,
+                },
+            }
+
+        # 2. 20일 이동평균선 이탈
+        mas = self._dynamic_mas(
+            code,
+            current_price,
+        )
+
+        if mas is not None:
+            _, ma20, _ = mas
+
+            if current_price < ma20:
+                return {
+                    "reason_code": "MA20_BREAKDOWN",
+                    "signal_reason": "20일선 이탈",
+                    "current_price": current_price,
+                    "ratio": 1.0,
+                    "condition_data": {
+                        "current_price": current_price,
+                        "ma20": ma20,
+                    },
+                }
+
+        # 3. 전일대비 거래량 15% 이상 증가 + 음봉
+        metric = self._metric(code)
+        if metric:
+            prev_volume = float(
+                metric.get("prev_volume", 0)
+                or 0
+            )
+            current_volume = float(
+                tick.get("누적거래량", 0)
+                or 0
+            )
+            open_price = float(
+                tick.get("시가", 0)
+                or 0
+            )
+
+            bearish_volume = (
+                prev_volume > 0
+                and open_price > 0
+                and current_volume
+                >= prev_volume
+                * self.BEARISH_VOLUME_MULTIPLIER
+                and current_price < open_price
+            )
+
+            if bearish_volume:
+                return {
+                    "reason_code": "BEARISH_VOLUME",
+                    "signal_reason": (
+                        "전일대비 거래량 15% 이상 증가 + 음봉"
+                    ),
+                    "current_price": current_price,
+                    "ratio": 1.0,
+                    "condition_data": {
+                        "current_price": current_price,
+                        "open_price": open_price,
+                        "current_volume": current_volume,
+                        "prev_volume": prev_volume,
+                        "volume_multiplier": (
+                            self.BEARISH_VOLUME_MULTIPLIER
+                        ),
+                        "required_volume": (
+                            prev_volume
+                            * self.BEARISH_VOLUME_MULTIPLIER
+                        ),
+                        "bearish_candle": (
+                            current_price < open_price
+                        ),
+                    },
+                }
+
+        if not metric:
+            return None
+
+        state = (
+            get_pullback_runtime_state(code)
+            or {}
+        )
+
+        previous_high = float(
+            state.get("previous_high")
+            or metric.get(
+                "previous_high",
+                0,
+            )
+            or 0
+        )
+
+        today = datetime.now().strftime(
+            "%Y%m%d"
+        )
+
         # 전고점 터치 당일에는 이후 틱으로 거래량 스냅샷을 계속 갱신한다.
-        # 그래야 다음 거래일의 거래량 감소 판단 기준이 '터치 순간 거래량'이 아니라
-        # 터치 당일의 가능한 최신 누적거래량에 가깝게 유지된다.
-        today = datetime.now().strftime("%Y%m%d")
-        if state.get("high_touch_date") == today:
+        if (
+            state.get("high_touch_date")
+            == today
+        ):
             save_pullback_runtime_state(
                 code=code,
                 strategy_name=self.strategy_name,
                 high_touch_volume=int(
-                    tick.get("누적거래량", 0) or 0
+                    tick.get(
+                        "누적거래량",
+                        0,
+                    )
+                    or 0
                 ),
             )
-            state = get_pullback_runtime_state(code) or state
-
-        # 2. 전고점 도달 다음날 거래량 둔화 -> 잔량 전량 청산
-        if (
-            state.get("partial_exit_requested")
-            and self._is_next_day_volume_fade(code, tick, state)
-        ):
-            return self.order_sell(
-                code,
-                ratio=1.0,
-                reason="전고점 도달 다음날 거래량 감소",
+            state = (
+                get_pullback_runtime_state(code)
+                or state
             )
 
-        # 3. 전고점 최초 도달 -> 30% 부분익절
+        # 4. 전고점 부분익절을 이미 주문한 다음 거래일의 거래량 감소
+        if (
+            state.get(
+                "partial_exit_requested"
+            )
+            and self._is_next_day_volume_fade(
+                code,
+                tick,
+                state,
+            )
+        ):
+            touch_volume = self._touch_day_volume(
+                code,
+                state,
+            )
+            current_volume = int(
+                tick.get("누적거래량", 0)
+                or 0
+            )
+
+            return {
+                "reason_code": "NEXT_DAY_VOLUME_FADE",
+                "signal_reason": (
+                    "전고점 도달 다음날 거래량 감소"
+                ),
+                "current_price": current_price,
+                "ratio": 1.0,
+                "condition_data": {
+                    "current_price": current_price,
+                    "high_touch_date": state.get(
+                        "high_touch_date"
+                    ),
+                    "touch_day_volume": touch_volume,
+                    "current_volume": current_volume,
+                    "check_time": "15:20",
+                    "intended_sell_ratio": 1.0,
+                },
+            }
+
+        # 5. 전고점 최초 도달 -> 30% 부분익절
         if (
             previous_high > 0
             and current_price >= previous_high
-            and not state.get("partial_exit_requested", False)
+            and not state.get(
+                "partial_exit_requested",
+                False,
+            )
         ):
-            ordered = self.order_sell(
-                code,
-                ratio=self.PARTIAL_EXIT_RATIO,
-                reason="전고점 도달 30% 부분익절",
+            return {
+                "reason_code": (
+                    "PREVIOUS_HIGH_PARTIAL_EXIT"
+                ),
+                "signal_reason": (
+                    "전고점 도달 30% 부분익절"
+                ),
+                "current_price": current_price,
+                "ratio": self.PARTIAL_EXIT_RATIO,
+                "condition_data": {
+                    "current_price": current_price,
+                    "previous_high": previous_high,
+                    "intended_sell_ratio": (
+                        self.PARTIAL_EXIT_RATIO
+                    ),
+                    "high_touch_date": today,
+                    "current_volume": int(
+                        tick.get(
+                            "누적거래량",
+                            0,
+                        )
+                        or 0
+                    ),
+                },
+            }
+
+        return None
+
+    def manage_position(
+        self,
+        code,
+        tick,
+    ):
+        signal = self.get_sell_signal(
+            code,
+            tick,
+        )
+
+        if signal is None:
+            return False
+
+        code_name = self.universe.get(
+            code,
+            {},
+        ).get(
+            "code_name",
+            code,
+        )
+
+        signal_key = save_strategy_signal(
+            strategy_name=self.strategy_name,
+            code=code,
+            code_name=code_name,
+            signal_type="SELL",
+            reason_code=signal[
+                "reason_code"
+            ],
+            signal_reason=signal[
+                "signal_reason"
+            ],
+            current_price=signal[
+                "current_price"
+            ],
+            condition_data=signal[
+                "condition_data"
+            ],
+        )
+
+        order_info = self.kiwoom.order.get(
+            code,
+            {},
+        )
+
+        if int(
+            order_info.get(
+                "미체결수량",
+                0,
+            )
+            or 0
+        ) > 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "동일 종목 미체결 주문 존재",
+            )
+            return False
+
+        if not self._order_allowed():
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "StrategyManager 주문 안전조건 미충족",
+            )
+            return False
+
+        ordered = self.order_sell(
+            code,
+            ratio=signal["ratio"],
+            reason=signal[
+                "signal_reason"
+            ],
+            signal_key=signal_key,
+        )
+
+        # 전고점 부분익절은 실제 주문 전송 성공 후에만 상태를 변경한다.
+        if (
+            ordered
+            and signal["reason_code"]
+            == "PREVIOUS_HIGH_PARTIAL_EXIT"
+        ):
+            data = signal[
+                "condition_data"
+            ]
+
+            save_pullback_runtime_state(
+                code=code,
+                strategy_name=self.strategy_name,
+                previous_high=float(
+                    data.get(
+                        "previous_high",
+                        0,
+                    )
+                    or 0
+                ),
+                high_touch_date=(
+                    data.get(
+                        "high_touch_date"
+                    )
+                ),
+                high_touch_volume=int(
+                    data.get(
+                        "current_volume",
+                        0,
+                    )
+                    or 0
+                ),
+                partial_exit_requested=True,
             )
 
-            # 실제 주문 전송에 성공했을 때만 부분익절 상태를 기록한다.
-            if ordered:
-                save_pullback_runtime_state(
-                    code=code,
-                    strategy_name=self.strategy_name,
-                    previous_high=previous_high,
-                    high_touch_date=today,
-                    high_touch_volume=int(
-                        tick.get("누적거래량", 0) or 0
-                    ),
-                    partial_exit_requested=True,
-                )
-
-            return ordered
-
-        return False
+        return ordered
 
     def order_sell(
         self,
         code,
         ratio=1.0,
         reason="매도조건",
+        signal_key=None,
     ):
         if code not in self.kiwoom.balance:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "실제 계좌 잔고에서 종목을 찾을 수 없음",
+            )
             return False
 
         balance_info = self.kiwoom.balance[
@@ -921,6 +1305,12 @@ class PullbackTrendStrategy(QThread):
         )
 
         if sellable_quantity <= 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "매매가능수량이 0",
+            )
             return False
 
         ratio = max(
@@ -957,6 +1347,13 @@ class PullbackTrendStrategy(QThread):
         )
 
         if result != 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                True,
+                "ORDER_FAILED",
+                f"Kiwoom SendOrder 실패 result={result}",
+            )
+
             send_message(
                 f"[눌림목 매도 실패] "
                 f"{self.universe[code]['code_name']}"
@@ -966,6 +1363,13 @@ class PullbackTrendStrategy(QThread):
                 f"result={result}"
             )
             return False
+
+        update_strategy_signal_order_result(
+            signal_key,
+            True,
+            "ORDER_SENT",
+            None,
+        )
 
         self.kiwoom.order[code] = {
             "주문구분": "매도",

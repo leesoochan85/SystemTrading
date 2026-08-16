@@ -20,6 +20,7 @@ from util.market_history import (
 from util.db_helper import (
     POSITION_DB,
     init_position_strategy_table,
+    init_sent_news_table,
     init_monitoring_tables,
     delete_position_strategy,
     get_position_strategy,
@@ -30,6 +31,8 @@ from util.db_helper import (
     get_today_realized_pnl,
     save_daily_equity,
     save_strategy_daily_summaries,
+    save_position_snapshot,
+    save_strategy_equity_snapshots,
 )
 from util.hankyung_report_helper import (
     scan_new_hankyung_reports,
@@ -93,6 +96,10 @@ class StrategyManager(QObject):
         # 동일 code의 실시간 콜백이 짧은 간격으로 중첩되는 것을 막기 위한 예약.
         self.buy_request_in_progress = set()
 
+        # 웹 전략 신호에서 "조건은 충족했지만 왜 주문되지 않았는지"를
+        # 확인할 수 있도록 종목별 마지막 신규매수 거절 사유를 보존한다.
+        self.last_buy_rejections = {}
+
         self.last_deposit_sync_at = 0
         self.deposit_sync_interval = 300  # 5분
 
@@ -120,6 +127,16 @@ class StrategyManager(QObject):
 
         self.last_order_sync_at = 0
         self.order_sync_interval = 60
+
+        # 웹 보유현황은 Kiwoom 메모리를 FastAPI가 직접 읽지 않도록
+        # monitoring.db에 짧은 주기로 최신 스냅샷을 저장한다.
+        self.last_position_snapshot_at = 0
+        self.position_snapshot_interval = 5
+
+        # 전략 성과 그래프는 1분 단위면 충분하다.
+        # 전략별 공용현금 배분은 하지 않고 실제 매매원금/손익만 추적한다.
+        self.last_strategy_equity_snapshot_at = 0
+        self.strategy_equity_snapshot_interval = 60
 
         self.buy_order_cancel_after = 600
         self.pending_buy_cancellations = {}
@@ -155,6 +172,14 @@ class StrategyManager(QObject):
             if callable(guard_setter):
                 guard_setter(self.can_event_driven_order)
 
+            rejection_setter = getattr(
+                strategy,
+                "set_buy_rejection_reason_handler",
+                None,
+            )
+            if callable(rejection_setter):
+                rejection_setter(self.get_buy_rejection_reason)
+
     # ------------------------------------------------------------------
     # 시작/타이머
     # ------------------------------------------------------------------
@@ -164,9 +189,17 @@ class StrategyManager(QObject):
         self.is_running = True
 
         init_position_strategy_table()
+        init_sent_news_table()
         init_monitoring_tables()
 
         self.initialize_strategies()
+
+        # 초기 잔고 조회가 정상 완료된 경우 웹 보유현황을 즉시 1회 저장.
+        self.save_position_snapshot_if_due(force=True)
+        self.save_strategy_equity_snapshot_if_due(
+            force=True
+        )
+
         self.send_one_value_quality_report_if_needed(force=True)
 
         if check_transaction_open():
@@ -298,6 +331,32 @@ class StrategyManager(QObject):
             and int(info.get("미체결수량", 0) or 0) > 0
         )
 
+    def _set_buy_rejection(self, code, reason):
+        code = str(code).strip().zfill(6)
+        self.last_buy_rejections[code] = str(reason or "신규매수 거절")
+        return None
+
+    def get_buy_rejection_reason(self, code, clear=False):
+        code = str(code).strip().zfill(6)
+        if clear:
+            return self.last_buy_rejections.pop(code, None)
+        return self.last_buy_rejections.get(code)
+
+    def get_event_driven_order_block_reason(self):
+        if not self.is_running:
+            return "StrategyManager가 실행 중이 아님"
+        if not self.is_initialized:
+            return "전략 초기화가 완료되지 않음"
+        if not self.account_state_safe:
+            return self.account_state_failure_reason or "계좌/미체결 상태가 안전하지 않음"
+        if not self.deposit_state_safe:
+            return "주문가능금액 조회 상태가 안전하지 않음"
+        if not self.market_data_ready:
+            return "시장 기준 데이터 준비가 완료되지 않음"
+        if not check_transaction_open():
+            return "정규장 시간이 아님"
+        return None
+
     def request_buy_order(
         self,
         strategy_name,
@@ -308,106 +367,85 @@ class StrategyManager(QObject):
         screen_no,
         buy_fee_rate=None,
     ):
-        """
-        모든 전략의 신규 매수 요청이 통과해야 하는 단일 관문.
+        """모든 전략의 신규 매수 요청이 통과해야 하는 단일 관문.
 
-        반환
-        ----
-        성공:
-            {
-                "quantity": ...,
-                "price": ...,
-                "estimated_amount": ...,
-                "max_position_amount": ...,
-                "total_assets": ...
-            }
-
-        거절/실패:
-            None
+        기존 전략 호환성을 위해 성공 시 dict, 거절/실패 시 None을 그대로 반환한다.
+        거절 사유는 get_buy_rejection_reason(code)로 별도 조회할 수 있다.
         """
         code = str(code).strip().zfill(6)
         code_name = str(code_name or code)
         price = int(price or 0)
+        self.last_buy_rejections.pop(code, None)
 
         if buy_fee_rate is None:
             buy_fee_rate = self.DEFAULT_BUY_FEE_RATE
         buy_fee_rate = max(0.0, float(buy_fee_rate))
 
         if price <= 0:
-            return None
+            return self._set_buy_rejection(code, "유효한 주문가격이 없음")
 
-        if not self.can_event_driven_order():
-            return None
+        block_reason = self.get_event_driven_order_block_reason()
+        if block_reason:
+            return self._set_buy_rejection(code, block_reason)
 
-        # 같은 종목에 대한 전략 간 동시 진입을 먼저 막는다.
         if code in self.buy_request_in_progress:
-            return None
+            return self._set_buy_rejection(code, "동일 종목의 신규매수 요청 처리 중")
 
         self.buy_request_in_progress.add(code)
 
         try:
             balance_info = self.kiwoom.balance.get(code, {})
             if int(balance_info.get("보유수량", 0) or 0) > 0:
-                return None
+                return self._set_buy_rejection(code, "이미 계좌에 보유 중인 종목")
 
             if self.has_pending_buy(code):
-                return None
+                return self._set_buy_rejection(code, "동일 종목 매수 미체결/예약 주문 존재")
 
             current_position_count = self.get_account_position_count()
             if current_position_count >= self.MAX_ACCOUNT_POSITIONS:
+                reason = f"계좌 최대 보유/대기 {self.MAX_ACCOUNT_POSITIONS}종목 도달"
                 print(
                     "[StrategyManager] 신규매수 거절 - "
-                    f"계좌 최대 보유/대기 {self.MAX_ACCOUNT_POSITIONS}종목 도달 / "
-                    f"{code_name}({code}) / {strategy_name}"
+                    f"{reason} / {code_name}({code}) / {strategy_name}"
                 )
-                return None
+                return self._set_buy_rejection(code, reason)
 
             total_assets = self.calculate_total_assets()
             if total_assets <= 0:
+                reason = "총자산 계산값이 0원 이하"
                 print(
-                    "[StrategyManager] 신규매수 거절 - 총자산 계산값 0원 / "
-                    f"{code_name}({code})"
+                    "[StrategyManager] 신규매수 거절 - "
+                    f"{reason} / {code_name}({code})"
                 )
-                return None
+                return self._set_buy_rejection(code, reason)
 
-            max_position_amount = int(
-                total_assets * self.MAX_POSITION_RATIO
-            )
+            max_position_amount = int(total_assets * self.MAX_POSITION_RATIO)
             available_cash = self.get_available_buy_cash()
-
-            buy_budget = min(
-                max_position_amount,
-                available_cash,
-            )
+            buy_budget = min(max_position_amount, available_cash)
 
             if buy_budget <= 0:
+                reason = "사용가능 현금 없음"
                 print(
-                    "[StrategyManager] 신규매수 거절 - 사용가능 현금 없음 / "
-                    f"{code_name}({code}) / {strategy_name}"
+                    "[StrategyManager] 신규매수 거절 - "
+                    f"{reason} / {code_name}({code}) / {strategy_name}"
                 )
-                return None
+                return self._set_buy_rejection(code, reason)
 
-            # 지정가 주문이므로 매수가 + 예상 매수수수료를 포함한 비용이
-            # 종목당 10%와 현재 현금을 모두 넘지 않게 한다.
             unit_cost = price * (1.0 + buy_fee_rate)
             quantity = int(buy_budget // unit_cost)
 
             if quantity <= 0:
+                reason = f"현재 예산으로 1주 매수 불가 (가격 {price:,}원 / 가용 {buy_budget:,}원)"
                 print(
-                    "[StrategyManager] 신규매수 거절 - 1주 매수 불가 / "
-                    f"{code_name}({code}) / 가격 {price:,}원 / "
-                    f"가용 {buy_budget:,}원"
+                    "[StrategyManager] 신규매수 거절 - "
+                    f"{reason} / {code_name}({code})"
                 )
-                return None
+                return self._set_buy_rejection(code, reason)
 
-            estimated_amount = int(
-                quantity * price * (1.0 + buy_fee_rate)
-            )
-
+            estimated_amount = int(quantity * price * (1.0 + buy_fee_rate))
             if estimated_amount <= 0:
-                return None
+                return self._set_buy_rejection(code, "예상 주문금액 계산 실패")
 
-            # SendOrder보다 먼저 예약한다.
             self.reserved_buy_orders[code] = {
                 "amount": estimated_amount,
                 "strategy_name": strategy_name,
@@ -429,14 +467,13 @@ class StrategyManager(QObject):
 
             if result != 0:
                 self.reserved_buy_orders.pop(code, None)
-
+                reason = f"Kiwoom SendOrder 실패 result={result}"
                 print(
                     "[StrategyManager] 매수 주문 전송 실패 - "
                     f"{code_name}({code}) / {strategy_name} / result={result}"
                 )
-                return None
+                return self._set_buy_rejection(code, reason)
 
-            # 키움 미체결 TR이 갱신되기 전에도 즉시 중복 주문을 막는다.
             self.kiwoom.order[code] = {
                 "주문구분": "매수",
                 "주문가격": price,
@@ -445,6 +482,8 @@ class StrategyManager(QObject):
                 "order_time": time.time(),
                 "예산예약금액": estimated_amount,
             }
+
+            self.last_buy_rejections.pop(code, None)
 
             print(
                 "[StrategyManager] 매수 승인 - "
@@ -465,7 +504,6 @@ class StrategyManager(QObject):
             }
 
         except Exception:
-            # 예외 발생 시 임시예약을 반드시 회수한다.
             self.reserved_buy_orders.pop(code, None)
             error_msg = traceback.format_exc()
             print(error_msg)
@@ -473,6 +511,7 @@ class StrategyManager(QObject):
                 f"[StrategyManager 매수요청 오류] "
                 f"{code_name}({code}) / {strategy_name}\n{error_msg}"
             )
+            self._set_buy_rejection(code, "StrategyManager 매수 요청 처리 중 예외 발생")
             return None
 
         finally:
@@ -575,35 +614,7 @@ class StrategyManager(QObject):
             for code in codes
         )
 
-    def get_event_realtime_union_fids(self, strategies=None):
-        strategies = strategies or self.get_event_driven_strategies()
-        fid_names = set()
-
-        for strategy in strategies:
-            if not getattr(strategy, "is_init_success", False):
-                continue
-
-            getter = getattr(strategy, "get_required_realtime_fids", None)
-            if not callable(getter):
-                raise RuntimeError(
-                    f"{strategy.strategy_name}에 get_required_realtime_fids()가 없습니다."
-                )
-
-            required = set(getter() or [])
-            if not required:
-                raise RuntimeError(
-                    f"{strategy.strategy_name}의 실시간 FID 목록이 비어 있습니다."
-                )
-
-            fid_names.update(required)
-
-        return sorted(fid_names)
-
-    def register_shared_event_realtime(
-        self,
-        strategies,
-        force_refresh=False,
-    ):
+    def register_shared_event_realtime(self, strategies, force_refresh=False):
         active = [
             strategy
             for strategy in strategies
@@ -619,29 +630,18 @@ class StrategyManager(QObject):
                 "event-driven 전략의 실시간 등록 가능 종목이 없습니다."
             )
 
-        union_fid_names = self.get_event_realtime_union_fids(active)
-
-        fid_setter = getattr(
-            self.kiwoom,
-            "set_stock_realtime_fid_names",
-            None,
-        )
-        if callable(fid_setter):
-            fid_setter(union_fid_names)
-
+        # 두 전략이 동일 시장 종목을 감시하므로 SetRealReg는 한 전략을 통해
+        # 후보 합집합으로 한 번만 등록한다.
         registrar = active[0]
         registrar.set_universe_real_time(
             register_market=True,
             codes_override=union_codes,
             force_refresh=force_refresh,
-            fid_names_override=union_fid_names,
         )
 
         print(
             "[StrategyManager] event-driven 공통 실시간 등록: "
-            f"{len(union_codes)}종목 / "
-            f"{len(active)}전략 공유 / "
-            f"FID {len(union_fid_names)}개 {union_fid_names}"
+            f"{len(union_codes)}종목 / {len(active)}전략 공유"
         )
 
         return union_codes
@@ -1460,6 +1460,70 @@ class StrategyManager(QObject):
 
         return False
 
+
+    def save_position_snapshot_if_due(
+        self,
+        force=False,
+    ):
+        """현재 실제 보유현황을 웹 조회용 DB에 저장한다."""
+        if not self.kiwoom.last_balance_query_success:
+            return False
+
+        now = time.time()
+
+        if (
+            not force
+            and now - self.last_position_snapshot_at
+            < self.position_snapshot_interval
+        ):
+            return False
+
+        count = save_position_snapshot(
+            balance=self.kiwoom.balance,
+            realtime_price_map=(
+                self.kiwoom
+                .universe_realtime_transaction_info
+            ),
+        )
+
+        self.last_position_snapshot_at = now
+
+        return True
+
+
+    def save_strategy_equity_snapshot_if_due(
+        self,
+        force=False,
+    ):
+        """웹 전략별 누적 성과곡선을 1분 주기로 저장한다."""
+        if not self.kiwoom.last_balance_query_success:
+            return False
+
+        now = time.time()
+
+        if (
+            not force
+            and (
+                now
+                - self.last_strategy_equity_snapshot_at
+                < self.strategy_equity_snapshot_interval
+            )
+        ):
+            return False
+
+        strategy_names = [
+            strategy.strategy_name
+            for strategy in self.strategies
+        ]
+
+        save_strategy_equity_snapshots(
+            strategy_names
+        )
+
+        self.last_strategy_equity_snapshot_at = now
+
+        return True
+
     def save_performance_snapshot(self):
         evaluation_amount, total_assets = save_daily_equity(
             deposit=self.d2_estimated_deposit,
@@ -2023,6 +2087,13 @@ class StrategyManager(QObject):
                     allow_buy_cancel=False
                 )
 
+                self.save_position_snapshot_if_due(
+                    force=True
+                )
+                self.save_strategy_equity_snapshot_if_due(
+                    force=True
+                )
+
                 if (
                     self.kiwoom.last_balance_query_success
                     and self.sync_deposit_from_kiwoom()
@@ -2050,6 +2121,11 @@ class StrategyManager(QObject):
                     allow_buy_cancel=True
                 ):
                     return
+
+            # 실시간 틱을 반영한 현재가를 5초 간격으로 웹 DB에 저장한다.
+            # 잔고 조회 자체는 기존 정책대로 60초 동기화를 유지한다.
+            self.save_position_snapshot_if_due()
+            self.save_strategy_equity_snapshot_if_due()
 
             if not self.account_state_safe:
                 if (

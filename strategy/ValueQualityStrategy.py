@@ -8,6 +8,8 @@ from util.const import get_fid
 from util.db_helper import (
     get_position_strategy,
     save_position_strategy,
+    save_strategy_signal,
+    update_strategy_signal_order_result,
 )
 from util.notifier import send_message
 from util.time_helper import (
@@ -85,6 +87,7 @@ class ValueQualityStrategy(QThread):
 
         self.order_guard = None
         self.buy_order_handler = None
+        self.buy_rejection_reason_handler = None
 
         self.value_db_path = get_value_db_path()
 
@@ -96,6 +99,22 @@ class ValueQualityStrategy(QThread):
 
     def set_buy_order_handler(self, callback):
         self.buy_order_handler = callback
+
+    def set_buy_rejection_reason_handler(self, callback):
+        """Manager의 신규매수 거절 사유 조회기를 연결한다."""
+        self.buy_rejection_reason_handler = callback
+
+    def _get_buy_rejection_reason(self, code):
+        if self.buy_rejection_reason_handler is None:
+            return "StrategyManager에서 신규매수를 승인하지 않음"
+
+        try:
+            return (
+                self.buy_rejection_reason_handler(code)
+                or "StrategyManager에서 신규매수를 승인하지 않음"
+            )
+        except Exception:
+            return "StrategyManager 신규매수 거절 사유 조회 실패"
 
     def _order_allowed(self):
         if self.order_guard is None:
@@ -214,18 +233,11 @@ class ValueQualityStrategy(QThread):
     def get_realtime_candidate_codes(self):
         return sorted(self.universe.keys())
 
-    def get_required_realtime_fids(self):
-        return {
-            "현재가",
-            "(최우선)매수호가",
-        }
-
     def set_universe_real_time(
         self,
         register_market=True,
         codes_override=None,
         force_refresh=False,
-        fid_names_override=None,
     ):
         if not self.listener_registered:
             self.kiwoom.add_realtime_listener(
@@ -272,15 +284,11 @@ class ValueQualityStrategy(QThread):
                 f"안전 한도 {self.MAX_REALTIME_SCREENS}개를 초과했습니다."
             )
 
-        fid_names = (
-            set(fid_names_override)
-            if fid_names_override is not None
-            else self.get_required_realtime_fids()
-        )
-        fids = ";".join(
-            get_fid(name)
-            for name in sorted(fid_names)
-        )
+        fids = ";".join([
+            get_fid("현재가"),
+            get_fid("(최우선)매수호가"),
+            get_fid("(최우선)매도호가"),
+        ])
 
         for i in range(
             0,
@@ -363,26 +371,15 @@ class ValueQualityStrategy(QThread):
         raw_code,
         tick,
     ):
-        code = str(raw_code).strip().zfill(6)
+        """재무/수익률 전략 신호를 주문 가능 여부보다 먼저 기록한다."""
+        code = str(
+            raw_code
+        ).strip().zfill(6)
 
         if (
             code not in self.universe
             or not self.is_init_success
         ):
-            return
-
-        if not self._order_allowed():
-            return
-
-        order_info = self.kiwoom.order.get(
-            code,
-            {},
-        )
-
-        if int(
-            order_info.get("미체결수량", 0)
-            or 0
-        ) > 0:
             return
 
         try:
@@ -399,14 +396,6 @@ class ValueQualityStrategy(QThread):
                 )
                 return
 
-            # 전량 수동매도 후 Manager 잔고 동기화가 끝날 때까지
-            # position_strategy가 남아 있으면 재매수를 막는다.
-            if (
-                get_position_strategy(code)
-                == self.strategy_name
-            ):
-                return
-
             self.check_buy_signal_and_order(
                 code,
                 tick=tick,
@@ -418,18 +407,151 @@ class ValueQualityStrategy(QThread):
                 f"{code}: {exc}"
             )
 
+    def _get_buy_signal(
+        self,
+        code,
+        tick=None,
+    ):
+        """순수 저평가 우량주 매수조건만 판정한다."""
+        if not self._is_qualified_candidate(
+            code
+        ):
+            return None
+
+        info = self.universe.get(
+            code,
+            {},
+        )
+
+        rt = (
+            tick
+            or self.kiwoom
+            .universe_realtime_transaction_info
+            .get(code, {})
+        )
+
+        current_price = int(
+            rt.get("현재가", 0)
+            or 0
+        )
+
+        # 실제 실시간 신호의 발생 시점을 남기기 위해 유효한 현재가 틱이 있을 때 기록.
+        if current_price <= 0:
+            return None
+
+        return {
+            "reason_code": "VALUE_QUALITY_ENTRY",
+            "signal_reason": (
+                "PER/PBR 저평가 + 매출총이익률/총자산회전율 우량 조건 충족"
+            ),
+            "current_price": current_price,
+            "condition_data": {
+                "current_price": current_price,
+                "per_ttm": float(
+                    info["per_ttm"]
+                ),
+                "per_min": self.PER_MIN,
+                "per_max": self.PER_MAX,
+                "pbr": float(
+                    info["pbr"]
+                ),
+                "pbr_min": self.PBR_MIN,
+                "pbr_max": self.PBR_MAX,
+                "gross_margin_pct": float(
+                    info[
+                        "gross_margin_pct"
+                    ]
+                ),
+                "gross_margin_min": (
+                    self.GROSS_MARGIN_MIN
+                ),
+                "gross_margin_max": (
+                    self.GROSS_MARGIN_MAX
+                ),
+                "asset_turnover": float(
+                    info[
+                        "asset_turnover"
+                    ]
+                ),
+                "asset_turnover_min": (
+                    self.ASSET_TURNOVER_MIN
+                ),
+                "asset_turnover_max": (
+                    self.ASSET_TURNOVER_MAX
+                ),
+            },
+        }
+
     def check_buy_signal_and_order(
         self,
         code,
         tick=None,
     ):
-        if (
-            check_adjacent_transaction_closed_for_buying()
-            or not check_transaction_open()
-        ):
+        if not check_transaction_open():
+            return False
+
+        signal = self._get_buy_signal(
+            code,
+            tick=tick,
+        )
+
+        if signal is None:
+            return False
+
+        info = self.universe[code]
+        code_name = (
+            info.get("code_name")
+            or code
+        )
+
+        signal_key = save_strategy_signal(
+            strategy_name=self.strategy_name,
+            code=code,
+            code_name=code_name,
+            signal_type="BUY",
+            reason_code=signal[
+                "reason_code"
+            ],
+            signal_reason=signal[
+                "signal_reason"
+            ],
+            current_price=signal[
+                "current_price"
+            ],
+            condition_data=signal[
+                "condition_data"
+            ],
+        )
+
+        if check_adjacent_transaction_closed_for_buying():
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "15:15 이후 신규매수 제한 시간",
+            )
             return False
 
         if code in self.kiwoom.balance:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "이미 보유 중인 종목",
+            )
+            return False
+
+        # 전량 수동매도 후 Manager 잔고/DB 동기화가 끝날 때까지 재매수 차단.
+        if (
+            get_position_strategy(code)
+            == self.strategy_name
+        ):
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "기존 전략 포지션 DB 정리/체결 반영 대기",
+            )
             return False
 
         order_info = self.kiwoom.order.get(
@@ -441,9 +563,21 @@ class ValueQualityStrategy(QThread):
             order_info.get("미체결수량", 0)
             or 0
         ) > 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "동일 종목 미체결 주문 존재",
+            )
             return False
 
-        if not self._is_qualified_candidate(code):
+        if not self._order_allowed():
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "StrategyManager 주문 안전조건 미충족",
+            )
             return False
 
         rt = (
@@ -458,27 +592,35 @@ class ValueQualityStrategy(QThread):
             or 0
         )
         bid = int(
-            rt.get("(최우선)매수호가", 0)
+            rt.get(
+                "(최우선)매수호가",
+                0,
+            )
             or 0
         )
 
-        order_price = bid or current_price
+        order_price = (
+            bid
+            or current_price
+        )
 
         if order_price <= 0:
-            return False
-
-        if self.buy_order_handler is None:
-            print(
-                "[ValueQuality] "
-                "Manager buy_order_handler가 연결되지 않았습니다."
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "유효한 매수 주문가격을 확인할 수 없음",
             )
             return False
 
-        info = self.universe[code]
-        code_name = (
-            info.get("code_name")
-            or code
-        )
+        if self.buy_order_handler is None:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "Manager buy_order_handler 미연결",
+            )
+            return False
 
         order = self.buy_order_handler(
             strategy_name=self.strategy_name,
@@ -490,10 +632,27 @@ class ValueQualityStrategy(QThread):
         )
 
         if order is None:
+            update_strategy_signal_order_result(
+                signal_key,
+                order_attempted=False,
+                order_result="BLOCKED",
+                blocked_reason=(
+                    self._get_buy_rejection_reason(
+                        code
+                    )
+                ),
+            )
             return False
 
         quantity = int(
             order["quantity"]
+        )
+
+        update_strategy_signal_order_result(
+            signal_key,
+            order_attempted=True,
+            order_result="ORDER_SENT",
+            blocked_reason=None,
         )
 
         save_position_strategy(
@@ -511,16 +670,18 @@ class ValueQualityStrategy(QThread):
             db_path=self.value_db_path,
         )
 
+        data = signal["condition_data"]
+
         send_message(
             f"[저평가 우량주 매수] "
             f"{code_name}({code}) "
             f"{quantity}주 {order_price:,}원 / "
-            f"PER {float(info['per_ttm']):.2f} / "
-            f"PBR {float(info['pbr']):.2f} / "
+            f"PER {data['per_ttm']:.2f} / "
+            f"PBR {data['pbr']:.2f} / "
             f"매출총이익률 "
-            f"{float(info['gross_margin_pct']):.2f}% / "
+            f"{data['gross_margin_pct']:.2f}% / "
             f"총자산회전율 "
-            f"{float(info['asset_turnover']):.2f}회"
+            f"{data['asset_turnover']:.2f}회"
         )
 
         return True
@@ -568,7 +729,7 @@ class ValueQualityStrategy(QThread):
             * 100.0
         )
 
-    def manage_position(
+    def get_sell_signal(
         self,
         code,
         tick=None,
@@ -579,40 +740,168 @@ class ValueQualityStrategy(QThread):
         )
 
         if return_rate is None:
-            return False
+            return None
+
+        balance_info = self.kiwoom.balance.get(
+            code,
+            {},
+        )
+
+        buy_price = float(
+            balance_info.get("매입가")
+            or balance_info.get("매입단가")
+            or 0
+        )
+
+        rt = (
+            tick
+            or self.kiwoom
+            .universe_realtime_transaction_info
+            .get(code, {})
+        )
+
+        current_price = float(
+            rt.get("현재가")
+            or balance_info.get(
+                "현재가"
+            )
+            or 0
+        )
 
         if (
             return_rate
             <= self.STOP_LOSS_PCT
         ):
-            return self.order_sell(
-                code,
-                reason=(
+            return {
+                "reason_code": "STOP_LOSS",
+                "signal_reason": (
                     f"손실률 {return_rate:.2f}% "
                     f"<= {self.STOP_LOSS_PCT:.0f}%"
                 ),
-            )
+                "current_price": current_price,
+                "condition_data": {
+                    "buy_price": buy_price,
+                    "current_price": current_price,
+                    "return_pct": return_rate,
+                    "stop_loss_pct": (
+                        self.STOP_LOSS_PCT
+                    ),
+                },
+            }
 
         if (
             return_rate
             >= self.TAKE_PROFIT_PCT
         ):
-            return self.order_sell(
-                code,
-                reason=(
+            return {
+                "reason_code": "TAKE_PROFIT",
+                "signal_reason": (
                     f"수익률 {return_rate:.2f}% "
                     f">= +{self.TAKE_PROFIT_PCT:.0f}%"
                 ),
-            )
+                "current_price": current_price,
+                "condition_data": {
+                    "buy_price": buy_price,
+                    "current_price": current_price,
+                    "return_pct": return_rate,
+                    "take_profit_pct": (
+                        self.TAKE_PROFIT_PCT
+                    ),
+                },
+            }
 
-        return False
+        return None
+
+    def manage_position(
+        self,
+        code,
+        tick=None,
+    ):
+        signal = self.get_sell_signal(
+            code,
+            tick=tick,
+        )
+
+        if signal is None:
+            return False
+
+        code_name = self.universe.get(
+            code,
+            {},
+        ).get(
+            "code_name",
+            code,
+        )
+
+        signal_key = save_strategy_signal(
+            strategy_name=self.strategy_name,
+            code=code,
+            code_name=code_name,
+            signal_type="SELL",
+            reason_code=signal[
+                "reason_code"
+            ],
+            signal_reason=signal[
+                "signal_reason"
+            ],
+            current_price=signal[
+                "current_price"
+            ],
+            condition_data=signal[
+                "condition_data"
+            ],
+        )
+
+        order_info = self.kiwoom.order.get(
+            code,
+            {},
+        )
+
+        if int(
+            order_info.get(
+                "미체결수량",
+                0,
+            )
+            or 0
+        ) > 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "동일 종목 미체결 주문 존재",
+            )
+            return False
+
+        if not self._order_allowed():
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "StrategyManager 주문 안전조건 미충족",
+            )
+            return False
+
+        return self.order_sell(
+            code,
+            reason=signal[
+                "signal_reason"
+            ],
+            signal_key=signal_key,
+        )
 
     def order_sell(
         self,
         code,
         reason,
+        signal_key=None,
     ):
         if code not in self.kiwoom.balance:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "실제 계좌 잔고에서 종목을 찾을 수 없음",
+            )
             return False
 
         balance_info = self.kiwoom.balance[
@@ -620,12 +909,22 @@ class ValueQualityStrategy(QThread):
         ]
 
         quantity = int(
-            balance_info.get("매매가능수량")
-            or balance_info.get("보유수량")
+            balance_info.get(
+                "매매가능수량"
+            )
+            or balance_info.get(
+                "보유수량"
+            )
             or 0
         )
 
         if quantity <= 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                False,
+                "BLOCKED",
+                "매매가능수량이 0",
+            )
             return False
 
         result = self.kiwoom.send_order(
@@ -640,6 +939,13 @@ class ValueQualityStrategy(QThread):
         )
 
         if result != 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                True,
+                "ORDER_FAILED",
+                f"Kiwoom SendOrder 실패 result={result}",
+            )
+
             send_message(
                 f"[저평가 우량주 매도 실패] "
                 f"{self.universe[code].get('code_name', code)}"
@@ -648,6 +954,13 @@ class ValueQualityStrategy(QThread):
                 f"{reason} / result={result}"
             )
             return False
+
+        update_strategy_signal_order_result(
+            signal_key,
+            True,
+            "ORDER_SENT",
+            None,
+        )
 
         self.kiwoom.order[code] = {
             "주문구분": "매도",

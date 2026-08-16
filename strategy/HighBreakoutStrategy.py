@@ -7,8 +7,10 @@ from PyQt5.QtCore import QThread
 
 from util.const import get_fid
 from util.db_helper import (
-    save_position_strategy,
     get_position_strategy,
+    save_position_strategy,
+    save_strategy_signal,
+    update_strategy_signal_order_result,
 )
 from util.market_history import (
     MIN_HISTORY_DAYS,
@@ -59,6 +61,7 @@ class HighBreakoutStrategy(QThread):
 
         self.order_guard = None
         self.buy_order_handler = None
+        self.buy_rejection_reason_handler = None
 
         self.market_history_db_path = get_market_history_db_path()
         self.last_signal_log_at = {}
@@ -73,6 +76,21 @@ class HighBreakoutStrategy(QThread):
     def set_buy_order_handler(self, callback):
         """실제 매수 수량/자금 예약/SendOrder를 Manager에 위임한다."""
         self.buy_order_handler = callback
+
+    def set_buy_rejection_reason_handler(self, callback):
+        """Manager가 매수를 거절했을 때 웹 신호 로그에 남길 사유 조회기를 연결한다."""
+        self.buy_rejection_reason_handler = callback
+
+    def _get_buy_rejection_reason(self, code):
+        if self.buy_rejection_reason_handler is None:
+            return "StrategyManager에서 신규매수를 승인하지 않음"
+        try:
+            return (
+                self.buy_rejection_reason_handler(code)
+                or "StrategyManager에서 신규매수를 승인하지 않음"
+            )
+        except Exception:
+            return "StrategyManager 신규매수 거절 사유 조회 실패"
 
     def _order_allowed(self):
         if self.order_guard is None:
@@ -206,19 +224,11 @@ class HighBreakoutStrategy(QThread):
             eligible_codes | holding_codes
         )
 
-    def get_required_realtime_fids(self):
-        return {
-            "현재가",
-            "누적거래량",
-            "(최우선)매수호가",
-        }
-
     def set_universe_real_time(
         self,
         register_market=True,
         codes_override=None,
         force_refresh=False,
-        fid_names_override=None,
     ):
         if not self.listener_registered:
             self.kiwoom.add_realtime_listener(
@@ -268,14 +278,17 @@ class HighBreakoutStrategy(QThread):
                 "초과했습니다."
             )
 
-        fid_names = (
-            set(fid_names_override)
-            if fid_names_override is not None
-            else self.get_required_realtime_fids()
-        )
         fids = ";".join(
-            get_fid(name)
-            for name in sorted(fid_names)
+            [
+                get_fid("체결시간"),
+                get_fid("현재가"),
+                get_fid("시가"),
+                get_fid("고가"),
+                get_fid("저가"),
+                get_fid("누적거래량"),
+                get_fid("(최우선)매도호가"),
+                get_fid("(최우선)매수호가"),
+            ]
         )
 
         for i in range(
@@ -317,63 +330,59 @@ class HighBreakoutStrategy(QThread):
         )
 
     def on_realtime_tick(self, raw_code, tick):
-        """체결 이벤트가 들어온 종목만 즉시 검사한다."""
-        code = (
-            str(raw_code)
-            .strip()
-            .upper()
-            .zfill(6)
-        )
+        """체결 이벤트가 들어온 종목만 즉시 검사한다.
 
-        if (
-            code not in self.universe
-            or not self.is_init_success
-        ):
-            return
+        웹 분석을 위해 전략 조건 판정을 주문 가능 여부보다 먼저 수행한다.
+        따라서 계좌 안전중지/예산 부족/최대 보유수 도달 상황에서도
+        기술적 매수·매도 신호 자체는 strategy_signal_log에 남는다.
+        """
+        code = str(raw_code).strip().upper().zfill(6)
 
-        if not self._order_allowed():
-            return
-
-        order_info = self.kiwoom.order.get(
-            code,
-            {},
-        )
-
-        if int(
-            order_info.get("미체결수량", 0)
-            or 0
-        ) > 0:
+        if code not in self.universe or not self.is_init_success:
             return
 
         try:
             if code in self.kiwoom.balance:
-                if (
-                    get_position_strategy(code)
-                    != self.strategy_name
-                ):
+                if get_position_strategy(code) != self.strategy_name:
                     return
 
-                if self.check_sell_signal(
+                sell_signal = self.get_sell_signal(code, tick=tick)
+                if sell_signal is None:
+                    return
+
+                signal_key = self._save_sell_signal(code, tick, sell_signal)
+
+                order_info = self.kiwoom.order.get(code, {})
+                if int(order_info.get("미체결수량", 0) or 0) > 0:
+                    update_strategy_signal_order_result(
+                        signal_key,
+                        order_attempted=False,
+                        order_result="BLOCKED",
+                        blocked_reason="동일 종목 미체결 주문 존재",
+                    )
+                    return
+
+                if not self._order_allowed():
+                    update_strategy_signal_order_result(
+                        signal_key,
+                        order_attempted=False,
+                        order_result="BLOCKED",
+                        blocked_reason="StrategyManager 주문 안전조건 미충족",
+                    )
+                    return
+
+                self.order_sell(
                     code,
                     tick=tick,
-                ):
-                    self.order_sell(
-                        code,
-                        tick=tick,
-                    )
-
+                    signal=sell_signal,
+                    signal_key=signal_key,
+                )
                 return
 
-            self.check_buy_signal_and_order(
-                code,
-                tick=tick,
-            )
+            self.check_buy_signal_and_order(code, tick=tick)
 
         except Exception as exc:
-            print(
-                "[HighBreakout] 실시간 검사 오류 "
-                f"{code}: {exc}"
-            )
+            print(f"[HighBreakout] 실시간 검사 오류 {code}: {exc}")
 
     def _metric(self, code):
         return self.breakout_metrics.get(
@@ -418,70 +427,18 @@ class HighBreakoutStrategy(QThread):
             or None
         )
 
-    def check_buy_signal_and_order(
-        self,
-        code,
-        tick=None,
-    ):
-        if (
-            check_adjacent_transaction_closed_for_buying()
-            or not check_transaction_open()
-        ):
-            return False
-
-        if code in self.kiwoom.balance:
-            return False
-
-        order_info = self.kiwoom.order.get(
-            code,
-            {},
-        )
-
-        if int(
-            order_info.get("미체결수량", 0)
-            or 0
-        ) > 0:
-            return False
-
+    def _get_buy_signal(self, code, tick=None):
+        """순수 전략 매수조건만 판정한다. 주문 가능 여부는 여기서 판단하지 않는다."""
         metric = self._metric(code)
         if not metric:
-            return False
+            return None
 
-        rt = (
-            tick
-            or self.kiwoom
-            .universe_realtime_transaction_info
-            .get(code, {})
-        )
-
-        current_price = int(
-            rt.get("현재가", 0) or 0
-        )
-        volume = int(
-            rt.get("누적거래량", 0) or 0
-        )
-
-        breakout_price = float(
-            metric.get(
-                "breakout_price",
-                0,
-            )
-            or 0
-        )
-        volume_ma20 = float(
-            metric.get(
-                "volume_ma20",
-                0,
-            )
-            or 0
-        )
-        trading_value_ma20 = float(
-            metric.get(
-                "trading_value_ma20",
-                0,
-            )
-            or 0
-        )
+        rt = tick or self.kiwoom.universe_realtime_transaction_info.get(code, {})
+        current_price = int(rt.get("현재가", 0) or 0)
+        volume = int(rt.get("누적거래량", 0) or 0)
+        breakout_price = float(metric.get("breakout_price", 0) or 0)
+        volume_ma20 = float(metric.get("volume_ma20", 0) or 0)
+        trading_value_ma20 = float(metric.get("trading_value_ma20", 0) or 0)
 
         if (
             current_price <= 0
@@ -489,75 +446,140 @@ class HighBreakoutStrategy(QThread):
             or volume_ma20 < 0
             or trading_value_ma20 <= 0
         ):
-            return False
+            return None
 
-        # 신고가 + 거래량 + 유동성 필터
         if not (
             current_price > breakout_price
             and volume >= volume_ma20
             and trading_value_ma20 >= self.MIN_AVG_TRADING_VALUE
         ):
+            return None
+
+        return {
+            "reason_code": "BREAKOUT_ENTRY",
+            "signal_reason": (
+                f"직전 {self.BREAKOUT_WINDOW}일 최고가 돌파 + "
+                f"누적거래량 20일 평균 이상 + 20일 평균거래대금 20억원 이상"
+            ),
+            "current_price": current_price,
+            "condition_data": {
+                "current_price": current_price,
+                "breakout_price": breakout_price,
+                "volume": volume,
+                "volume_ma20": volume_ma20,
+                "trading_value_ma20": trading_value_ma20,
+                "min_avg_trading_value": self.MIN_AVG_TRADING_VALUE,
+            },
+        }
+
+    def check_buy_signal_and_order(self, code, tick=None):
+        # 정규장이 아니면 전략 신호로 보지 않는다.
+        if not check_transaction_open():
+            return False
+
+        signal = self._get_buy_signal(code, tick=tick)
+        if signal is None:
+            return False
+
+        code_name = self.universe[code]["code_name"]
+        signal_key = save_strategy_signal(
+            strategy_name=self.strategy_name,
+            code=code,
+            code_name=code_name,
+            signal_type="BUY",
+            reason_code=signal["reason_code"],
+            signal_reason=signal["signal_reason"],
+            current_price=signal["current_price"],
+            condition_data=signal["condition_data"],
+        )
+
+        # 아래부터는 "조건은 맞지만 실제 주문이 가능한가"를 판단한다.
+        if check_adjacent_transaction_closed_for_buying():
+            update_strategy_signal_order_result(
+                signal_key, False, "BLOCKED", "15:15 이후 신규매수 제한 시간"
+            )
+            return False
+
+        if code in self.kiwoom.balance:
+            update_strategy_signal_order_result(
+                signal_key, False, "BLOCKED", "이미 보유 중인 종목"
+            )
+            return False
+
+        order_info = self.kiwoom.order.get(code, {})
+        if int(order_info.get("미체결수량", 0) or 0) > 0:
+            update_strategy_signal_order_result(
+                signal_key, False, "BLOCKED", "동일 종목 미체결 주문 존재"
+            )
+            return False
+
+        if not self._order_allowed():
+            update_strategy_signal_order_result(
+                signal_key, False, "BLOCKED", "StrategyManager 주문 안전조건 미충족"
+            )
             return False
 
         bid = int(
-            rt.get(
-                "(최우선)매수호가",
-                0,
-            )
-            or 0
+            (tick or self.kiwoom.universe_realtime_transaction_info.get(code, {})).get(
+                "(최우선)매수호가", 0
+            ) or 0
         )
-
         if bid <= 0:
+            update_strategy_signal_order_result(
+                signal_key, False, "BLOCKED", "최우선 매수호가를 확인할 수 없음"
+            )
             return False
 
         if self.buy_order_handler is None:
-            print(
-                "[HighBreakout] "
-                "Manager buy_order_handler가 "
-                "연결되지 않았습니다."
+            update_strategy_signal_order_result(
+                signal_key, False, "BLOCKED", "Manager buy_order_handler 미연결"
             )
             return False
 
         order = self.buy_order_handler(
             strategy_name=self.strategy_name,
             code=code,
-            code_name=self.universe[code][
-                "code_name"
-            ],
+            code_name=code_name,
             price=bid,
             rqname="send_buy_order",
             screen_no="2004",
         )
 
         if order is None:
+            update_strategy_signal_order_result(
+                signal_key,
+                order_attempted=False,
+                order_result="BLOCKED",
+                blocked_reason=self._get_buy_rejection_reason(code),
+            )
             return False
 
-        quantity = int(
-            order["quantity"]
+        quantity = int(order["quantity"])
+        update_strategy_signal_order_result(
+            signal_key,
+            order_attempted=True,
+            order_result="ORDER_SENT",
+            blocked_reason=None,
         )
 
         save_position_strategy(
             code=code,
-            code_name=self.universe[code][
-                "code_name"
-            ],
+            code_name=code_name,
             strategy_name=self.strategy_name,
             quantity=0,
             buy_price=0,
         )
 
+        data = signal["condition_data"]
         send_message(
-            f"[신고가돌파 매수] "
-            f"{self.universe[code]['code_name']}"
-            f"({code}) "
+            f"[신고가돌파 매수] {code_name}({code}) "
             f"{quantity}주 {bid:,}원 / "
             f"직전{self.BREAKOUT_WINDOW}일 최고가 "
-            f"{int(breakout_price):,}원 돌파 / "
-            f"누적거래량 {volume:,} / "
+            f"{int(data['breakout_price']):,}원 돌파 / "
+            f"누적거래량 {int(data['volume']):,} / "
             f"20일 평균거래대금 "
-            f"{trading_value_ma20 / 100_000_000:,.1f}억원"
+            f"{data['trading_value_ma20'] / 100_000_000:,.1f}억원"
         )
-
         return True
 
     def is_stop_loss_triggered(
@@ -616,70 +638,106 @@ class HighBreakoutStrategy(QThread):
             * 100
         ) <= self.STOP_LOSS_PCT
 
-    def check_sell_signal(
-        self,
-        code,
-        tick=None,
-    ):
+    def get_sell_signal(self, code, tick=None):
+        """매도조건을 사유와 조건 스냅샷 형태로 반환한다."""
         if code not in self.kiwoom.balance:
-            return False
+            return None
 
-        if self.is_stop_loss_triggered(
-            code,
-            tick=tick,
-        ):
-            return True
-
-        rt = (
-            tick
-            or self.kiwoom
-            .universe_realtime_transaction_info
-            .get(code, {})
-        )
-
-        current_price = float(
-            rt.get("현재가", 0) or 0
-        )
-
-        if current_price <= 0:
-            return False
-
-        ma20 = self._dynamic_ma20(
-            code,
-            current_price,
-        )
-
-        if ma20 is None:
-            return False
-
-        return current_price < ma20
-
-    def order_sell(
-        self,
-        code,
-        tick=None,
-    ):
         balance_info = self.kiwoom.balance[code]
+        purchase_price = float(
+            balance_info.get("매입가", balance_info.get("매입단가", 0)) or 0
+        )
+        rt = tick or self.kiwoom.universe_realtime_transaction_info.get(code, {})
+        current_price = float(rt.get("현재가", balance_info.get("현재가", 0)) or 0)
 
+        if purchase_price <= 0 or current_price <= 0:
+            return None
+
+        return_pct = (current_price - purchase_price) / purchase_price * 100.0
+
+        if return_pct <= self.STOP_LOSS_PCT:
+            return {
+                "reason_code": "STOP_LOSS",
+                "signal_reason": f"수익률 {return_pct:.2f}% <= {self.STOP_LOSS_PCT:.2f}%",
+                "current_price": current_price,
+                "condition_data": {
+                    "purchase_price": purchase_price,
+                    "current_price": current_price,
+                    "return_pct": return_pct,
+                    "stop_loss_pct": self.STOP_LOSS_PCT,
+                },
+                "market_order": True,
+            }
+
+        ma20 = self._dynamic_ma20(code, current_price)
+        if ma20 is not None and current_price < ma20:
+            return {
+                "reason_code": "MA20_BREAKDOWN",
+                "signal_reason": f"현재가 {current_price:,.0f}원 < MA20 {ma20:,.1f}원",
+                "current_price": current_price,
+                "condition_data": {
+                    "purchase_price": purchase_price,
+                    "current_price": current_price,
+                    "return_pct": return_pct,
+                    "ma20": ma20,
+                },
+                "market_order": False,
+            }
+
+        return None
+
+    def _save_sell_signal(self, code, tick, signal):
+        return save_strategy_signal(
+            strategy_name=self.strategy_name,
+            code=code,
+            code_name=self.universe[code]["code_name"],
+            signal_type="SELL",
+            reason_code=signal["reason_code"],
+            signal_reason=signal["signal_reason"],
+            current_price=signal["current_price"],
+            condition_data=signal["condition_data"],
+        )
+
+    def check_sell_signal(self, code, tick=None):
+        """기존 Manager 호환용 bool 인터페이스."""
+        return self.get_sell_signal(code, tick=tick) is not None
+
+    def order_sell(self, code, tick=None, signal=None, signal_key=None):
+        balance_info = self.kiwoom.balance[code]
         quantity = int(
             balance_info.get("매매가능수량", 0)
             or balance_info.get("보유수량", 0)
             or 0
         )
 
+        if signal is None:
+            signal = self.get_sell_signal(code, tick=tick)
+        if signal is None:
+            return False
+        if signal_key is None:
+            signal_key = self._save_sell_signal(code, tick, signal)
+
         if quantity < 1:
+            update_strategy_signal_order_result(
+                signal_key, False, "BLOCKED", "매매가능수량이 0"
+            )
             return False
 
-        is_stop_loss = self.is_stop_loss_triggered(
-            code,
-            tick=tick,
-        )
+        rt = tick or self.kiwoom.universe_realtime_transaction_info.get(code, {})
 
-        order_label = (
-            "[신고가돌파 손절 시장가 매도]"
-            if is_stop_loss
-            else "[신고가돌파 MA20 이탈 시장가 매도]"
-        )
+        if signal.get("market_order"):
+            order_price = 0
+            order_classification = "03"
+            order_label = "[신고가돌파 손절 시장가 매도]"
+        else:
+            order_price = int(rt.get("(최우선)매도호가", 0) or 0)
+            if order_price <= 0:
+                update_strategy_signal_order_result(
+                    signal_key, False, "BLOCKED", "최우선 매도호가를 확인할 수 없음"
+                )
+                return False
+            order_classification = "00"
+            order_label = "[신고가돌파 매도]"
 
         result = self.kiwoom.send_order(
             "send_sell_order",
@@ -687,66 +745,71 @@ class HighBreakoutStrategy(QThread):
             2,
             code,
             quantity,
-            0,
-            "03",
+            order_price,
+            order_classification,
             strategy_name=self.strategy_name,
         )
 
         if result != 0:
+            update_strategy_signal_order_result(
+                signal_key,
+                order_attempted=True,
+                order_result="ORDER_FAILED",
+                blocked_reason=f"Kiwoom SendOrder 실패 result={result}",
+            )
             send_message(
                 f"{order_label} 주문 실패: "
-                f"{self.universe[code]['code_name']}"
-                f"({code}) result={result}"
+                f"{self.universe[code]['code_name']}({code}) result={result}"
             )
             return False
 
+        update_strategy_signal_order_result(
+            signal_key, True, "ORDER_SENT", None
+        )
+
         self.kiwoom.order[code] = {
             "주문구분": "매도",
-            "주문가격": 0,
             "미체결수량": quantity,
             "strategy_name": self.strategy_name,
             "order_time": time.time(),
         }
 
+        price_text = "시장가" if signal.get("market_order") else f"{order_price:,}원"
         send_message(
-            f"{order_label} "
-            f"{self.universe[code]['code_name']}"
-            f"({code}) {quantity}주 시장가"
+            f"{order_label} {self.universe[code]['code_name']}({code}) "
+            f"{quantity}주 {price_text} / 사유: {signal['signal_reason']}"
         )
-
         return True
 
     def check_code(self, code):
         """Manager 호환용. 신규매수는 실시간 이벤트에서 처리한다."""
-        code = (
-            str(code)
-            .strip()
-            .upper()
-            .zfill(6)
-        )
-
+        code = str(code).strip().upper().zfill(6)
         if code not in self.universe:
             return False
 
-        order_info = self.kiwoom.order.get(
-            code,
-            {},
-        )
-
-        if int(
-            order_info.get("미체결수량", 0)
-            or 0
-        ) > 0:
-            return False
-
         if code in self.kiwoom.balance:
-            if (
-                get_position_strategy(code)
-                != self.strategy_name
-            ):
+            if get_position_strategy(code) != self.strategy_name:
                 return False
 
-            if self.check_sell_signal(code):
-                return self.order_sell(code)
+            signal = self.get_sell_signal(code)
+            if signal is None:
+                return False
+
+            signal_key = self._save_sell_signal(code, None, signal)
+            order_info = self.kiwoom.order.get(code, {})
+            if int(order_info.get("미체결수량", 0) or 0) > 0:
+                update_strategy_signal_order_result(
+                    signal_key, False, "BLOCKED", "동일 종목 미체결 주문 존재"
+                )
+                return False
+
+            if not self._order_allowed():
+                update_strategy_signal_order_result(
+                    signal_key, False, "BLOCKED", "StrategyManager 주문 안전조건 미충족"
+                )
+                return False
+
+            return self.order_sell(code, signal=signal, signal_key=signal_key)
 
         return False
+

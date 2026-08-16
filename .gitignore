@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 *.pyd
 
+webenv/
 .venv/
 venv/
 env/
@@ -29,3 +30,6 @@ __pycache__/
 *.csv
 .env
 .vscode/
+
+__pycache__/
+*.pyc

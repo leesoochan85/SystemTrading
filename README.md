@@ -1,5 +1,38 @@
 # SystemTrading 작업 환경 세팅 가이드
 
+> 대상: 저장소를 처음 받은 PC에서 **과거 데이터 수집 → Kiwoom 자동매매 → Telegram → 선택적으로 웹 API**까지 실행 가능한 상태를 만드는 절차입니다.
+>
+> 핵심은 Python 환경이 하나가 아니라는 점입니다.
+>
+> - **32bit Python 3.9**: Kiwoom OpenAPI+ 자동매매 실행
+> - **64bit Python**: pykrx로 과거 일봉/종목 마스터 구축
+>
+> 두 환경은 같은 프로젝트 폴더의 `market_history.db`를 공유합니다.
+
+---
+
+## 0. 처음 설치할 때 전체 순서
+
+새 PC에서는 아래 순서대로 진행하는 것을 권장합니다.
+
+```text
+1. Git 설치
+2. 저장소 clone
+3. Kiwoom OpenAPI+ 설치 + 서비스 신청/로그인 확인
+4. Python 3.9 32bit 설치
+5. Kiwoom용 32bit 가상환경 생성 + 패키지 설치
+6. 64bit Python/Conda 환경 marketdata 생성 + pykrx 설치
+7. Telegram 환경변수 설정
+8. 64bit 환경에서 market_history.db 초기 구축
+9. ValueQuality를 사용할 경우 재무 CSV 입력
+10. DB/환경 사전 점검
+11. 32bit 환경에서 main.py 실행
+12. 선택: 웹 모니터링 API 실행
+```
+
+**중요:** 새 PC에서 `main.py`부터 실행하면 안 됩니다. `HighBreakoutStrategy`와 `PullbackTrendStrategy`는 `market_history.db`의 종목 마스터와 최소 과거 일봉이 준비되어 있어야 정상 초기화됩니다.
+
+---
 
 ## 1. 새 PC에서 프로젝트 받기
 
@@ -14,43 +47,72 @@ git status
 
 정상 예시:
 
-```cmd
+```text
 On branch main
 Your branch is up to date with 'origin/main'.
 ```
 
-Git이 인식되지 않으면 Git for Windows를 설치해야 합니다.
+Git 확인:
 
 ```cmd
 git --version
 where git
 ```
 
----
+Git이 인식되지 않으면 Git for Windows를 설치한 뒤 CMD를 새로 엽니다.
 
-## 2. 필수 환경
+### 권장: clone 직후 현재 브랜치/최신 상태 확인
 
-### Python
-
-Kiwoom OpenAPI는 32비트 ActiveX 기반이므로 일반적으로 **Python 3.9 32-bit** 환경을 사용합니다.
-
-권장:
-
-```text
-Python 3.9.x 32-bit
+```cmd
+git branch --show-current
+git fetch origin
+git status
 ```
 
-설치된 Python 확인:
+로컬 수정이 없는 새 PC라면 필요 시:
+
+```cmd
+git pull origin main
+```
+
+---
+
+## 2. 프로젝트에서 사용하는 두 Python 환경
+
+### 2-1. Kiwoom 자동매매용
+
+```text
+Windows
+Python 3.9.x 32-bit
+PyQt5 QAxContainer
+Kiwoom OpenAPI+
+```
+
+Kiwoom OpenAPI+가 ActiveX 기반이므로 자동매매 프로세스는 **32bit Python**을 사용합니다.
+
+설치 확인:
 
 ```cmd
 py -0p
 ```
 
-`-3.9-32`가 보여야 합니다.
+목록에 Python 3.9 32-bit가 보여야 합니다.
+
+### 2-2. 과거 데이터 수집용
+
+```text
+64-bit Python
+pykrx
+pandas
+numpy
+python-dotenv
+```
+
+`bootstrap_market_history.py`는 코드에서 64bit가 아니면 실행을 중단하도록 되어 있습니다. 따라서 Kiwoom용 32bit 환경과 별도로 만들어야 합니다.
 
 ---
 
-## 3. 가상환경 생성
+## 3. Kiwoom용 32bit 가상환경 생성
 
 프로젝트 폴더에서 실행합니다.
 
@@ -62,69 +124,116 @@ kiwoom\Scripts\activate
 
 정상 활성화 예시:
 
-```cmd
+```text
 (kiwoom) C:\Users\사용자명\Downloads\SystemTrading>
 ```
 
-Python 버전과 비트 확인:
+버전/비트 확인:
 
 ```cmd
 python --version
-python -c "import platform; print(platform.architecture())"
+python -c "import struct; print(struct.calcsize('P') * 8)"
 ```
 
 정상 목표:
 
-```cmd
+```text
 Python 3.9.x
-('32bit', 'WindowsPE')
+32
 ```
 
 ---
 
-## 4. 패키지 설치
+## 4. 32bit 자동매매 패키지 설치
 
-32비트 Python에서는 일부 최신 패키지가 설치 실패할 수 있으므로 버전을 고정합니다.
+32bit Python에서는 일부 최신 패키지 wheel이 없을 수 있으므로 기존 검증 버전을 우선 사용합니다.
 
 ```cmd
 python -m pip install --upgrade pip wheel
 pip install "setuptools==80.10.2" --force-reinstall
 pip install numpy==1.24.4 pandas==1.5.3 matplotlib==3.7.5 --prefer-binary
-pip install requests beautifulsoup4 lxml PyQt5 openpyxl --prefer-binary
-pip install pykrx --no-deps
-pip install datetime xlrd deprecated multipledispatch
+pip install requests beautifulsoup4 lxml PyQt5 openpyxl xlrd deprecated multipledispatch --prefer-binary
+```
+
+> **변경:** `pykrx`는 이 32bit 환경의 필수 패키지에서 제외합니다. 현재 구조에서는 pykrx 조회를 64bit `marketdata` 환경이 담당하고, Kiwoom 프로세스는 `market_history.db`를 읽습니다.
+
+설치 확인:
+
+```cmd
+python -c "import numpy, pandas, requests, bs4, lxml, openpyxl; print('basic packages OK')"
+python -c "from PyQt5.QAxContainer import QAxWidget; print('QAx OK')"
+```
+
+`QAx OK`가 나오면 PyQt5 ActiveX 모듈이 정상적으로 import된 것입니다.
+
+---
+
+## 5. 64bit `marketdata` 환경 생성
+
+Conda를 사용하는 경우 예시입니다.
+
+```cmd
+conda create -n marketdata python=3.12 -y
+conda activate marketdata
+```
+
+64bit 확인:
+
+```cmd
+python -c "import struct, platform; print(platform.python_version(), struct.calcsize('P') * 8)"
+```
+
+정상 목표:
+
+```text
+... 64
+```
+
+필수 패키지:
+
+```cmd
+python -m pip install --upgrade pip
+pip install pykrx pandas numpy python-dotenv
 ```
 
 설치 확인:
 
 ```cmd
-python -c "import numpy, pandas, matplotlib, requests, bs4, lxml, pykrx, openpyxl; print('basic packages OK')"
-python -c "from PyQt5.QAxContainer import QAxWidget; print('QAx OK')"
-python -c "from pykrx import stock; print('pykrx OK')"
+python -c "from pykrx import stock; import pandas, numpy, dotenv; print('marketdata packages OK')"
 ```
 
-`pykrx` 실행 시 `pkg_resources is deprecated` 경고가 나올 수 있지만, `pykrx OK`가 출력되면 실행 자체는 가능합니다.  
-단, `setuptools`를 최신 버전으로 올리면 `pykrx`가 깨질 수 있으므로 `setuptools==80.10.2` 또는 `setuptools<81` 상태를 유지합니다.
+> 이 환경에서는 `PyQt5.QAxContainer`가 필요하지 않습니다. 반대로 Kiwoom용 32bit 환경에서 과거 전체시장 수집을 수행하지 않습니다.
 
 ---
 
-## 5. Kiwoom OpenAPI+ 설치 및 버전처리
+## 6. Kiwoom OpenAPI+ 설치 및 버전처리
 
-새 PC에는 Kiwoom OpenAPI+를 설치해야 합니다.
+새 PC에는 Kiwoom OpenAPI+를 별도로 설치해야 합니다.
 
-설치 확인:
+설치 확인 예시:
 
 ```cmd
 dir C:\OpenAPI
 ```
 
-아래 파일들이 있으면 정상입니다.
+일반적으로 아래 구성요소가 존재합니다.
 
 ```text
 KOAStudioSA.exe
 opstarter.exe
 opversionup.exe
 khopenapi.ocx
+```
+
+### 최초 PC 세팅 시 확인
+
+```text
+1. Kiwoom 계정 준비
+2. OpenAPI+ 서비스 사용 신청 확인
+3. 필요한 인증서/보안 프로그램 설치
+4. OpenAPI+ 로그인 확인
+5. 버전처리 완료
+6. 이후 자동매매 실행
 ```
 
 ### 버전처리 순서
@@ -153,7 +262,7 @@ C:\OpenAPI\opstarter.exe
 C:\OpenAPI\KOAStudioSA.exe
 ```
 
-만약 “OpenAPI를 사용하는 프로그램을 모두 종료하세요”가 나오면 관련 프로세스를 확인합니다.
+“OpenAPI를 사용하는 프로그램을 모두 종료하세요”가 나오면 관련 프로세스를 확인합니다.
 
 ```cmd
 tasklist | findstr /i "python koa opstarter opversion nkmini khopen"
@@ -172,7 +281,7 @@ taskkill /F /IM nkmini.exe
 
 ---
 
-## 6. OpenAPI 등록 사용자 오류
+## 7. OpenAPI 등록 사용자 오류
 
 새 PC에서 아래 메시지가 나올 수 있습니다.
 
@@ -180,38 +289,35 @@ taskkill /F /IM nkmini.exe
 등록된 사용자가 아닙니다.
 ```
 
-확인할 것:
+확인 항목:
 
 ```text
 1. 기존 PC에서 쓰던 키움 ID와 같은 ID인지 확인
 2. 키움 OpenAPI+ 서비스 사용 신청 여부 확인
-3. 모의투자/실전투자 계정 구분 확인
-4. 새 PC의 공동인증서/보안 프로그램 설정 확인
+3. 모의투자/실전투자 로그인 구분 확인
+4. 새 PC의 인증서/보안 프로그램 설정 확인
+5. OpenAPI 버전처리가 끝났는지 확인
 ```
-
-OpenAPI 사용 신청은 보통 계정 단위이지만, 새 PC에서는 인증서, 보안 모듈, 버전처리를 다시 해야 할 수 있습니다.
 
 ---
 
-## 7. Telegram 환경변수 설정
+## 8. Telegram 환경변수 설정
 
-Telegram 알림을 사용하려면 새 PC에서도 환경변수를 설정해야 합니다.
-
-필요한 환경변수:
+현재 `util/const.py`는 아래 환경변수를 읽습니다.
 
 ```text
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
 ```
 
-CMD에서 설정:
+CMD에서 영구 환경변수로 설정:
 
 ```cmd
 setx TELEGRAM_BOT_TOKEN "봇_토큰"
 setx TELEGRAM_CHAT_ID "채팅_ID"
 ```
 
-설정 후 CMD를 완전히 닫고 새로 열어야 적용됩니다.
+`setx` 실행 후에는 **기존 CMD를 닫고 새 CMD를 열어야** 적용됩니다.
 
 확인:
 
@@ -220,33 +326,309 @@ echo %TELEGRAM_BOT_TOKEN%
 echo %TELEGRAM_CHAT_ID%
 ```
 
-Python에서 확인:
+Python에서 값 존재 여부만 확인하려면 토큰 전체를 출력하기보다 다음처럼 확인하는 것을 권장합니다.
 
 ```cmd
-python -c "import os; print(os.getenv('TELEGRAM_BOT_TOKEN')); print(os.getenv('TELEGRAM_CHAT_ID'))"
+python -c "import os; print(bool(os.getenv('TELEGRAM_BOT_TOKEN')), bool(os.getenv('TELEGRAM_CHAT_ID')))"
 ```
 
 전송 테스트:
 
 ```cmd
-python -c "from util.notifier import send_message; send_message('텔레그램 테스트 메시지')"
+python -c "from util.notifier import send_message; send_message('SystemTrading Telegram 테스트')"
 ```
 
-Telegram 오류 의미:
+오류 예시:
 
 ```text
-401 Unauthorized: 봇 토큰 오류
-404 Not Found: 봇 토큰 형식 오류 또는 잘못된 토큰
-400 Bad Request: chat_id 오류 가능성
+401 Unauthorized: 봇 토큰 오류 가능성
+404 Not Found: 잘못된 Bot API URL/토큰 형식 가능성
+400 Bad Request: chat_id 또는 요청값 확인 필요
 ```
 
-봇 토큰이 외부에 노출되면 BotFather에서 반드시 재발급합니다.
+봇 토큰이 외부에 노출되면 BotFather에서 즉시 재발급합니다.
 
 ---
 
-## 8. 자주 발생한 오류 정리
+## 9. 최초 `market_history.db` 구축 — 필수
 
-### git 명령어 인식 안 됨
+신고가/눌림목 전략은 `market_history.db`의 다음 데이터를 사용합니다.
+
+```text
+stock_master : KOSPI/KOSDAQ 기업주식 목록
+daily_price  : 과거 OHLCV 일봉
+```
+
+새 clone에 충분한 DB가 없다면 **64bit `marketdata` 환경에서 먼저 구축**합니다.
+
+```cmd
+cd C:\Users\사용자명\Downloads\SystemTrading
+conda activate marketdata
+python bootstrap_market_history.py
+```
+
+스크립트 자체가 64bit 여부를 검사합니다.
+
+기본 동작:
+
+```text
+- KOSPI + KOSDAQ 기업주식 마스터 갱신
+- SPAC/리츠 제외
+- 최소 전략 계산용 과거 일봉 수집
+- 기존 DB가 있으면 누락 구간 위주 증분 보충
+- market_history.db에 저장
+```
+
+필요 시 옵션 확인:
+
+```cmd
+python bootstrap_market_history.py --help
+```
+
+예:
+
+```cmd
+python bootstrap_market_history.py --lookback-days 180 --overlap-days 10 --sleep 1.0
+```
+
+### 정상 여부 확인
+
+실행 로그에서 최소한 아래 내용을 확인합니다.
+
+```text
+[수집기 Python] ... / 64bit
+[공유 DB] ...\market_history.db
+[기업주식 마스터 갱신] ...종목
+[초기 일봉 구축 완료] ...
+```
+
+**주의:** 전체시장 종목별 수집이므로 시간이 걸릴 수 있으며, 요청 간격을 과도하게 줄이지 않습니다.
+
+---
+
+## 10. ValueQuality 재무데이터 준비 — 전략 사용 시 필수
+
+`ValueQualityStrategy`는 가격만으로 후보를 만들지 않습니다. `value_quality.db`의 재무 스냅샷이 필요합니다.
+
+입력 CSV 컬럼:
+
+```text
+code
+code_name
+as_of_date
+per_ttm
+pbr
+gross_margin_pct
+asset_turnover
+latest_annual_year
+source_note
+```
+
+예시 경로:
+
+```text
+data/value_fundamentals.csv
+```
+
+32bit/64bit 어느 쪽에서도 SQLite 입력 자체는 가능하지만, 보통 프로젝트의 일반 Python 환경에서 실행합니다.
+
+```cmd
+python bootstrap_value_quality_data.py data\value_fundamentals.csv
+```
+
+정상 예시:
+
+```text
+[ValueQuality] fundamental N건 저장 완료
+```
+
+재무데이터를 넣지 않으면 실행 자체가 완전히 실패하는 것이 아니라 **ValueQuality 후보가 0종목**으로 나올 수 있습니다.
+
+현재 필터:
+
+```text
+0 < PER(TTM) <= 15
+0 < PBR <= 1
+30 <= 매출총이익률 <= 95
+1 <= 총자산회전율 <= 10
+```
+
+---
+
+## 11. DB 파일에 대한 이해
+
+새 PC에서는 모든 DB가 처음부터 존재할 필요는 없습니다. 코드가 일부 테이블/DB를 자동 생성합니다.
+
+### 초기 실행 전에 사실상 필요한 핵심 데이터
+
+```text
+market_history.db
+  - stock_master
+  - daily_price
+
+value_quality.db
+  - ValueQuality를 실제 운용할 경우 fundamental snapshot 필요
+```
+
+### 실행 중 생성/갱신되는 주요 DB
+
+```text
+strategy_position.db
+monitoring.db
+value_quality.db
+market_history.db
+```
+
+`universe_price.db`는 현재 `db_helper.py`의 레거시 호환 코드가 남아 있으므로 임의 삭제 전에 코드 참조를 확인합니다.
+
+SQLite가 WAL 모드로 동작할 때 아래 보조 파일이 일시적으로 생길 수 있습니다.
+
+```text
+*.db-wal
+*.db-shm
+```
+
+프로그램이 실행 중인 상태에서 임의 삭제하지 않습니다.
+
+---
+
+## 12. 자동매매 실행 전 사전 점검
+
+32bit 환경으로 돌아옵니다.
+
+```cmd
+cd C:\Users\사용자명\Downloads\SystemTrading
+kiwoom\Scripts\activate
+```
+
+확인:
+
+```cmd
+python -c "import struct; print('bitness=', struct.calcsize('P') * 8)"
+python -c "from PyQt5.QAxContainer import QAxWidget; print('QAx OK')"
+python -c "import sqlite3; c=sqlite3.connect('market_history.db'); print(c.execute('select count(*) from stock_master where active=1').fetchone()); print(c.execute('select count(*) from daily_price').fetchone()); c.close()"
+python -c "import os; print('telegram=', bool(os.getenv('TELEGRAM_BOT_TOKEN')), bool(os.getenv('TELEGRAM_CHAT_ID')))"
+```
+
+목표:
+
+```text
+bitness= 32
+QAx OK
+stock_master 활성 종목 수 > 0
+daily_price 행 수 > 0
+telegram= True True   # Telegram을 사용할 경우
+```
+
+---
+
+## 13. `main.py` 실행
+
+Kiwoom용 **32bit 가상환경**에서 실행합니다.
+
+```cmd
+python main.py
+```
+
+현재 `main.py`는 다음 3개 전략을 생성해 `StrategyManager`에 전달합니다.
+
+```text
+HighBreakoutStrategy
+PullbackTrendStrategy
+ValueQualityStrategy
+```
+
+처음에는 반드시 **모의투자 계좌 또는 주문 위험이 없는 환경에서 초기화 로그부터 검증**하는 것을 권장합니다.
+
+### 정상 초기화 시 확인할 핵심 로그
+
+```text
+로그인 성공
+HighBreakout 객체 생성 완료
+PullbackTrend 객체 생성 완료
+ValueQuality 객체 생성 완료
+[StrategyManager] start 호출
+[Kiwoom] 미체결 주문 조회 정상 완료: ...건
+[Kiwoom] 잔고 조회 정상 완료: ...
+[Kiwoom] 자금 조회 정상 완료: ...
+[HighBreakout] 신고가 기준값 준비: ...
+[PullbackTrend] 기준값 준비: ...
+[ValueQuality] 저평가 우량주 후보 준비: ...
+[StrategyManager] ... 실시간 등록 ...
+[StrategyManager] 타이머 시작
+[StrategyManager] Telegram /status 명령대기
+```
+
+초기화 중 계좌/예수금/미체결 조회가 실패했다면 주문을 맡기기 전에 원인을 먼저 해결합니다.
+
+---
+
+## 14. 장중 확인 항목
+
+현재 공통 주식체결 FID는 최소화되어 있습니다.
+
+```text
+현재가
+시가
+누적거래량
+(최우선)매수호가
+```
+
+장중에는 다음을 확인합니다.
+
+- 실시간 이벤트가 실제로 들어오는지
+- 신고가/눌림목/ValueQuality 신호가 지연 없이 처리되는지
+- 매수 주문 전 종목당 총자산 10% 제한이 적용되는지
+- 보유 + 매수 미체결 + 예약 종목이 계좌 전체 최대 10개를 넘지 않는지
+- 주문/체결 후 `strategy_position.db`, `monitoring.db`가 갱신되는지
+- Telegram 주문/체결 알림 및 `/status`가 동작하는지
+- CPU/메모리와 실시간 틱 처리 지연이 과도하지 않은지
+
+---
+
+## 15. 웹 모니터링 API 실행 — 선택 기능
+
+웹 API는 자동매매 프로세스와 분리되어 SQLite DB를 **조회 전용**으로 읽습니다.
+
+필요 패키지 예:
+
+```cmd
+pip install fastapi uvicorn
+```
+
+저장소에 `requirements-web.txt`가 있다면 개별 설치보다 다음을 우선 사용합니다.
+
+```cmd
+pip install -r requirements-web.txt
+```
+
+프로젝트 루트에서:
+
+```cmd
+python run_web_api.py
+```
+
+기본 주소:
+
+```text
+http://127.0.0.1:8000
+http://127.0.0.1:8000/docs
+http://127.0.0.1:8000/health
+```
+
+FastAPI는 기본적으로 프로젝트 루트의 `monitoring.db`, `strategy_position.db`를 읽습니다.
+
+프로젝트 외부 위치에서 실행하는 특수한 경우에는 `SYSTEMTRADING_ROOT` 환경변수로 루트를 지정할 수 있습니다.
+
+```cmd
+set SYSTEMTRADING_ROOT=C:\경로\SystemTrading
+```
+
+---
+
+## 16. 자주 발생하는 오류
+
+### Git 명령어 인식 안 됨
 
 ```text
 'git'은(는) 내부 또는 외부 명령...
@@ -257,8 +639,6 @@ Telegram 오류 의미:
 ```text
 Git for Windows 설치 후 CMD 새로 열기
 ```
-
----
 
 ### libcurl-4.dll 오류
 
@@ -272,261 +652,109 @@ fatal: failed to load library 'libcurl-4.dll'
 Git 재설치 또는 Git Bash에서 clone 시도
 ```
 
----
-
-### openpyxl 없음
-
-```text
-ModuleNotFoundError: No module named 'openpyxl'
-```
-
-해결:
+### `ModuleNotFoundError: openpyxl`
 
 ```cmd
 pip install openpyxl
 ```
 
----
-
-### pkg_resources 없음
-
-```text
-ModuleNotFoundError: No module named 'pkg_resources'
-```
-
-해결:
+### `ModuleNotFoundError: pkg_resources`
 
 ```cmd
 pip install "setuptools==80.10.2" --force-reinstall
 ```
 
----
+### `QAxContainer` import 실패
 
-### PyQt5 QAxContainer 확인
+먼저 현재 Python 비트를 확인합니다.
+
+```cmd
+python -c "import struct; print(struct.calcsize('P') * 8)"
+```
+
+자동매매 환경이라면 `32`가 나와야 합니다.
 
 ```cmd
 python -c "from PyQt5.QAxContainer import QAxWidget; print('QAx OK')"
 ```
 
-`QAx OK`가 나오면 PyQt5 ActiveX 모듈은 정상입니다.
+### `stock_master가 비어 있습니다`
+
+원인:
+
+```text
+market_history.db 초기 구축을 하지 않았거나 잘못된 DB를 보고 있음
+```
+
+해결:
+
+```cmd
+conda activate marketdata
+python bootstrap_market_history.py
+```
+
+### `신고가/눌림목 계산 가능한 종목이 없습니다`
+
+원인:
+
+```text
+과거 일봉이 전략 최소 요구 거래일 수보다 부족함
+```
+
+해결:
+
+```text
+bootstrap_market_history.py를 다시 실행해 누락 데이터를 보충
+필요 시 --lookback-days를 늘림
+```
+
+### ValueQuality 후보가 0종목
+
+확인:
+
+```text
+1. value_quality.db에 fundamental snapshot이 들어갔는지
+2. CSV 컬럼명이 정확한지
+3. PER/PBR/매출총이익률/총자산회전율 필터를 만족하는 데이터가 있는지
+```
 
 ---
 
-## 9. 주의사항
+## 17. 운영 전 주의사항
 
-```text
-1. main.py 실행 전 Kiwoom OpenAPI 버전처리 완료
-2. Kiwoom OpenAPI는 Python 3.9 32-bit 환경 사용
-3. Telegram 토큰은 GitHub에 올리지 말고 환경변수로 관리
-4. 새 PC에서는 .db 파일이 없으면 조회 제한에 걸릴 수 있음
-5. 초기화 완료 로그를 확인한 뒤 장중 자동매매를 맡기는 것이 안전함
-6. BotFather 토큰이 노출되면 즉시 재발급
-7. 처음 세팅하는 PC에서는 유니버스 수를 줄이거나 TR 요청 간격을 늘려 테스트 권장
-```
+1. `main.py` 실행 전 Kiwoom OpenAPI 버전처리를 완료합니다.
+2. 자동매매는 **Python 3.9 32bit**, 과거 전체시장 수집은 **64bit marketdata**로 분리합니다.
+3. 처음 받은 PC에서는 `market_history.db`를 먼저 구축합니다.
+4. ValueQuality를 실제 사용하려면 `value_quality.db`에 재무 스냅샷을 입력합니다.
+5. Telegram 토큰은 소스코드/GitHub에 저장하지 않습니다.
+6. `.db-wal`, `.db-shm`은 실행 중인 SQLite가 사용하는 파일일 수 있으므로 임의 삭제하지 않습니다.
+7. 처음 실전 계좌에서 바로 검증하지 말고 초기화/조회/주문 흐름을 모의투자에서 먼저 확인합니다.
+8. `util/time_helper.py`의 휴장일/특별 개장시간 목록은 연도가 바뀌거나 KRX 일정이 변경되면 반드시 갱신합니다.
+9. 네이버/한경처럼 비공식 또는 웹 페이지 기반 데이터 소스는 응답 구조 변경으로 고장날 수 있으므로 오류 로그를 확인합니다.
+10. 장중 실시간 최적화가 검증될 때까지 `Kiwoom.before_fid_opt_*` 같은 백업 파일은 보존하는 편이 안전합니다.
 
-# SystemTrading
+---
 
-Kiwoom OpenAPI+ 기반의 국내 주식 자동매매 프로젝트입니다.
+## 18. 새 PC 설치 완료 체크리스트
 
+- [ ] Git clone 완료
+- [ ] `git status` 정상
+- [ ] Kiwoom OpenAPI+ 설치
+- [ ] OpenAPI+ 서비스 신청/로그인 확인
+- [ ] OpenAPI 버전처리 완료
+- [ ] Python 3.9 32bit 설치
+- [ ] `kiwoom` 32bit 가상환경 생성
+- [ ] `QAx OK` 확인
+- [ ] 64bit `marketdata` 환경 생성
+- [ ] `pykrx` import 확인
+- [ ] Telegram 환경변수 설정
+- [ ] `bootstrap_market_history.py` 성공
+- [ ] `stock_master` 데이터 존재
+- [ ] `daily_price` 데이터 존재
+- [ ] ValueQuality 사용 시 fundamental CSV 적재
+- [ ] `main.py` 로그인/초기화 완료
+- [ ] 미체결/잔고/예수금 정상 조회
+- [ ] 실시간 FID 등록 확인
+- [ ] Telegram `/status` 확인
+- [ ] 선택 시 FastAPI `/health`, `/docs` 확인
 
-
-## 현재 실행 전략
-
-`main.py` 기준 활성 전략은 3개입니다.
-
-1. **HighBreakoutStrategy**
-   - 직전 60거래일 신고가 돌파
-   - 거래량 및 거래대금 필터
-   - -5% 손절 / MA20 이탈 시 시장가 전량매도
-
-2. **PullbackTrendStrategy**
-   - MA5 > MA20 > MA60 정배열
-   - MA20 부근 눌림목 진입
-   - -5% 손절
-   - 거래량 +15% & 음봉 매도
-   - 전고점 30% 부분익절
-   - 다음 거래일 거래량 감소 시 잔량 매도
-
-3. **ValueQualityStrategy**
-   - TTM PER 0~15
-   - PBR 0~1
-   - 매출총이익률 30~95%
-   - 총자산회전율 1~10
-   - -10% 손절 / +30% 익절
-
-## 핵심 구조
-
-```text
-64bit marketdata Python
-    ↓
-pykrx / 외부 과거 데이터
-    ↓
-market_history.db
-    ↓
-32bit Kiwoom 자동매매
-    ↓
-StrategyManager
-    ├─ HighBreakout
-    ├─ PullbackTrend
-    └─ ValueQuality
-    ↓
-실시간 이벤트 기반 감시
-    ↓
-조건 충족 시 주문
-```
-
-## 실시간 FID
-
-2026-08-15 기준 공통 실시간 FID를 8개에서 4개로 축소했습니다.
-
-```text
-현재가
-시가
-누적거래량
-(최우선)매수호가
-```
-
-`StrategyManager`가 event-driven 전략별 필요 FID의 합집합을 계산하고,
-`Kiwoom.py`도 해당 FID만 `GetCommRealData`로 읽습니다.
-
-## 자금/리스크 정책
-
-- 전략별 고정 예산 배분 없음
-- 하나의 계좌 공용 현금 사용
-- 종목당 총자산 최대 10%
-- 계좌 전체 보유 + 신규매수 미체결 + 예약 종목 최대 10개
-- 실제 매수 주문은 StrategyManager를 통해 중앙 관리
-
-## Telegram
-
-Telegram은 계속 사용합니다.
-
-사용 용도:
-
-- 매수/매도 주문 및 체결 알림
-- 상태(`/status`) 확인
-- ValueQualityStrategy 보유종목의 한경 컨센서스 기업 리포트
-
-**기존 네이버 일반 경제뉴스 자동 전송 기능은 제거했습니다.**
-
-따라서 `util/notifier.py`는 삭제하면 안 됩니다.
-
-## 한경 기업 리포트
-
-ValueQualityStrategy 실제 보유종목에 대해서만 확인합니다.
-
-```text
-30분마다 확인
-    ↓
-마지막 확인 report_id 이후만 검사
-    ↓
-보유종목과 일치하는 새 리포트
-    ↓
-Telegram 전송
-```
-
-리포트 상태/중복 전송 정보는 `value_quality.db`에 저장합니다.
-
-## 주요 DB
-
-### 유지
-
-```text
-market_history.db
-strategy_position.db
-monitoring.db
-value_quality.db
-```
-
-`universe_price.db`는 기존 db_helper 호환 코드 정리가 끝날 때까지 유지합니다.
-
-### 제거된 레거시 DB
-
-코드 참조가 없는 경우 정리 스크립트가 아래 파일을 백업 후 삭제합니다.
-
-```text
-sent_news.db
-RSIStrategy.db
-BandTrendStrategy.db
-BandReversionStrategy.db
-HighBreakoutStrategy.db
-ORBStrategy.db
-```
-
-## 실행 환경
-
-### 자동매매
-
-```text
-Windows
-Python 3.9 32-bit
-PyQt5 QAxContainer
-Kiwoom OpenAPI+
-```
-
-### 과거 데이터 수집
-
-```text
-64-bit conda env: marketdata
-pykrx
-pandas
-numpy
-```
-
-## 현재 중요 파일
-
-```text
-main.py
-
-api/
-  Kiwoom.py
-
-strategy/
-  StrategyManager.py
-  HighBreakoutStrategy.py
-  PullbackTrendStrategy.py
-  ValueQualityStrategy.py
-
-util/
-  market_history.py
-  value_quality_data.py
-  hankyung_report_helper.py
-  db_helper.py
-  notifier.py
-  time_helper.py
-  const.py
-```
-
-## 2026-08-15 정리
-
-- 일반 경제뉴스 자동 전송 제거
-- `sent_news.db` 관련 코드 제거
-- 사용하지 않는 RSI/Band/ORB 전략 정리
-- 과거 전략별 DB 정리
-- 한경 컨센서스 리포트만 ValueQuality 보유종목에 전송
-- 한경 리포트 검사 주기 30분
-- 실시간 FID 8개 → 4개 축소
-- HighBreakout MA20 이탈 매도 시장가 통일
-- StrategyManager에서 전략별 FID 합집합 관리
-- Kiwoom 실시간 콜백도 필요한 FID만 조회
-
-## 다음 거래일 장중 확인
-
-아래 로그를 확인합니다.
-
-```text
-[Kiwoom] 주식체결 실시간 FID 적용: 4개 / [...]
-[StrategyManager] event-driven 공통 실시간 등록:
-...종목 / 3전략 공유 / FID 4개 [...]
-```
-
-추가 확인:
-
-- 현재가/시가/누적거래량/최우선매수호가 정상 수신
-- HighBreakout 매수/시장가 매도 정상
-- PullbackTrend 매수/매도 정상
-- ValueQuality 매수/손절/익절 정상
-- CPU/메모리 사용량
-- 실시간 틱 처리 지연 여부
-
-> `api/Kiwoom.before_fid_opt_*.py` 백업은 장중 FID 최적화가 정상임을 확인할 때까지 삭제하지 않습니다.

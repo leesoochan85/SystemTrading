@@ -37,6 +37,9 @@ from util.db_helper import (
 from util.hankyung_report_helper import (
     scan_new_hankyung_reports,
 )
+from util.virtual_strategy_engine import VirtualStrategyEngine
+from util.virtual_trading import init_virtual_trading_tables
+
 from util.value_quality_data import (
     get_last_sent_value_report_at,
     get_last_scanned_hankyung_report_id,
@@ -163,6 +166,13 @@ class StrategyManager(QObject):
 
         # 전략은 매수 조건만 판단한다.
         # 실제 주문 수량/예산/계좌 전체 포지션 제한은 Manager가 담당한다.
+        # 웹 가상매매는 실계좌 잔고/예수금과 완전히 분리해 같은 실시간 틱을 병렬 처리한다.
+        init_virtual_trading_tables()
+        self.virtual_strategy_engine = VirtualStrategyEngine(self.strategies)
+        self.kiwoom.add_realtime_listener(
+            self.virtual_strategy_engine.on_realtime_tick
+        )
+
         for strategy in self.strategies:
             setter = getattr(strategy, "set_buy_order_handler", None)
             if callable(setter):
@@ -193,6 +203,9 @@ class StrategyManager(QObject):
         init_monitoring_tables()
 
         self.initialize_strategies()
+
+        # 프로그램 재시작으로 복원된 가상 포지션 상태를 웹 DB에 즉시 1회 동기화.
+        self.virtual_strategy_engine.flush_snapshot_if_due(force=True)
 
         # 초기 잔고 조회가 정상 완료된 경우 웹 보유현황을 즉시 1회 저장.
         self.save_position_snapshot_if_due(force=True)
@@ -608,6 +621,13 @@ class StrategyManager(QObject):
             getter = getattr(strategy, "get_realtime_candidate_codes", None)
             if callable(getter):
                 codes.update(getter())
+
+        # 실제 계좌와 무관하게 열린 가상 포지션은 반드시 실시간 감시를 계속한다.
+        # 특히 ValueQuality 후보가 다음 갱신에서 재무 필터를 벗어나더라도
+        # 이미 가상 매수된 종목의 -10%/+30% 매도 관리는 유지돼야 한다.
+        codes.update(
+            self.virtual_strategy_engine.get_open_codes()
+        )
 
         return sorted(
             str(code).strip().upper().zfill(6)
@@ -2075,12 +2095,21 @@ class StrategyManager(QObject):
         try:
             now = time.time()
 
+            # 가상매매는 실계좌 상태와 독립적이다.
+            # 실시간 틱에서는 메모리만 갱신하고, 여기서 최대 5초마다 SQLite에 일괄 저장한다.
+            # 따라서 실제 계좌 잔고/예수금 동기화가 실패해도 웹 가상포지션 스냅샷은 유지된다.
+            self.virtual_strategy_engine.flush_snapshot_if_due()
+
             self.send_one_value_quality_report_if_needed()
 
             # 장외에는 주문하지 않고 상태/장마감 데이터만 정리한다.
             if not check_transaction_open():
                 self.set_timer_interval(
                     self.market_closed_interval
+                )
+
+                self.virtual_strategy_engine.flush_snapshot_if_due(
+                    force=True
                 )
 
                 self.refresh_order_and_balance_state(

@@ -20,6 +20,11 @@ from .database import (
     get_strategy_equity_history,
     get_strategy_signals,
     get_strategy_trades,
+    get_virtual_positions,
+    get_virtual_trades,
+    get_virtual_performance,
+    get_virtual_event_summary,
+    get_virtual_events,
 )
 from .strategies import (
     get_all_strategy_configs,
@@ -107,78 +112,44 @@ def health():
 
 @app.get("/api/dashboard")
 def dashboard():
-    position_counts = get_all_position_counts()
-    account_equity = get_latest_account_equity()
     today = datetime.now().strftime("%Y%m%d")
-
     strategies = []
 
     for config in get_all_strategy_configs():
         strategy_name = config["strategy_name"]
-
         strategies.append(
             {
                 **config,
-                "holding_count": int(
-                    position_counts.get(
-                        strategy_name,
-                        0,
-                    )
-                ),
-                "performance": get_strategy_performance(
-                    strategy_name
-                ),
-                "equity_snapshot": get_latest_strategy_equity(
-                    strategy_name
-                ),
-                "latest_daily_summary": (
-                    get_latest_strategy_daily_summary(
-                        strategy_name
-                    )
-                ),
-                "today_signals": get_signal_summary(
-                    strategy_name,
-                    signal_date=today,
+                "virtual_performance": get_virtual_performance(strategy_name),
+                "today_virtual_events": get_virtual_event_summary(
+                    strategy_name, event_date=today
                 ),
             }
         )
 
     return {
-        "as_of": datetime.now().isoformat(
-            timespec="seconds"
-        ),
-        "account_equity": account_equity,
+        "as_of": datetime.now().isoformat(timespec="seconds"),
         "strategies": strategies,
-        "return_note": (
-            "performance.realized_return_pct는 매도 완료 거래의 "
-            "매입원금 합계 대비 순실현손익률이며 전략 NAV 누적수익률이 아닙니다."
+        "metric_note": (
+            "승률/평균수익률/최고/최저는 가상 BUY 후 100% 청산이 완료된 "
+            "거래를 기준으로 계산합니다. 부분청산만 진행된 포지션은 완료 거래에 포함하지 않습니다."
         ),
     }
 
 
 @app.get("/api/strategies")
 def strategies():
-    position_counts = get_all_position_counts()
-
+    today = datetime.now().strftime("%Y%m%d")
     result = []
 
     for config in get_all_strategy_configs():
         strategy_name = config["strategy_name"]
-
         result.append(
             {
                 **config,
-                "holding_count": int(
-                    position_counts.get(
-                        strategy_name,
-                        0,
-                    )
-                ),
-                "performance": get_strategy_performance(
-                    strategy_name
-                ),
-                "equity_snapshot": get_latest_strategy_equity(
-                    strategy_name
+                "virtual_performance": get_virtual_performance(strategy_name),
+                "today_virtual_events": get_virtual_event_summary(
+                    strategy_name, event_date=today
                 ),
             }
         )
@@ -189,30 +160,14 @@ def strategies():
 @app.get("/api/strategies/{strategy_name}")
 def strategy_detail(strategy_name: str):
     config = _require_strategy(strategy_name)
+    today = datetime.now().strftime("%Y%m%d")
 
     return {
         **config,
-        "performance": get_strategy_performance(
-            strategy_name
-        ),
-        "equity_snapshot": get_latest_strategy_equity(
-            strategy_name
-        ),
-        "latest_daily_summary": (
-            get_latest_strategy_daily_summary(
-                strategy_name
-            )
-        ),
-        "positions": get_strategy_positions(
-            strategy_name
-        ),
-        "signal_summary": get_signal_summary(
-            strategy_name
-        ),
-        "position_snapshot": get_position_snapshot_status(),
-        "position_price_note": (
-            "position_snapshot이 저장된 경우 Kiwoom 실시간 현재가와 "
-            "평균매입가 기준 평가금액/평가손익/수익률을 제공합니다."
+        "virtual_performance": get_virtual_performance(strategy_name),
+        "virtual_positions": get_virtual_positions(strategy_name),
+        "today_virtual_events": get_virtual_event_summary(
+            strategy_name, event_date=today
         ),
     }
 
@@ -395,3 +350,48 @@ def strategy_equity_history(
         ),
     }
 
+
+
+@app.get("/api/virtual/events")
+def virtual_events(
+    strategy_name: str,
+    limit: int = Query(default=100, ge=1, le=1000),
+):
+    _require_strategy(strategy_name)
+    return {
+        "strategy_name": strategy_name,
+        "items": get_virtual_events(strategy_name, limit=limit),
+        "limit": limit,
+    }
+
+
+@app.get("/api/virtual/positions")
+def virtual_positions(strategy_name: Optional[str] = None):
+    if strategy_name:
+        _require_strategy(strategy_name)
+    return {"items": get_virtual_positions(strategy_name)}
+
+
+@app.get("/api/virtual/trades")
+def virtual_trades(
+    strategy_name: Optional[str] = None,
+    limit: int = Query(default=500, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+):
+    if strategy_name:
+        _require_strategy(strategy_name)
+    return {
+        "items": get_virtual_trades(strategy_name, limit=limit, offset=offset),
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/api/strategies/{strategy_name}/virtual-performance")
+def strategy_virtual_performance(strategy_name: str):
+    _require_strategy(strategy_name)
+    return {
+        "strategy_name": strategy_name,
+        "performance": get_virtual_performance(strategy_name),
+        "positions": get_virtual_positions(strategy_name),
+    }

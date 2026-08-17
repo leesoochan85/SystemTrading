@@ -8,6 +8,23 @@ webenv/
 venv/
 env/
 
+# React / Vite
+web_frontend/node_modules/
+web_frontend/dist/
+web_frontend/.vite/
+
+# Frontend environment
+web_frontend/.env
+web_frontend/.env.local
+web_frontend/.env.*.local
+
+# Logs
+web_frontend/*.log
+web_frontend/npm-debug.log*
+web_frontend/yarn-debug.log*
+web_frontend/yarn-error.log*
+
+
 *.sqlite3
 *.xlsx
 *.csv

@@ -707,6 +707,11 @@ class StrategyManager(QObject):
             self.last_order_sync_at = time.time()
             print("[StrategyManager] 잔고 조회 완료")
 
+            # 프로그램 재시작 전에 매수 체결 이벤트가 일부 누락되어
+            # strategy_position.db에 0주/0원 예약 row만 남은 경우,
+            # 전략명이 이미 확정된 포지션에 한해서 실제 잔고로 안전 복구한다.
+            # 일반 수량 불일치(수동 부분매도 등)도 같은 함수에서 실제 잔고 기준으로 보정한다.
+            self.sync_position_quantities_from_balance()
             self.check_balance_position_db_consistency()
 
             print("[StrategyManager] 예수금 조회 시작")
@@ -1021,22 +1026,41 @@ class StrategyManager(QObject):
         """
         실제 키움 잔고를 strategy_position.db의 최종 기준으로 사용한다.
 
+        자동 복구 규칙
+        --------------
+        1) DB에 해당 종목과 strategy_name이 이미 존재하고
+        2) DB quantity <= 0, buy_price <= 0인 '매수 예약 row'이며
+        3) 실제 키움 잔고 quantity > 0, buy_price > 0이면
+           체결 이벤트가 누락된 것으로 보고 실제 잔고의 수량/매입가를 복구한다.
+
+        안전 원칙
+        ---------
+        - DB에 종목 자체가 없는 실제 보유종목은 자동으로 전략에 귀속하지 않는다.
+        - strategy_name이 현재 실행 전략 목록에 없는 row도 자동복구하지 않는다.
+        - 이미 정상 체결된 DB 포지션(quantity > 0)은 기존처럼 수량만 실제 잔고에 맞춘다.
+        - 정상 포지션의 buy_price, created_at, strategy_name은 변경하지 않는다.
+        - 실제 잔고가 0인 전량매도는 cleanup_sold_positions()의 2회 확인 후 삭제한다.
+
         목적
         ----
+        - 매수 체결 Chejan/DB 반영 일시 누락 후 프로그램 재시작
         - HTS/MTS 수동 부분매도
-        - 체결 이벤트 일시 누락
-        - 프로그램 재접속
-
-        위 상황에서도 보유수량이 실제 잔고와 다르면 DB의 quantity만 보정한다.
-        매입가/created_at/전략명은 건드리지 않는다.
-        전량매도(실제 0주)는 cleanup_sold_positions()의 2회 확인 후 삭제한다.
+        - 재접속 후 실제 잔고와 전략 DB 수량 차이 복구
         """
         if not self.account_state_safe:
             return
 
-        db_positions = get_all_position_details()
+        if not self.kiwoom.last_balance_query_success:
+            return
 
-        corrections = []
+        db_positions = get_all_position_details()
+        valid_strategy_names = {
+            str(getattr(strategy, "strategy_name", "") or "")
+            for strategy in self.strategies
+        }
+
+        quantity_corrections = []
+        reservation_recoveries = []
 
         with sqlite3.connect(POSITION_DB) as con:
             for raw_code, balance_info in self.kiwoom.balance.items():
@@ -1046,21 +1070,75 @@ class StrategyManager(QObject):
                     balance_info.get("보유수량", 0)
                     or 0
                 )
+                actual_buy_price = float(
+                    balance_info.get("매입가")
+                    or balance_info.get("매입단가")
+                    or 0
+                )
 
                 if actual_quantity <= 0:
                     continue
 
                 db_position = db_positions.get(code)
+
+                # DB 기록 자체가 없으면 HTS/MTS 수동매수일 가능성이 있으므로
+                # 어떤 전략에도 자동 귀속하지 않는다.
                 if db_position is None:
                     continue
 
+                strategy_name = str(
+                    db_position.get("strategy_name", "")
+                    or ""
+                ).strip()
                 db_quantity = int(
                     db_position.get("quantity", 0)
                     or 0
                 )
+                db_buy_price = float(
+                    db_position.get("buy_price", 0)
+                    or 0
+                )
+                code_name = (
+                    balance_info.get("종목명")
+                    or db_position.get("code_name")
+                    or self.get_code_name(code)
+                )
 
-                # 매수 직후 예약 row(0주)는 체결 이벤트에서 매입가와 함께
-                # 정상 반영되어야 하므로 여기서 임의로 올리지 않는다.
+                # 매수 주문 직후 생성된 0주/0원 예약 row인데 실제 잔고가
+                # 이미 존재한다면 체결 이벤트 DB 반영이 빠진 상황으로 간주한다.
+                # 단, 전략명이 현재 실행 중인 전략 중 하나로 확정된 경우만 복구한다.
+                if db_quantity <= 0 and db_buy_price <= 0:
+                    if (
+                        strategy_name
+                        and strategy_name in valid_strategy_names
+                        and actual_buy_price > 0
+                    ):
+                        con.execute("""
+                            UPDATE position_strategy
+                            SET code_name = ?,
+                                quantity = ?,
+                                buy_price = ?
+                            WHERE code = ?
+                              AND quantity <= 0
+                              AND buy_price <= 0
+                        """, (
+                            code_name,
+                            actual_quantity,
+                            int(round(actual_buy_price)),
+                            code,
+                        ))
+
+                        reservation_recoveries.append((
+                            code,
+                            code_name,
+                            strategy_name,
+                            actual_quantity,
+                            actual_buy_price,
+                        ))
+                    continue
+
+                # 이미 정상 체결 기록이 있는 포지션은 수동 부분매도나
+                # 체결 이벤트 누락을 대비해 수량만 실제 잔고 기준으로 맞춘다.
                 if db_quantity <= 0:
                     continue
 
@@ -1076,17 +1154,30 @@ class StrategyManager(QObject):
                     code,
                 ))
 
-                corrections.append(
-                    (
-                        code,
-                        db_position.get("code_name")
-                        or self.get_code_name(code),
-                        db_quantity,
-                        actual_quantity,
-                    )
-                )
+                quantity_corrections.append((
+                    code,
+                    code_name,
+                    db_quantity,
+                    actual_quantity,
+                ))
 
-        for code, code_name, before, after in corrections:
+        for (
+            code,
+            code_name,
+            strategy_name,
+            quantity,
+            buy_price,
+        ) in reservation_recoveries:
+            message = (
+                "[체결누락 포지션 자동복구] "
+                f"{code_name}({code}) / {strategy_name} / "
+                f"DB 0주·0원 -> 실제잔고 "
+                f"{quantity}주·평단 {buy_price:,.0f}원"
+            )
+            print(f"[StrategyManager] {message}")
+            send_message(message)
+
+        for code, code_name, before, after in quantity_corrections:
             message = (
                 "[수동매도/잔고 DB 자동보정] "
                 f"{code_name}({code}) "
@@ -1094,6 +1185,11 @@ class StrategyManager(QObject):
             )
             print(f"[StrategyManager] {message}")
             send_message(message)
+
+        return {
+            "reservation_recovered": len(reservation_recoveries),
+            "quantity_corrected": len(quantity_corrections),
+        }
 
     def notify_strategy_position_closed(
         self,

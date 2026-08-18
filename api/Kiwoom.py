@@ -509,7 +509,7 @@ class Kiwoom(QAxWidget):
                 deposit_rqname,
                 "opw00001",
                 0,
-                "0002",
+                "2003",
             )
 
             # 키움 환경에 따라 정상 요청 반환값은 None 또는 0일 수 있음
@@ -794,6 +794,10 @@ class Kiwoom(QAxWidget):
 
         정상적으로 미체결 주문이 0건인 응답은 성공으로 처리되어
         self.order = {}로 갱신된다.
+
+        주의:
+        모의투자 opt10075 반복 조회에서 요청명 불일치로 응답을 놓치는
+        상황을 방지하기 위해 고정 요청명 ORD_REQ를 사용한다.
         """
         previous_order = {
             code: dict(info)
@@ -811,7 +815,9 @@ class Kiwoom(QAxWidget):
         self.last_order_query_success = False
         self._waiting_for_order_response = True
 
-        order_rqname = self._next_safe_rqname("ORD")
+        # 모의투자 opt10075도 반복 조회 시 이전/최초 rqname으로
+        # 응답하는 경우가 있을 수 있으므로 고정 요청명을 사용한다.
+        order_rqname = "ORD_REQ"
         self._active_order_rqname = order_rqname
 
         try:
@@ -841,7 +847,7 @@ class Kiwoom(QAxWidget):
                 order_rqname,
                 "opt10075",
                 0,
-                "0002",
+                "2001",
             )
 
             # 환경에 따라 정상 요청 반환값이 None 또는 0일 수 있으므로 둘 다 허용
@@ -1020,7 +1026,7 @@ class Kiwoom(QAxWidget):
                 balance_rqname,
                 "opw00018",
                 0,
-                "0002",
+                "2002",
             )
 
             if request_result not in (None, 0):

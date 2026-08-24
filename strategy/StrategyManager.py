@@ -38,7 +38,10 @@ from util.hankyung_report_helper import (
     scan_new_hankyung_reports,
 )
 from util.virtual_strategy_engine import VirtualStrategyEngine
-from util.virtual_trading import init_virtual_trading_tables
+from util.virtual_trading import (
+    init_virtual_trading_tables,
+    save_virtual_strategy_daily_snapshots,
+)
 
 from util.value_quality_data import (
     get_last_sent_value_report_at,
@@ -141,6 +144,8 @@ class StrategyManager(QObject):
         self.last_strategy_equity_snapshot_at = 0
         self.strategy_equity_snapshot_interval = 60
 
+        self.last_virtual_daily_snapshot_date = None
+
         self.buy_order_cancel_after = 600
         self.pending_buy_cancellations = {}
 
@@ -149,6 +154,11 @@ class StrategyManager(QObject):
 
         self.last_daily_price_refresh_date = None
         self.is_refreshing_daily_price_data = False
+
+        # 장마감 일봉 저장이 가능한 날인지 구분하기 위한 상태.
+        # 오늘 정규장 시간에 프로그램이 실제로 실행된 적이 있어야
+        # Kiwoom 실시간 OHLCV가 메모리에 누적되었다고 판단한다.
+        self.market_open_observed_date = None
 
         self.last_position_db_mismatch_signature = None
 
@@ -216,6 +226,7 @@ class StrategyManager(QObject):
         self.send_one_value_quality_report_if_needed(force=True)
 
         if check_transaction_open():
+            self.market_open_observed_date = datetime.now().strftime("%Y%m%d")
             self.set_timer_interval(self.market_open_interval)
         else:
             self.set_timer_interval(self.market_closed_interval)
@@ -243,6 +254,7 @@ class StrategyManager(QObject):
             return
 
         if check_transaction_open():
+            self.market_open_observed_date = datetime.now().strftime("%Y%m%d")
             self.set_timer_interval(self.market_open_interval)
             print("[StrategyManager] 장 시작 감지 - 1초 상태 검사로 전환")
             self.step()
@@ -1343,11 +1355,36 @@ class StrategyManager(QObject):
             db_path=self.market_history_db_path,
         )
 
+        target_count = len(target_codes)
+        coverage = (
+            saved_count / target_count
+            if target_count > 0
+            else 0.0
+        )
+
         print(
-            "[StrategyManager] Kiwoom 당일 일봉 저장 완료: "
-            f"{saved_count}/{len(target_codes)}종목 -> "
+            "[StrategyManager] Kiwoom 당일 일봉 저장 결과: "
+            f"{saved_count}/{target_count}종목 "
+            f"({coverage * 100:.1f}%) -> "
             f"{self.market_history_db_path}"
         )
+
+        if target_count > 0 and saved_count == 0:
+            raise RuntimeError(
+                "Kiwoom 당일 일봉 저장 0건 - "
+                "실시간 OHLCV(현재가/시가/고가/저가/누적거래량) "
+                "수신 상태를 확인하세요."
+            )
+
+        if target_count > 0 and coverage < 0.95:
+            warning = (
+                "[경고] Kiwoom 당일 일봉 저장률이 낮습니다 - "
+                f"{saved_count}/{target_count}종목 "
+                f"({coverage * 100:.1f}%). "
+                "누락 종목은 다음 64bit bootstrap 증분 수집으로 보충하세요."
+            )
+            print(f"[StrategyManager] {warning}")
+            send_message(warning)
 
         return saved_count
 
@@ -1375,10 +1412,36 @@ class StrategyManager(QObject):
             if not active:
                 return False
 
+            # 오늘 정규장 시간에 프로그램이 한 번도 실행되지 않았다면
+            # 실시간 OHLCV가 쌓이지 않은 것이 정상이다.
+            # 이 경우에는 오류/traceback을 만들지 않고 장마감 저장만 건너뛴다.
+            if self.market_open_observed_date != today:
+                realtime_count = len(
+                    self.kiwoom.universe_realtime_transaction_info
+                )
+
+                print(
+                    "[StrategyManager] 장 종료 일봉 갱신 SKIP: "
+                    f"{today} / 오늘 장중 실행 이력 없음 / "
+                    f"실시간 캐시 {realtime_count}종목"
+                )
+                print(
+                    "[StrategyManager] 다음 64bit bootstrap 증분 수집에서 "
+                    f"{today} 누락 일봉을 보충하세요."
+                )
+
+                # 같은 장외 세션에서 5분마다 동일 SKIP 로그가 반복되지 않게 한다.
+                self.last_daily_price_refresh_date = today
+                return False
+
             print(
                 f"[StrategyManager] 장 종료 일봉 갱신 시작: {today}"
             )
 
+            # 여기까지 왔다는 것은 오늘 장중 실행 이력이 있다는 뜻이다.
+            # 따라서 저장 0건은 정상 상황이 아니며,
+            # save_today_realtime_bars_to_shared_db()의 RuntimeError를 유지하여
+            # step() 최상위 except에서 traceback을 그대로 출력/전송한다.
             self.save_today_realtime_bars_to_shared_db()
 
             success = []
@@ -1639,6 +1702,50 @@ class StrategyManager(QObject):
         self.last_strategy_equity_snapshot_at = now
 
         return True
+
+    def save_virtual_strategy_daily_snapshot_after_close(self):
+        """오늘 장중 가격을 받은 경우 가상 전략 성과지수를 장마감 후 하루 1회 저장."""
+        if not check_transaction_closed():
+            return False
+
+        today = datetime.now().strftime("%Y%m%d")
+
+        if self.last_virtual_daily_snapshot_date == today:
+            return False
+
+        if self.market_open_observed_date != today:
+            print(
+                "[StrategyManager] 가상 전략 일별지수 SKIP: "
+                f"{today} / 오늘 장중 실행 이력 없음"
+            )
+            self.last_virtual_daily_snapshot_date = today
+            return False
+
+        self.virtual_strategy_engine.flush_snapshot_if_due(force=True)
+
+        strategy_names = [
+            strategy.strategy_name
+            for strategy in self.strategies
+            if getattr(strategy, "is_init_success", False)
+        ]
+
+        snapshots = save_virtual_strategy_daily_snapshots(
+            strategy_names,
+            snapshot_date=today,
+        )
+        self.last_virtual_daily_snapshot_date = today
+
+        for item in snapshots:
+            print(
+                "[StrategyManager] 가상 전략 일별지수 저장: "
+                f"{item['strategy_name']} / "
+                f"INDEX {item['strategy_index']:.2f} / "
+                f"일간 {item['daily_return_pct']:+.2f}% / "
+                f"DD {item['drawdown_pct']:.2f}%"
+            )
+
+        return bool(snapshots)
+
 
     def save_performance_snapshot(self):
         evaluation_amount, total_assets = save_daily_equity(
@@ -2225,6 +2332,8 @@ class StrategyManager(QObject):
                 ):
                     self.save_performance_snapshot()
 
+                self.save_virtual_strategy_daily_snapshot_after_close()
+
                 self.refresh_daily_price_data_after_close()
 
                 print(
@@ -2232,6 +2341,10 @@ class StrategyManager(QObject):
                     "계좌 상태만 확인하고 대기합니다."
                 )
                 return
+
+            # 정규장 루프에 실제 진입했다는 사실을 날짜별로 기록한다.
+            # 프로그램을 장중에 시작했거나, 장 시작 전부터 켜둔 경우 모두 잡힌다.
+            self.market_open_observed_date = datetime.now().strftime("%Y%m%d")
 
             self.set_timer_interval(
                 self.market_open_interval

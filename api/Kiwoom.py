@@ -30,9 +30,21 @@ class Kiwoom(QAxWidget):
         # ORBStrategy는 09:00~09:04:59 틱만 집계해 첫 5분봉을 정확히 확정한다.
         self.realtime_listeners = []
 
+        # 전략 주문 조건용 FID와 별개로 장마감 market_history.db 일봉 생성에
+        # 반드시 필요한 OHLCV 필드는 항상 수신/보존한다.
+        self.daily_bar_required_fid_names = {
+            "현재가",
+            "시가",
+            "고가",
+            "저가",
+            "누적거래량",
+        }
+
         self.stock_realtime_fid_names = {
             "현재가",
             "시가",
+            "고가",
+            "저가",
             "누적거래량",
             "(최우선)매수호가",
         }
@@ -1086,6 +1098,22 @@ class Kiwoom(QAxWidget):
             raise ValueError(
                 "주식체결 실시간 FID 목록은 비어 있을 수 없습니다."
             )
+
+        # StrategyManager가 전략별 FID 합집합을 전달하더라도
+        # 장마감 일봉 저장에 필요한 OHLCV FID는 제거되지 않게 강제 포함한다.
+        normalized.update(
+            getattr(
+                self,
+                "daily_bar_required_fid_names",
+                {
+                    "현재가",
+                    "시가",
+                    "고가",
+                    "저가",
+                    "누적거래량",
+                },
+            )
+        )
 
         self.stock_realtime_fid_names = normalized
 

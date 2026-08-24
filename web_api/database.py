@@ -782,6 +782,159 @@ def get_virtual_events(
     return events[:limit]
 
 
+
+def get_virtual_daily_performance(
+    strategy_name: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    """가상 SELL 이벤트를 날짜별로 집계한다.
+
+    daily_return_pct는 해당 날짜에 청산된 SELL leg의 수익률을
+    실제 청산비중(exit_ratio)으로 가중평균한 값이다.
+
+    현재 가상매매는 전략별 독립 현금/NAV를 운용하지 않으므로
+    이 값은 일간 NAV 수익률이 아니다.
+    아직 청산되지 않은 포지션의 미실현손익도 포함하지 않는다.
+    """
+    empty = {
+        "items": [],
+        "active_day_count": 0,
+        "best_daily_return_pct": 0.0,
+        "worst_daily_return_pct": 0.0,
+        "average_daily_return_pct": 0.0,
+        "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN",
+    }
+
+    if not table_exists(MONITORING_DB, "virtual_trade"):
+        return empty
+
+    where = ["strategy_name = ?"]
+    params: list[Any] = [strategy_name]
+
+    if date_from:
+        where.append("substr(exit_at, 1, 8) >= ?")
+        params.append(str(date_from))
+
+    if date_to:
+        where.append("substr(exit_at, 1, 8) <= ?")
+        params.append(str(date_to))
+
+    with _connect_readonly(MONITORING_DB) as con:
+        rows = con.execute(
+            f"""
+            SELECT
+                substr(exit_at, 1, 8) AS date,
+                COUNT(*) AS sell_event_count,
+                COALESCE(SUM(exit_ratio), 0) AS exited_ratio,
+                COALESCE(SUM(weighted_return_pct), 0)
+                    AS weighted_return_sum
+            FROM virtual_trade
+            WHERE {' AND '.join(where)}
+            GROUP BY substr(exit_at, 1, 8)
+            ORDER BY date ASC
+            """,
+            params,
+        ).fetchall()
+
+    items = []
+
+    for row in rows:
+        exited_ratio = float(row["exited_ratio"] or 0)
+        weighted_sum = float(row["weighted_return_sum"] or 0)
+
+        daily_return_pct = (
+            weighted_sum / exited_ratio
+            if exited_ratio > 0
+            else 0.0
+        )
+
+        items.append({
+            "date": str(row["date"]),
+            "sell_event_count": int(row["sell_event_count"] or 0),
+            "exited_ratio": exited_ratio,
+            "weighted_return_sum": weighted_sum,
+            "daily_return_pct": daily_return_pct,
+        })
+
+    daily_returns = [
+        float(item["daily_return_pct"])
+        for item in items
+    ]
+
+    return {
+        "items": items,
+        "active_day_count": len(items),
+        "best_daily_return_pct": (
+            max(daily_returns) if daily_returns else 0.0
+        ),
+        "worst_daily_return_pct": (
+            min(daily_returns) if daily_returns else 0.0
+        ),
+        "average_daily_return_pct": (
+            sum(daily_returns) / len(daily_returns)
+            if daily_returns
+            else 0.0
+        ),
+        "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN",
+    }
+
+
+def get_virtual_strategy_index_history(
+    strategy_name: str,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, Any]:
+    empty = {
+        "items": [],
+        "latest": None,
+        "best_daily_return_pct": 0.0,
+        "worst_daily_return_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
+    }
+
+    if not table_exists(MONITORING_DB, "virtual_strategy_daily_snapshot"):
+        return empty
+
+    where = ["strategy_name = ?"]
+    params: list[Any] = [strategy_name]
+
+    if date_from:
+        where.append("snapshot_date >= ?")
+        params.append(str(date_from))
+    if date_to:
+        where.append("snapshot_date <= ?")
+        params.append(str(date_to))
+
+    with _connect_readonly(MONITORING_DB) as con:
+        rows = con.execute(
+            f"""
+            SELECT *
+            FROM virtual_strategy_daily_snapshot
+            WHERE {' AND '.join(where)}
+            ORDER BY snapshot_date ASC
+            """,
+            params,
+        ).fetchall()
+
+    items = _rows_to_dicts(rows)
+    if not items:
+        return empty
+
+    daily_returns = [float(item.get("daily_return_pct") or 0) for item in items]
+    drawdowns = [float(item.get("drawdown_pct") or 0) for item in items]
+
+    return {
+        "items": items,
+        "latest": items[-1],
+        "best_daily_return_pct": max(daily_returns),
+        "worst_daily_return_pct": min(daily_returns),
+        "max_drawdown_pct": min(drawdowns),
+        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
+    }
+
+
 def get_virtual_performance(strategy_name: str) -> dict[str, Any]:
     """가상 BUY→완전청산 단위의 전략 성과를 반환한다.
 

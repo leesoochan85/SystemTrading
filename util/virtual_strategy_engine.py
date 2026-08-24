@@ -9,6 +9,7 @@ from util.virtual_trading import (
     bulk_update_virtual_positions,
     close_virtual_position,
     get_all_virtual_positions,
+    get_virtual_entry_keys_for_date,
     open_virtual_position,
     update_virtual_position,
 )
@@ -39,7 +40,11 @@ class VirtualStrategyEngine:
         self.dirty_position_keys = set()
         self.last_snapshot_at = 0.0
 
+        self.reentry_guard_date = None
+        self.entered_today_keys = set()
+
         self.reload_positions_from_db()
+        self._reload_reentry_guard()
 
     # ------------------------------------------------------------------
     # 메모리 캐시 / 5초 DB 스냅샷
@@ -69,6 +74,35 @@ class VirtualStrategyEngine:
             "[VirtualStrategyEngine] 가상 포지션 캐시 복원: "
             f"{len(self.position_cache)}건"
         )
+
+    def _reload_reentry_guard(self, force=False):
+        today = datetime.now().strftime("%Y%m%d")
+
+        if not force and self.reentry_guard_date == today:
+            return
+
+        self.reentry_guard_date = today
+        self.entered_today_keys = set(
+            get_virtual_entry_keys_for_date(today)
+        )
+
+        print(
+            "[VirtualStrategyEngine] 당일 재진입 차단 복원: "
+            f"{today} / {len(self.entered_today_keys)}건"
+        )
+
+    def _refresh_reentry_guard_date(self):
+        today = datetime.now().strftime("%Y%m%d")
+        if self.reentry_guard_date != today:
+            self._reload_reentry_guard(force=True)
+
+    def _has_entered_today(self, strategy_name, code):
+        self._refresh_reentry_guard_date()
+        return self._position_key(strategy_name, code) in self.entered_today_keys
+
+    def _mark_entered_today(self, strategy_name, code):
+        self._refresh_reentry_guard_date()
+        self.entered_today_keys.add(self._position_key(strategy_name, code))
 
     def get_open_codes(self):
         """가상 보유 중인 종목을 실시간 등록 대상에 강제 포함하기 위해 반환한다."""
@@ -210,6 +244,9 @@ class VirtualStrategyEngine:
             )
             return
 
+        if self._has_entered_today(strategy.strategy_name, code):
+            return
+
         self._process_buy(strategy, code, tick, current_price)
 
     def _save_signal(
@@ -331,6 +368,8 @@ class VirtualStrategyEngine:
         )
 
         if opened:
+            self._mark_entered_today(name, code)
+
             self._cache_open_position(
                 strategy_name=name,
                 code=code,

@@ -72,6 +72,70 @@ def init_virtual_trading_tables():
             ON virtual_trade(strategy_name, exit_at)
         """)
 
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS virtual_strategy_daily_snapshot (
+                snapshot_date TEXT NOT NULL,
+                strategy_name TEXT NOT NULL,
+                open_position_count INTEGER NOT NULL DEFAULT 0,
+                deployed_units REAL NOT NULL DEFAULT 0,
+                realized_cost_units REAL NOT NULL DEFAULT 0,
+                realized_value_units REAL NOT NULL DEFAULT 0,
+                open_cost_units REAL NOT NULL DEFAULT 0,
+                open_value_units REAL NOT NULL DEFAULT 0,
+                total_value_units REAL NOT NULL DEFAULT 0,
+                strategy_index REAL NOT NULL DEFAULT 100,
+                cumulative_return_pct REAL NOT NULL DEFAULT 0,
+                daily_return_pct REAL NOT NULL DEFAULT 0,
+                peak_index REAL NOT NULL DEFAULT 100,
+                drawdown_pct REAL NOT NULL DEFAULT 0,
+                metric_type TEXT NOT NULL DEFAULT 'EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (strategy_name, snapshot_date)
+            )
+        """)
+        con.execute("""
+            CREATE INDEX IF NOT EXISTS idx_virtual_strategy_daily_snapshot_date
+            ON virtual_strategy_daily_snapshot(strategy_name, snapshot_date)
+        """)
+
+
+def get_virtual_entry_keys_for_date(entry_date: str):
+    """특정 날짜에 이미 가상 BUY가 발생한 (strategy_name, code) 집합."""
+    init_virtual_trading_tables()
+
+    date_text = str(entry_date or "").strip()
+    if len(date_text) != 8 or not date_text.isdigit():
+        return set()
+
+    result = set()
+
+    with _connect() as con:
+        position_rows = con.execute(
+            """
+            SELECT DISTINCT strategy_name, code
+            FROM virtual_position
+            WHERE substr(entry_at, 1, 8) = ?
+            """,
+            (date_text,),
+        ).fetchall()
+
+        trade_rows = con.execute(
+            """
+            SELECT DISTINCT strategy_name, code
+            FROM virtual_trade
+            WHERE substr(entry_at, 1, 8) = ?
+            """,
+            (date_text,),
+        ).fetchall()
+
+    for row in list(position_rows) + list(trade_rows):
+        result.add((
+            str(row["strategy_name"]),
+            str(row["code"]).strip().upper().zfill(6),
+        ))
+
+    return result
+
 
 def get_all_virtual_positions() -> list[dict[str, Any]]:
     """현재 열린 가상 포지션 전체를 한 번에 읽는다.
@@ -278,3 +342,144 @@ def close_virtual_position(
                 strategy_name, str(code).zfill(6),
             ))
     return True
+
+
+def save_virtual_strategy_daily_snapshots(
+    strategy_names,
+    snapshot_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """가상 BUY를 동일 투자금 1단위로 본 일별 mark-to-market 성과지수."""
+    init_virtual_trading_tables()
+
+    date_text = str(snapshot_date) if snapshot_date else datetime.now().strftime("%Y%m%d")
+    now_text = _now()
+    names = list(dict.fromkeys(
+        str(name).strip()
+        for name in (strategy_names or [])
+        if str(name).strip()
+    ))
+
+    if not names:
+        return []
+
+    saved = []
+
+    with _connect() as con:
+        for strategy_name in names:
+            realized = con.execute(
+                """
+                SELECT
+                    COALESCE(SUM(exit_ratio), 0) AS cost_units,
+                    COALESCE(SUM(exit_ratio * exit_price / entry_price), 0) AS value_units
+                FROM virtual_trade
+                WHERE strategy_name = ? AND entry_price > 0
+                """,
+                (strategy_name,),
+            ).fetchone()
+
+            opened = con.execute(
+                """
+                SELECT
+                    COUNT(*) AS open_position_count,
+                    COALESCE(SUM(remaining_ratio), 0) AS cost_units,
+                    COALESCE(SUM(remaining_ratio * current_price / entry_price), 0) AS value_units
+                FROM virtual_position
+                WHERE strategy_name = ?
+                  AND entry_price > 0
+                  AND current_price > 0
+                  AND remaining_ratio > 0
+                """,
+                (strategy_name,),
+            ).fetchone()
+
+            realized_cost = float(realized["cost_units"] or 0)
+            realized_value = float(realized["value_units"] or 0)
+            open_count = int(opened["open_position_count"] or 0)
+            open_cost = float(opened["cost_units"] or 0)
+            open_value = float(opened["value_units"] or 0)
+
+            deployed_units = realized_cost + open_cost
+            total_value_units = realized_value + open_value
+            strategy_index = (
+                total_value_units / deployed_units * 100.0
+                if deployed_units > 0 else 100.0
+            )
+            cumulative_return_pct = strategy_index - 100.0
+
+            previous = con.execute(
+                """
+                SELECT strategy_index, peak_index
+                FROM virtual_strategy_daily_snapshot
+                WHERE strategy_name = ? AND snapshot_date < ?
+                ORDER BY snapshot_date DESC
+                LIMIT 1
+                """,
+                (strategy_name, date_text),
+            ).fetchone()
+
+            if previous is None:
+                previous_index = 100.0
+                previous_peak = 100.0
+            else:
+                previous_index = float(previous["strategy_index"] or 100.0)
+                previous_peak = float(previous["peak_index"] or 100.0)
+
+            daily_return_pct = (
+                (strategy_index / previous_index - 1.0) * 100.0
+                if previous_index > 0 else 0.0
+            )
+            peak_index = max(100.0, previous_peak, strategy_index)
+            drawdown_pct = (
+                (strategy_index / peak_index - 1.0) * 100.0
+                if peak_index > 0 else 0.0
+            )
+
+            con.execute(
+                """
+                INSERT INTO virtual_strategy_daily_snapshot (
+                    snapshot_date, strategy_name, open_position_count, deployed_units,
+                    realized_cost_units, realized_value_units,
+                    open_cost_units, open_value_units, total_value_units,
+                    strategy_index, cumulative_return_pct, daily_return_pct,
+                    peak_index, drawdown_pct, metric_type, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          'EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX', ?)
+                ON CONFLICT(strategy_name, snapshot_date) DO UPDATE SET
+                    open_position_count=excluded.open_position_count,
+                    deployed_units=excluded.deployed_units,
+                    realized_cost_units=excluded.realized_cost_units,
+                    realized_value_units=excluded.realized_value_units,
+                    open_cost_units=excluded.open_cost_units,
+                    open_value_units=excluded.open_value_units,
+                    total_value_units=excluded.total_value_units,
+                    strategy_index=excluded.strategy_index,
+                    cumulative_return_pct=excluded.cumulative_return_pct,
+                    daily_return_pct=excluded.daily_return_pct,
+                    peak_index=excluded.peak_index,
+                    drawdown_pct=excluded.drawdown_pct,
+                    metric_type=excluded.metric_type,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    date_text, strategy_name, open_count, deployed_units,
+                    realized_cost, realized_value, open_cost, open_value,
+                    total_value_units, strategy_index, cumulative_return_pct,
+                    daily_return_pct, peak_index, drawdown_pct, now_text,
+                ),
+            )
+
+            saved.append({
+                "snapshot_date": date_text,
+                "strategy_name": strategy_name,
+                "open_position_count": open_count,
+                "deployed_units": deployed_units,
+                "strategy_index": strategy_index,
+                "cumulative_return_pct": cumulative_return_pct,
+                "daily_return_pct": daily_return_pct,
+                "peak_index": peak_index,
+                "drawdown_pct": drawdown_pct,
+                "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
+                "updated_at": now_text,
+            })
+
+    return saved

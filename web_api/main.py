@@ -23,6 +23,8 @@ from .database import (
     get_virtual_positions,
     get_virtual_trades,
     get_virtual_performance,
+    get_virtual_daily_performance,
+    get_virtual_strategy_index_history,
     get_virtual_event_summary,
     get_virtual_events,
 )
@@ -384,6 +386,68 @@ def virtual_trades(
         "items": get_virtual_trades(strategy_name, limit=limit, offset=offset),
         "limit": limit,
         "offset": offset,
+    }
+
+
+
+@app.get("/api/strategies/{strategy_name}/virtual-index-history")
+def strategy_virtual_index_history(
+    strategy_name: str,
+    date_from: Optional[str] = Query(default=None, pattern=r"^\d{8}$"),
+    date_to: Optional[str] = Query(default=None, pattern=r"^\d{8}$"),
+):
+    _require_strategy(strategy_name)
+    result = get_virtual_strategy_index_history(
+        strategy_name=strategy_name,
+        date_from=date_from,
+        date_to=date_to,
+    )
+    return {
+        "strategy_name": strategy_name,
+        **result,
+        "warning": (
+            "실제 전략별 현금계좌 NAV가 아니라 각 가상 BUY를 동일 투자금 1단위로 "
+            "mark-to-market한 성과지수입니다. MDD는 일별 스냅샷 저장 시작 이후 구간을 "
+            "중심으로 해석하세요."
+        ),
+    }
+
+
+@app.get("/api/strategies/{strategy_name}/virtual-daily-performance")
+def strategy_virtual_daily_performance(
+    strategy_name: str,
+    date_from: Optional[str] = Query(
+        default=None,
+        pattern=r"^\d{8}$",
+        description="시작일 YYYYMMDD",
+    ),
+    date_to: Optional[str] = Query(
+        default=None,
+        pattern=r"^\d{8}$",
+        description="종료일 YYYYMMDD",
+    ),
+):
+    _require_strategy(strategy_name)
+
+    result = get_virtual_daily_performance(
+        strategy_name=strategy_name,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    return {
+        "strategy_name": strategy_name,
+        **result,
+        "metric_definition": (
+            "daily_return_pct = 해당 날짜 가상 SELL leg의 "
+            "weighted_return_pct 합 / 청산비중(exit_ratio) 합"
+        ),
+        "warning": (
+            "현재 가상전략은 독립 현금/NAV를 운용하지 않으므로 "
+            "이 값은 일간 NAV 수익률이 아니라 그날 청산된 "
+            "가상 포지션의 비중가중 평균 실현수익률입니다. "
+            "미실현 포지션은 포함하지 않습니다."
+        ),
     }
 
 

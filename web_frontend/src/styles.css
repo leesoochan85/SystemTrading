@@ -50,3 +50,121 @@ td small { display:block; color:#5d6b7f; margin-top:3px; }
 .signal-row .virtual-buy { color:#62d7aa; }
 .signal-row .virtual-sell { color:#ff8d95; }
 .event b small { color:#657287; font-weight:500; margin-left:5px; }
+
+
+/* 전략별 일별 가상 실현수익률 */
+.panel-subtitle {
+  margin: 4px 0 0;
+  color: #6f7d91;
+  font-size: 12px;
+}
+
+.daily-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-bottom: 18px;
+}
+
+.daily-stat-grid > div {
+  padding: 14px;
+  border: 1px solid #182232;
+  border-radius: 13px;
+  background: #0b1018;
+}
+
+.daily-stat-grid span {
+  display: block;
+  margin-bottom: 6px;
+  color: #748197;
+  font-size: 12px;
+}
+
+.daily-stat-grid strong {
+  font-size: 20px;
+}
+
+.daily-chart-wrap {
+  width: 100%;
+  overflow-x: auto;
+  border: 1px solid #182232;
+  border-radius: 14px;
+  background: #090e15;
+}
+
+.daily-chart {
+  display: block;
+  width: 100%;
+  min-width: 720px;
+  height: auto;
+}
+
+.chart-zero-line {
+  stroke: #445064;
+  stroke-width: 1;
+  stroke-dasharray: 6 6;
+}
+
+.chart-return-line {
+  stroke: #d5dde9;
+  stroke-width: 3;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-point {
+  stroke: #090e15;
+  stroke-width: 3;
+}
+
+.chart-point-up {
+  fill: #ff7e86;
+}
+
+.chart-point-down {
+  fill: #6ea8ff;
+}
+
+.chart-axis-label,
+.chart-date-label {
+  fill: #69778c;
+  font-size: 11px;
+}
+
+.chart-empty {
+  padding: 70px 20px;
+  text-align: center;
+  color: #69778c;
+  font-size: 13px;
+}
+
+.chart-note {
+  margin: 14px 2px 0;
+}
+
+@media (max-width: 650px) {
+  .daily-stat-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+
+.primary-performance-panel {
+  border-color: #27364b;
+}
+
+.index-stat-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+@media (max-width: 850px) {
+  .index-stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 520px) {
+  .index-stat-grid {
+    grid-template-columns: 1fr;
+  }
+}

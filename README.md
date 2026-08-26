@@ -772,3 +772,12 @@ CSV 입력 여부
 - [ ] React `npm run dev` 확인
 - [ ] 테스트 데이터 제거
 - [ ] 다음 거래일 장중 실시간 화면 갱신 최종 확인
+
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 only (GPL-3.0-only).
+
+See [LICENSE](./LICENSE) for details.
+
+Third-party open-source dependencies and licenses are documented in [THIRD_PARTY.md](./THIRD_PARTY.md).

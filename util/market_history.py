@@ -15,11 +15,12 @@
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
 import time
-from typing import Dict, Iterable
+from typing import Dict, Iterable, Iterator
 
 import pandas as pd
 
@@ -32,42 +33,48 @@ EXCLUDED_COMPANY_NAME_KEYWORDS = ("스팩", "리츠")
 SQLITE_BUSY_TIMEOUT_MS = 15_000
 
 
-def _connect(db_path: Path = DB_PATH):
+@contextmanager
+def _connect(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
+    """SQLite 연결을 트랜잭션 종료 후 운영체제 수준에서도 확실히 닫는다."""
     db_path = Path(db_path).resolve()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     con = sqlite3.connect(db_path, timeout=SQLITE_BUSY_TIMEOUT_MS / 1000)
-    con.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
-    # 읽기(32bit 자동매매)와 쓰기(64bit 수집기/장마감 저장)의 충돌 가능성을 줄인다.
-    con.execute("PRAGMA journal_mode = WAL")
-    con.execute("PRAGMA synchronous = NORMAL")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS daily_price (
-            code TEXT NOT NULL,
-            date TEXT NOT NULL,
-            open INTEGER NOT NULL,
-            high INTEGER NOT NULL,
-            low INTEGER NOT NULL,
-            close INTEGER NOT NULL,
-            volume INTEGER NOT NULL,
-            source TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            PRIMARY KEY (code, date)
-        )
-    """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_daily_price_date ON daily_price(date)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_daily_price_code_date ON daily_price(code, date)")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS stock_master (
-            code TEXT PRIMARY KEY,
-            code_name TEXT NOT NULL,
-            market TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1,
-            updated_at TEXT NOT NULL
-        )
-    """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_stock_master_market ON stock_master(market)")
-    return con
+    try:
+        con.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        # 읽기(32bit 자동매매)와 쓰기(64bit 수집기/장마감 저장)의 충돌 가능성을 줄인다.
+        con.execute("PRAGMA journal_mode = WAL")
+        con.execute("PRAGMA synchronous = NORMAL")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS daily_price (
+                code TEXT NOT NULL,
+                date TEXT NOT NULL,
+                open INTEGER NOT NULL,
+                high INTEGER NOT NULL,
+                low INTEGER NOT NULL,
+                close INTEGER NOT NULL,
+                volume INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (code, date)
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_daily_price_date ON daily_price(date)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_daily_price_code_date ON daily_price(code, date)")
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS stock_master (
+                code TEXT PRIMARY KEY,
+                code_name TEXT NOT NULL,
+                market TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_stock_master_market ON stock_master(market)")
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def get_db_path() -> Path:
@@ -591,6 +598,7 @@ def load_breakout_metrics(
     volume_window: int = 20,
     ma_window: int = 20,
     db_path: Path = DB_PATH,
+    before_date: str | None = None,
 ) -> Dict[str, dict]:
     """종목별 실제 최근 일봉을 기준으로 신고가 계산값을 만든다.
 
@@ -606,6 +614,7 @@ def load_breakout_metrics(
         return {}
 
     max_window = max(breakout_window, volume_window, ma_window)
+    before_date = before_date or datetime.now().strftime("%Y%m%d")
 
     with _connect(db_path) as con:
         df = pd.read_sql_query(
@@ -618,6 +627,7 @@ def load_breakout_metrics(
                         ORDER BY date DESC
                     ) AS rn
                 FROM daily_price
+                WHERE date < ?
             )
             SELECT code, date, open, high, low, close, volume
             FROM ranked
@@ -625,7 +635,7 @@ def load_breakout_metrics(
             ORDER BY code, date
             """,
             con,
-            params=(max_window,),
+            params=(before_date, max_window),
         )
 
     if df.empty:
@@ -667,6 +677,7 @@ def load_breakout_metrics(
 
         metrics[str(code)] = {
             "breakout_price": float(last_breakout["high"].max()),
+            "prev_high": float(group.iloc[-1]["high"]),
             "volume_ma20": float(last_volume["volume"].mean()),
             "trading_value_ma20": trading_value_ma20,
             "ma20": float(last_ma["close"].mean()),

@@ -5,19 +5,23 @@ STRATEGIES = {
     "HighBreakoutStrategy": {
         "strategy_name": "HighBreakoutStrategy",
         "display_name": "신고가 돌파",
-        "description": "직전 신고가 돌파와 거래량·거래대금 조건을 이용하는 추세 돌파 전략",
+        "description": "60일 최고가 대비 -5% 이상에서 전일 고가를 넘으면 진입하고 ATR로 청산하는 전략",
         "buy_conditions": [
-            "현재가가 직전 60거래일 최고가를 돌파",
+            "현재가 >= 직전 60거래일 최고가의 95% (상한 없음, 오늘 제외)",
+            "현재가 > 전일 완결 일봉 고가",
             "당일 누적거래량이 최근 20거래일 평균거래량 이상",
             "최근 20거래일 평균거래대금이 20억원 이상",
+            "유효한 Wilder ATR(14)와 0원 초과 초기 청산선 확보",
         ],
         "sell_conditions": [
-            "수익률 -5% 이하 고정 손절",
-            "현재가가 동적 MA20 아래로 하락",
+            "초기 청산선 = 실제 매입가 - 2 × 진입 직전 Wilder ATR(14)",
+            "추적 청산선 = max(기존 청산선, 진입 이후 최고 종가 - 3 × 완결 일봉 ATR(14))",
+            "완결 일봉으로 갱신한 청산선은 다음 거래일부터 적용 (낮추지 않음)",
+            "현재가 <= 청산선이면 잔량 시장가 매도 (고정 -5% / 동적 MA20 매도 없음)",
         ],
         "reason_codes": {
-            "BUY": ["BREAKOUT_ENTRY"],
-            "SELL": ["STOP_LOSS", "MA20_BREAKDOWN"],
+            "BUY": ["HIGH_ZONE_OR_BREAKOUT_ENTRY"],
+            "SELL": ["ATR_INITIAL_STOP", "ATR_TRAILING_STOP"],
         },
     },
     "PullbackTrendStrategy": {

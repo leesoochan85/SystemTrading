@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 import math
 import time
 import traceback
@@ -8,6 +8,7 @@ from PyQt5.QtCore import QThread
 from util.const import get_fid
 from util.db_helper import (
     get_position_strategy,
+    get_position_detail,
     save_position_strategy,
     save_strategy_signal,
     update_strategy_signal_order_result,
@@ -17,6 +18,14 @@ from util.market_history import (
     get_db_path as get_market_history_db_path,
     load_breakout_metrics,
     load_company_stock_master,
+)
+from util.breakout_atr import (
+    ATR_PERIOD as DEFAULT_ATR_PERIOD,
+    INITIAL_ATR_MULTIPLIER as DEFAULT_INITIAL_ATR_MULTIPLIER,
+    TRAILING_ATR_MULTIPLIER as DEFAULT_TRAILING_ATR_MULTIPLIER,
+    AtrStateStore, load_atr_metrics, load_atr_history,
+    new_atr_state, new_atr_state_from_value,
+    advance_atr_state, atr_exit_signal,
 )
 from util.notifier import send_message
 from util.time_helper import (
@@ -43,7 +52,10 @@ class HighBreakoutStrategy(QThread):
     BREAKOUT_WINDOW = 60
     VOLUME_AVG_WINDOW = 20
     MIN_AVG_TRADING_VALUE = 2_000_000_000  # 최근 20봉 평균 거래대금 최소 20억원
-    STOP_LOSS_PCT = -5.0
+    HIGH_ZONE_MIN_RATIO = 0.95
+    ATR_PERIOD = DEFAULT_ATR_PERIOD
+    INITIAL_ATR_MULTIPLIER = DEFAULT_INITIAL_ATR_MULTIPLIER
+    TRAILING_ATR_MULTIPLIER = DEFAULT_TRAILING_ATR_MULTIPLIER
 
     REALTIME_CHUNK_SIZE = 90
     REALTIME_SCREEN_START = 3000
@@ -65,6 +77,13 @@ class HighBreakoutStrategy(QThread):
 
         self.market_history_db_path = get_market_history_db_path()
         self.last_signal_log_at = {}
+        self.metrics_date = None
+        self.atr_history_date = None
+        self.atr_history_cache = {}
+        self.atr_state_cache = {}
+        self.atr_state_store = AtrStateStore(
+            self.market_history_db_path.parent / "breakout_atr_state.db"
+        )
 
         if auto_init:
             self.init_strategy()
@@ -180,15 +199,29 @@ class HighBreakoutStrategy(QThread):
         """신고가 계산에 필요한 요약 지표만 메모리에 올린다."""
         codes = list(self.universe.keys())
 
+        now = datetime.now()
+        # 장 종료 후 Manager가 저장한 당일 완결봉은 다음 장 준비에 사용한다.
+        cutoff = now + timedelta(days=1) if now.hour * 60 + now.minute > 930 else now
+        before_date = cutoff.strftime("%Y%m%d")
         metrics = load_breakout_metrics(
             codes,
             breakout_window=self.BREAKOUT_WINDOW,
             volume_window=self.VOLUME_AVG_WINDOW,
             ma_window=20,
             db_path=self.market_history_db_path,
+            before_date=before_date,
         )
+        atr_metrics = load_atr_metrics(
+            codes, self.market_history_db_path, before_date, self.ATR_PERIOD
+        )
+        for code, metric in metrics.items():
+            atr = atr_metrics.get(code)
+            if atr and atr["atr_date"] == metric["history_last_date"]:
+                metric.update(atr)
 
         self.breakout_metrics = metrics
+        self.metrics_date = before_date
+        self.atr_history_cache.clear()
         missing = [
             code
             for code in codes
@@ -392,43 +425,68 @@ class HighBreakoutStrategy(QThread):
             .zfill(6)
         )
 
-    def _dynamic_ma20(
-        self,
-        code,
-        current_price,
-    ):
-        metric = self._metric(code)
+    def _ensure_daily_metrics(self):
+        if self.metrics_date != datetime.now().strftime("%Y%m%d"):
+            self.check_and_get_price_data()
 
-        if not metric:
-            return None
-
-        if (
-            int(
-                metric.get(
-                    "ma19_count",
-                    0,
-                )
-                or 0
+    def _atr_history(self, code, entry_at):
+        today = datetime.now().strftime("%Y%m%d")
+        if self.atr_history_date != today:
+            self.atr_history_cache.clear()
+            self.atr_history_date = today
+        key = (code, str(entry_at)[:8])
+        if key not in self.atr_history_cache:
+            self.atr_history_cache[key] = load_atr_history(
+                code, self.market_history_db_path, today, self.ATR_PERIOD,
+                from_date=str(entry_at)[:8],
             )
-            == 19
-        ):
-            return (
-                float(
-                    metric["ma19_close_sum"]
-                )
-                + float(current_price)
-            ) / 20.0
+        return self.atr_history_cache[key]
 
-        return (
-            float(
-                metric.get("ma20", 0)
-                or 0
-            )
-            or None
+    def evaluate_atr_exit(self, code, current_price, entry_price, entry_at, state=None):
+        """실주문/가상매매 공통: 완결 일봉으로 청산선을 갱신하고 현재가와 비교한다."""
+        try:
+            bars = self._atr_history(code, entry_at)
+        except Exception:
+            if not state:
+                raise
+            # 일봉 DB가 일시적으로 읽히지 않아도 저장된 청산선은 해제하지 않는다.
+            bars = []
+            last = self.last_signal_log_at.get(("atr_history", code), 0)
+            if time.time() - last >= 60:
+                print(f"[HighBreakout ATR] {code}: 일봉 조회 실패, 저장된 청산선 유지")
+                self.last_signal_log_at[("atr_history", code)] = time.time()
+        if not state:
+            try:
+                state = new_atr_state(
+                    entry_price, entry_at, bars, self.INITIAL_ATR_MULTIPLIER
+                )
+            except ValueError:
+                if not bars:
+                    raise
+                latest = bars[-1]
+                state = new_atr_state_from_value(
+                    entry_price,
+                    entry_at,
+                    latest["atr"],
+                    latest["date"],
+                    self.INITIAL_ATR_MULTIPLIER,
+                )
+                print(
+                    f"[HighBreakout ATR] {code}: 진입 전 이력 부족 - "
+                    "최신 완결 ATR로 기존 보유 상태 이관"
+                )
+        if (state["entry_price"] == entry_price
+                and (not bars or state["last_bar_date"] >= bars[-1]["date"])):
+            return atr_exit_signal(current_price, state), state
+        updated = advance_atr_state(
+            state, entry_price, bars, self.INITIAL_ATR_MULTIPLIER,
+            self.TRAILING_ATR_MULTIPLIER,
         )
+        return atr_exit_signal(current_price, updated), updated
 
     def _get_buy_signal(self, code, tick=None):
         """순수 전략 매수조건만 판정한다. 주문 가능 여부는 여기서 판단하지 않는다."""
+        self._ensure_daily_metrics()
         metric = self._metric(code)
         if not metric:
             return None
@@ -437,6 +495,8 @@ class HighBreakoutStrategy(QThread):
         current_price = int(rt.get("현재가", 0) or 0)
         volume = int(rt.get("누적거래량", 0) or 0)
         breakout_price = float(metric.get("breakout_price", 0) or 0)
+        prev_high = float(metric.get("prev_high", 0) or 0)
+        atr = float(metric.get("atr14", 0) or 0)
         volume_ma20 = float(metric.get("volume_ma20", 0) or 0)
         trading_value_ma20 = float(metric.get("trading_value_ma20", 0) or 0)
 
@@ -445,26 +505,35 @@ class HighBreakoutStrategy(QThread):
             or breakout_price <= 0
             or volume_ma20 < 0
             or trading_value_ma20 <= 0
+            or prev_high <= 0
+            or not math.isfinite(atr)
+            or atr <= 0
+            or current_price - self.INITIAL_ATR_MULTIPLIER * atr <= 0
         ):
             return None
 
         if not (
-            current_price > breakout_price
+            breakout_price * self.HIGH_ZONE_MIN_RATIO <= current_price
+            and current_price > prev_high
             and volume >= volume_ma20
             and trading_value_ma20 >= self.MIN_AVG_TRADING_VALUE
         ):
             return None
 
         return {
-            "reason_code": "BREAKOUT_ENTRY",
+            "reason_code": "HIGH_ZONE_OR_BREAKOUT_ENTRY",
             "signal_reason": (
-                f"직전 {self.BREAKOUT_WINDOW}일 최고가 돌파 + "
+                f"직전 {self.BREAKOUT_WINDOW}일 최고가 대비 -5% 이상 + 전일 고가 초과 + "
                 f"누적거래량 20일 평균 이상 + 20일 평균거래대금 20억원 이상"
             ),
             "current_price": current_price,
             "condition_data": {
                 "current_price": current_price,
                 "breakout_price": breakout_price,
+                "prev_high": prev_high,
+                "high_distance_pct": (current_price / breakout_price - 1) * 100,
+                "atr14": atr,
+                "atr_date": metric.get("atr_date"),
                 "volume": volume,
                 "volume_ma20": volume_ma20,
                 "trading_value_ma20": trading_value_ma20,
@@ -536,6 +605,9 @@ class HighBreakoutStrategy(QThread):
             )
             return False
 
+        # 새 포지션은 전량 매도/취소 후 남은 과거 ATR 상태를 재사용하지 않는다.
+        self.atr_state_cache.pop(code, None)
+        self.atr_state_store.delete(code)
         order = self.buy_order_handler(
             strategy_name=self.strategy_name,
             code=code,
@@ -572,119 +644,55 @@ class HighBreakoutStrategy(QThread):
 
         data = signal["condition_data"]
         send_message(
-            f"[신고가돌파 매수] {code_name}({code}) "
+            f"[신고가 부근·돌파 매수] {code_name}({code}) "
             f"{quantity}주 {bid:,}원 / "
             f"직전{self.BREAKOUT_WINDOW}일 최고가 "
-            f"{int(data['breakout_price']):,}원 돌파 / "
+            f"{int(data['breakout_price']):,}원 대비 {data['high_distance_pct']:.2f}% / "
+            f"전일고가 {int(data['prev_high']):,}원 초과 / ATR14 {data['atr14']:.2f} / "
             f"누적거래량 {int(data['volume']):,} / "
             f"20일 평균거래대금 "
             f"{data['trading_value_ma20'] / 100_000_000:,.1f}억원"
         )
         return True
 
-    def is_stop_loss_triggered(
-        self,
-        code,
-        tick=None,
-    ):
-        if code not in self.kiwoom.balance:
-            return False
-
-        balance_info = self.kiwoom.balance[
-            code
-        ]
-
-        purchase_price = float(
-            balance_info.get(
-                "매입가",
-                balance_info.get(
-                    "매입단가",
-                    0,
-                ),
-            )
-            or 0
-        )
-
-        rt = (
-            tick
-            or self.kiwoom
-            .universe_realtime_transaction_info
-            .get(code, {})
-        )
-
-        current_price = float(
-            rt.get(
-                "현재가",
-                balance_info.get(
-                    "현재가",
-                    0,
-                ),
-            )
-            or 0
-        )
-
-        if (
-            purchase_price <= 0
-            or current_price <= 0
-        ):
-            return False
-
-        return (
-            (
-                current_price
-                - purchase_price
-            )
-            / purchase_price
-            * 100
-        ) <= self.STOP_LOSS_PCT
+    def is_stop_loss_triggered(self, code, tick=None):
+        """기존 호출부 호환: 고정 -5% 대신 ATR 초기/추적 청산 여부를 반환한다."""
+        return self.get_sell_signal(code, tick=tick) is not None
 
     def get_sell_signal(self, code, tick=None):
-        """매도조건을 사유와 조건 스냅샷 형태로 반환한다."""
         if code not in self.kiwoom.balance:
             return None
-
-        balance_info = self.kiwoom.balance[code]
-        purchase_price = float(
-            balance_info.get("매입가", balance_info.get("매입단가", 0)) or 0
-        )
+        info = self.kiwoom.balance[code]
+        entry_price = float(info.get("매입가") or info.get("매입단가") or 0)
         rt = tick or self.kiwoom.universe_realtime_transaction_info.get(code, {})
-        current_price = float(rt.get("현재가", balance_info.get("현재가", 0)) or 0)
-
-        if purchase_price <= 0 or current_price <= 0:
+        current_price = float(rt.get("현재가") or info.get("현재가") or 0)
+        if entry_price <= 0 or current_price <= 0:
             return None
 
-        return_pct = (current_price - purchase_price) / purchase_price * 100.0
+        cached = self.atr_state_cache.get(code)
+        if cached is None:
+            detail = get_position_detail(code) or {}
+            entry_at = detail.get("created_at")
+            state = self.atr_state_store.load(code)
+            if state and state.get("entry_at") != entry_at:
+                state = None
+        else:
+            state = cached
+            entry_at = state["entry_at"]
 
-        if return_pct <= self.STOP_LOSS_PCT:
-            return {
-                "reason_code": "STOP_LOSS",
-                "signal_reason": f"수익률 {return_pct:.2f}% <= {self.STOP_LOSS_PCT:.2f}%",
-                "current_price": current_price,
-                "condition_data": {
-                    "purchase_price": purchase_price,
-                    "current_price": current_price,
-                    "return_pct": return_pct,
-                    "stop_loss_pct": self.STOP_LOSS_PCT,
-                },
-                "market_order": True,
-            }
+        signal, updated = self.evaluate_atr_exit(
+            code, current_price, entry_price, entry_at, state,
+        )
+        if updated != state:
+            self.atr_state_store.save(code, updated)
+        self.atr_state_cache[code] = updated
+        return signal
 
-        ma20 = self._dynamic_ma20(code, current_price)
-        if ma20 is not None and current_price < ma20:
-            return {
-                "reason_code": "MA20_BREAKDOWN",
-                "signal_reason": f"현재가 {current_price:,.0f}원 < MA20 {ma20:,.1f}원",
-                "current_price": current_price,
-                "condition_data": {
-                    "purchase_price": purchase_price,
-                    "current_price": current_price,
-                    "return_pct": return_pct,
-                    "ma20": ma20,
-                },
-                "market_order": False,
-            }
-
-        return None
+    def on_position_closed(self, code, reason=""):
+        """Manager가 실제 잔고 0을 확인한 뒤 호출한다."""
+        code = str(code).strip().upper().zfill(6)
+        self.atr_state_cache.pop(code, None)
+        self.atr_state_store.delete(code)
 
     def _save_sell_signal(self, code, tick, signal):
         return save_strategy_signal(
@@ -728,7 +736,7 @@ class HighBreakoutStrategy(QThread):
         if signal.get("market_order"):
             order_price = 0
             order_classification = "03"
-            order_label = "[신고가돌파 손절 시장가 매도]"
+            order_label = "[신고가 부근 ATR 시장가 청산]"
         else:
             order_price = int(rt.get("(최우선)매도호가", 0) or 0)
             if order_price <= 0:
@@ -737,7 +745,7 @@ class HighBreakoutStrategy(QThread):
                 )
                 return False
             order_classification = "00"
-            order_label = "[신고가돌파 매도]"
+            order_label = "[신고가 부근 매도]"
 
         result = self.kiwoom.send_order(
             "send_sell_order",
@@ -812,4 +820,3 @@ class HighBreakoutStrategy(QThread):
             return self.order_sell(code, signal=signal, signal_key=signal_key)
 
         return False
-

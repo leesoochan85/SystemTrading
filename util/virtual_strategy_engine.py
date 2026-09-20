@@ -288,6 +288,11 @@ class VirtualStrategyEngine:
 
         if name == "HighBreakoutStrategy":
             signal = strategy._get_buy_signal(code, tick=tick)
+            if signal:
+                _, state = strategy.evaluate_atr_exit(
+                    code, current_price, current_price,
+                    datetime.now().strftime("%Y%m%d%H%M%S"),
+                )
 
         elif name == "PullbackTrendStrategy":
             metric = strategy._metric(code)
@@ -401,37 +406,22 @@ class VirtualStrategyEngine:
         )
 
         if name == "HighBreakoutStrategy":
-            if return_pct <= strategy.STOP_LOSS_PCT:
-                return self._close(
-                    strategy,
-                    code,
-                    current_price,
-                    "STOP_LOSS",
-                    (
-                        f"가상 수익률 {return_pct:.2f}% "
-                        f"<= {strategy.STOP_LOSS_PCT:.2f}%"
-                    ),
-                    1.0,
-                    {
-                        "entry_price": entry_price,
-                        "return_pct": return_pct,
-                    },
+            previous_state = position.get("state") or {}
+            signal, state = strategy.evaluate_atr_exit(
+                code, current_price, entry_price, position["entry_at"],
+                previous_state or None,
+            )
+            position["state"] = state
+            # 일별 청산선/초기 상태는 즉시 저장. 일반 현재가 갱신은 기존 5초 주기.
+            if state != previous_state:
+                update_virtual_position(
+                    name, code, current_price, state=state,
                 )
-
-            ma20 = strategy._dynamic_ma20(code, current_price)
-            if ma20 is not None and current_price < ma20:
+            if signal:
                 return self._close(
-                    strategy,
-                    code,
-                    current_price,
-                    "MA20_BREAKDOWN",
-                    f"현재가 {current_price:,.0f}원 < MA20 {ma20:,.1f}원",
-                    1.0,
-                    {
-                        "entry_price": entry_price,
-                        "return_pct": return_pct,
-                        "ma20": ma20,
-                    },
+                    strategy, code, current_price,
+                    signal["reason_code"], signal["signal_reason"],
+                    1.0, signal["condition_data"],
                 )
             return
 

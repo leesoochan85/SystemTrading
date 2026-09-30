@@ -40,7 +40,7 @@ class HighBreakoutStrategy(QThread):
     핵심 구조
     ---------
     - 과거 일봉은 market_history.db에서만 읽는다.
-    - 장 시작 전에 직전 60일 최고가/20일 평균거래량/20일 평균거래대금을 종목별 1회 계산한다.
+    - 장 시작 전에 직전 180거래일 최고가/20일 평균거래량/20일 평균거래대금을 종목별 1회 계산한다.
     - 장중에는 pandas rolling을 반복하지 않고 실시간 틱 숫자만 비교한다.
     - 종목을 1초마다 순회하지 않고 Kiwoom 주식체결 이벤트가 온 종목만 즉시 검사한다.
     - 매수 수량/예산/계좌 전체 보유수 제한은 StrategyManager가 담당한다.
@@ -49,10 +49,9 @@ class HighBreakoutStrategy(QThread):
     strategy_name = "HighBreakoutStrategy"
     event_driven = True
 
-    BREAKOUT_WINDOW = 60
+    BREAKOUT_WINDOW = 180
     VOLUME_AVG_WINDOW = 20
     MIN_AVG_TRADING_VALUE = 2_000_000_000  # 최근 20봉 평균 거래대금 최소 20억원
-    HIGH_ZONE_MIN_RATIO = 0.95
     ATR_PERIOD = DEFAULT_ATR_PERIOD
     INITIAL_ATR_MULTIPLIER = DEFAULT_INITIAL_ATR_MULTIPLIER
     TRAILING_ATR_MULTIPLIER = DEFAULT_TRAILING_ATR_MULTIPLIER
@@ -513,7 +512,7 @@ class HighBreakoutStrategy(QThread):
             return None
 
         if not (
-            breakout_price * self.HIGH_ZONE_MIN_RATIO <= current_price
+            current_price >= breakout_price
             and current_price > prev_high
             and volume >= volume_ma20
             and trading_value_ma20 >= self.MIN_AVG_TRADING_VALUE
@@ -521,9 +520,9 @@ class HighBreakoutStrategy(QThread):
             return None
 
         return {
-            "reason_code": "HIGH_ZONE_OR_BREAKOUT_ENTRY",
+            "reason_code": "BREAKOUT_ENTRY",
             "signal_reason": (
-                f"직전 {self.BREAKOUT_WINDOW}일 최고가 대비 -5% 이상 + 전일 고가 초과 + "
+                f"직전 {self.BREAKOUT_WINDOW}거래일 최고가 돌파 + 전일 고가 초과 + "
                 f"누적거래량 20일 평균 이상 + 20일 평균거래대금 20억원 이상"
             ),
             "current_price": current_price,
@@ -644,9 +643,9 @@ class HighBreakoutStrategy(QThread):
 
         data = signal["condition_data"]
         send_message(
-            f"[신고가 부근·돌파 매수] {code_name}({code}) "
+            f"[신고가 돌파 매수] {code_name}({code}) "
             f"{quantity}주 {bid:,}원 / "
-            f"직전{self.BREAKOUT_WINDOW}일 최고가 "
+            f"직전{self.BREAKOUT_WINDOW}거래일 최고가 "
             f"{int(data['breakout_price']):,}원 대비 {data['high_distance_pct']:.2f}% / "
             f"전일고가 {int(data['prev_high']):,}원 초과 / ATR14 {data['atr14']:.2f} / "
             f"누적거래량 {int(data['volume']):,} / "
@@ -736,7 +735,7 @@ class HighBreakoutStrategy(QThread):
         if signal.get("market_order"):
             order_price = 0
             order_classification = "03"
-            order_label = "[신고가 부근 ATR 시장가 청산]"
+            order_label = "[신고가 돌파 ATR 시장가 청산]"
         else:
             order_price = int(rt.get("(최우선)매도호가", 0) or 0)
             if order_price <= 0:
@@ -745,7 +744,7 @@ class HighBreakoutStrategy(QThread):
                 )
                 return False
             order_classification = "00"
-            order_label = "[신고가 부근 매도]"
+            order_label = "[신고가 돌파 매도]"
 
         result = self.kiwoom.send_order(
             "send_sell_order",

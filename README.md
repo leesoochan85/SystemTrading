@@ -95,7 +95,7 @@ python-dotenv
 
 ### 2-3. 웹 API용
 
-FastAPI는 Kiwoom ActiveX를 사용하지 않고 SQLite DB만 읽으므로 자동매매용 32bit Python과 분리합니다.
+FastAPI는 Kiwoom ActiveX를 사용하지 않고 모니터링 DB 조회와 MA 설정 DB 저장을 담당하므로 자동매매용 32bit Python과 분리합니다.
 
 예:
 
@@ -291,6 +291,7 @@ ValueQualityStrategy
 전략별 별도 예산 없음
 모든 전략 공용 계좌 현금 사용
 신규 종목 1개당 총자산 최대 10%
+HighBreakout 실주문은 ATR 초기 청산선 기준 계획 손실 0.5% 수량 한도도 적용
 계좌 전체 최대 10포지션
 ```
 
@@ -405,7 +406,7 @@ FastAPI
 React
 ```
 
-FastAPI의 DB 연결은 조회 전용으로 사용합니다.
+모니터링 DB 연결은 조회 전용으로 사용합니다. 2026-09-30 추가한 MA 설정 변경은 별도 `strategy_settings.db`에 저장하며 매매 프로그램이 다음 거래일에 읽습니다.
 
 따라서 웹 서버나 브라우저 오류가 Kiwoom ActiveX 객체를 직접 건드리는 구조가 아닙니다.
 
@@ -507,7 +508,7 @@ http://127.0.0.1:8000/docs
 http://127.0.0.1:8000/health
 ```
 
-FastAPI는 `monitoring.db`, `strategy_position.db`를 읽습니다.
+FastAPI는 `monitoring.db`, `strategy_position.db`를 조회하고, 신고가 전략 MA 설정을 별도 `strategy_settings.db`에 저장합니다.
 
 ---
 
@@ -577,7 +578,7 @@ npm run dev
 
 ```text
 CMD 1 = 거래/실시간 데이터 생산
-CMD 2 = SQLite 읽기 전용 API
+CMD 2 = SQLite 모니터링 조회 및 MA 설정 저장 API
 CMD 3 = 사용자 화면
 ```
 
@@ -691,6 +692,23 @@ test_frontend_polling.py
 
 ## 23. 자주 발생하는 오류
 
+### npm ENOENT: package.json을 찾을 수 없음
+
+프로젝트 최상위에서 실행하면 발생합니다. `package.json`이 있는 폴더에서 실행하세요.
+
+```cmd
+cd web_frontend
+npm run dev
+```
+
+### MA 설정이 적용 대기로 계속 표시됨
+
+- 저장 날짜 이후의 거래일인지 확인합니다.
+- 매매 프로그램의 신고가 전략 초기화·실시간 틱 수신을 확인합니다.
+- 웹과 매매 프로그램이 같은 `strategy_settings.db`를 쓰는지 확인합니다.
+- CMD의 `MA 청산 설정 적용` 또는 `MA 설정 적용 지연` 로그를 확인합니다.
+- 적용 확인 날짜·시간도 확인합니다. 예전 기록은 현재 실행 여부를 보장하지 않습니다.
+
 ### QAxContainer import 실패
 
 ```cmd
@@ -743,7 +761,7 @@ CSV 입력 여부
 1. 자동매매는 Python 3.9 32bit에서 실행합니다.
 2. 과거 전체시장 수집은 64bit `marketdata`에서 실행합니다.
 3. 웹은 Kiwoom을 직접 접근하지 않고 DB를 통해 분리합니다.
-4. `monitoring.db`, `strategy_position.db`, `value_quality.db`, `market_history.db`를 실행 중 임의 삭제하지 않습니다.
+4. `monitoring.db`, `strategy_position.db`, `value_quality.db`, `market_history.db`, `breakout_atr_state.db`, `strategy_settings.db`를 실행 중 임의 삭제하지 않습니다.
 5. 테스트용 `T9...` 가상 포지션은 운영 전에 제거합니다.
 6. Telegram token을 Git에 저장하지 않습니다.
 7. 실전 계좌 전환 전 모의투자에서 충분히 검증합니다.
@@ -772,7 +790,7 @@ CSV 입력 여부
 - [ ] React `npm run dev` 확인
 - [ ] 테스트 데이터 제거
 - [ ] 다음 거래일 장중 실시간 화면 갱신 최종 확인
-
+---
 
 ## License
 

@@ -5,9 +5,9 @@ STRATEGIES = {
     "HighBreakoutStrategy": {
         "strategy_name": "HighBreakoutStrategy",
         "display_name": "신고가 돌파",
-        "description": "60일 최고가 대비 -5% 이상에서 전일 고가를 넘으면 진입하고 ATR로 청산하는 전략",
+        "description": "직전 180거래일 최고가를 돌파하고 전일 고가를 넘으면 진입하고 ATR로 청산하는 전략",
         "buy_conditions": [
-            "현재가 >= 직전 60거래일 최고가의 95% (상한 없음, 오늘 제외)",
+            "현재가 >= 직전 180거래일 최고가 (오늘 제외)",
             "현재가 > 전일 완결 일봉 고가",
             "당일 누적거래량이 최근 20거래일 평균거래량 이상",
             "최근 20거래일 평균거래대금이 20억원 이상",
@@ -20,7 +20,7 @@ STRATEGIES = {
             "현재가 <= 청산선이면 잔량 시장가 매도 (고정 -5% / 동적 MA20 매도 없음)",
         ],
         "reason_codes": {
-            "BUY": ["HIGH_ZONE_OR_BREAKOUT_ENTRY"],
+            "BUY": ["BREAKOUT_ENTRY"],
             "SELL": ["ATR_INITIAL_STOP", "ATR_TRAILING_STOP"],
         },
     },

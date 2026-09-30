@@ -650,7 +650,7 @@ def load_breakout_metrics(
     for code, group in df.groupby("code", sort=False):
         group = group.sort_values("date").copy()
 
-        # 각 종목 자체의 실제 최근 거래일 기준으로 최소 60봉을 요구한다.
+        # 각 종목 자체의 실제 최근 거래일 기준으로 필요한 봉 수를 요구한다.
         if len(group) < max_window:
             continue
 

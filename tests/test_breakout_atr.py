@@ -38,8 +38,9 @@ from strategy.HighBreakoutStrategy import HighBreakoutStrategy
 
 
 class BreakoutAtrTest(unittest.TestCase):
-    def test_high_zone_rebound_buy_boundaries(self):
+    def test_180_day_breakout_buy_boundaries(self):
         strategy = HighBreakoutStrategy(types.SimpleNamespace(), auto_init=False)
+        self.assertEqual(strategy.BREAKOUT_WINDOW, 180)
         strategy.metrics_date = datetime.now().strftime("%Y%m%d")
         strategy.breakout_metrics = {
             "000001": {
@@ -58,12 +59,13 @@ class BreakoutAtrTest(unittest.TestCase):
                 "000001", {"현재가": price, "누적거래량": 10}
             )
 
-        self.assertIsNotNone(signal(95))
+        self.assertIsNone(signal(95))
         self.assertIsNotNone(signal(100, previous_high=99))
         self.assertIsNotNone(signal(101, previous_high=99))
         self.assertIsNotNone(signal(120, previous_high=99))
         self.assertIsNone(signal(94))
         self.assertIsNone(signal(96, previous_high=97))
+        self.assertIsNone(signal(100, previous_high=100))
 
     def test_wilder_atr_includes_overnight_gap(self):
         rows = [

@@ -1,16 +1,21 @@
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
 
-async function request(path) {
-  const response = await fetch(`${API_BASE}${path}`);
+async function request(path, options) {
+  const response = await fetch(`${API_BASE}${path}`, options);
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`API ${response.status}: ${body}`);
+    const body = await response.json().catch(() => ({}));
+    const detail = typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail || body);
+    throw new Error(`API ${response.status}: ${detail}`);
   }
   return response.json();
 }
 
 export const getDashboard = () => request("/api/dashboard");
 export const getStrategy = (name) => request(`/api/strategies/${name}`);
+export const updateMaSettings = (name, values) => request(
+  `/api/strategies/${encodeURIComponent(name)}/ma-settings`,
+  { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) },
+);
 export const getVirtualPerformance = (name) =>
   request(`/api/strategies/${name}/virtual-performance`);
 export const getVirtualTrades = (name, limit = 100) =>

@@ -407,7 +407,7 @@ class VirtualStrategyEngine:
 
         if name == "HighBreakoutStrategy":
             previous_state = position.get("state") or {}
-            signal, state = strategy.evaluate_atr_exit(
+            signal, state = strategy.evaluate_sell_signal(
                 code, current_price, entry_price, position["entry_at"],
                 previous_state or None,
             )

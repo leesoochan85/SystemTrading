@@ -12,6 +12,7 @@ async function request(path, options) {
 
 export const getDashboard = () => request("/api/dashboard");
 export const getStrategy = (name) => request(`/api/strategies/${name}`);
+export const getPaperComparison = () => request("/api/strategies/MomentumContractionStrategy/paper-comparison");
 export const updateMaSettings = (name, values) => request(
   `/api/strategies/${encodeURIComponent(name)}/ma-settings`,
   { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(values) },

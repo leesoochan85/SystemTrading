@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import MomentumPage from "./MomentumPage";
 import {
   getStrategy,
   updateMaSettings,
@@ -304,6 +305,11 @@ function DailyReturnChart({ items }) {
 
 
 export default function StrategyPage() {
+  const { name } = useParams();
+  return name === "MomentumContractionStrategy" ? <MomentumPage /> : <LegacyStrategyPage />;
+}
+
+function LegacyStrategyPage() {
   const { name } = useParams();
   const [detail, setDetail] = useState(null);
   const [virtual, setVirtual] = useState(null);

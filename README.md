@@ -1,5 +1,9 @@
 # SystemTrading 작업 환경 세팅 가이드
 
+2026-10-08: **Breakout을 우선 개발**합니다. 첫 구간 체결량 누락·등록 초기화 검사를 보강하고, 선택적 틱 CSV 기록과 주문 없는 재현 도구를 추가했습니다. [수정 내용·검증·적용 순서](docs/2026-10-08_breakout_implementation.md)를 확인하세요. Parabolic은 이번 구현 범위에서 제외했습니다.
+
+2026-10-05: PDF·동영상 조건을 반영한 **모멘텀 수축 돌파 가상 전용 전략**과 현금·정수 수량·거래 비용을 적용한 A/B/C 비교를 추가했습니다. 기존 신고가 전략의 ATR 매수 인자와 웹 MA 청산 설정 연결도 수정했습니다. 조건의 출처, 실험값, 실행·설정 변경 방법은 [추가 운영 안내](docs/2026-10-05_README.md)를 확인하세요.
+
 > 대상: 저장소를 처음 받은 PC에서 **과거 데이터 수집 → Kiwoom 자동매매 → Telegram → FastAPI/React 웹 모니터링**까지 실행 가능한 상태를 만드는 절차입니다.
 >
 > 핵심은 실행 환경을 분리하는 것입니다.
@@ -223,6 +227,11 @@ conda activate marketdata
 python bootstrap_market_history.py
 ```
 
+현재 HighBreakout은 **당일을 제외한 직전 180거래일 일봉**이 필요합니다. C 모멘텀 전략은 최소 127봉과 기준 거래일의 최신 일봉을 확인합니다. 조회 옵션의 540은 달력일이며 실제 필요한 봉수와 다릅니다. 기존 종목의 과거 이력을 늘릴 때는 `--overlap-days`도 지정합니다.
+
+현재 수집기는 마지막 저장일이 수집 종료일 이상이면 봉수가 부족해도 건너뜁니다. 이때는 수집 로그를 확인하고 이력 보충 로직을 별도로 점검해야 합니다. 오류 안내에 65일이 표시되더라도 HighBreakout의 실제 신고가 창은 180거래일입니다.
+
+
 주요 데이터:
 
 ```text
@@ -231,6 +240,31 @@ daily_price
 ```
 
 현재 신고가/눌림목 전략은 장중에 전체 일봉을 반복 조회하지 않고, 시작 전에 `market_history.db`에서 기준값을 계산한 뒤 Kiwoom 실시간 체결 이벤트로 판단합니다.
+
+---
+
+## 8-1. 가상 비교 DB와 틱 기록 실행
+
+프로젝트 최상위에서 매매 프로그램을 실행할 CMD에 설정합니다.
+
+```cmd
+set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
+set "SYSTEMTRADING_PAPER_TICK_CSV=%CD%\ticks\breakout.csv"
+py -3.9-32 main.py
+```
+
+같은 실험은 같은 DB를 계속 사용합니다. 날짜별 새 DB로 바꾸면 현금과 보유 상태가 새 실험으로 시작하며, 기존 DB의 기록이 자동 이전되지 않습니다. 환경변수를 생략하면 기본 가상 저장 위치는 `monitoring.db`입니다. 틱 CSV 기록은 선택 사항입니다.
+
+웹 API를 실행할 별도 CMD에서도 웹 환경을 활성화하고 프로젝트 최상위로 이동한 뒤 같은 `SYSTEMTRADING_PAPER_DB`를 설정합니다.
+
+```cmd
+set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
+python run_web_api.py
+```
+
+`set`은 해당 CMD에서 시작하는 프로세스에만 적용됩니다. 실행할 때마다 입력하지 않으려면 프로젝트 최상위 `.bat`에 저장할 수 있습니다. [작업 기록의 실행 예시](docs/2026-10-08_README.md#6-가상-db와-틱-csv-설정)를 참고하세요.
+
+C는 가상 전용이지만 기존 전략의 증권사 주문 경로는 유지됩니다. 가상 DB 경로 설정이 전체 프로그램의 주문 모드를 바꾸지는 않습니다.
 
 ---
 
@@ -281,6 +315,7 @@ python bootstrap_value_quality_data.py data\value_fundamentals.csv
 HighBreakoutStrategy
 PullbackTrendStrategy
 ValueQualityStrategy
+MomentumContractionStrategy (가상 전용 A/B/C 비교)
 ```
 
 실제 매수 수량/현금/계좌 전체 포지션 제한은 `StrategyManager`가 중앙 관리합니다.
@@ -310,6 +345,7 @@ monitoring.db
   - 주문/체결/성과
   - 웹 조회용 스냅샷
   - 가상매매 virtual_position / virtual_trade
+  - 별도 현금 가상계좌 paper_account / paper_position / paper_trade 등
 
 value_quality.db
   - ValueQuality 재무 스냅샷
@@ -415,6 +451,8 @@ React
 ## 15. 가상매매의 목적과 실제 계좌와의 차이
 
 웹의 가상매매는 실제 주문 성공 여부를 그대로 복사하는 기능이 아닙니다.
+
+아래 비중 중심 설명은 기존 세 전략의 가상매매에 해당합니다. 새 **모멘텀 수축 돌파 A/B/C 비교**는 계좌마다 현금·최대 10종목·수량·거래 비용을 적용합니다. 기존 가상 지수와 새 현금 계좌 평가액은 계산 방식이 다릅니다.
 
 목적:
 

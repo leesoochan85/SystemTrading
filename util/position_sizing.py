@@ -2,6 +2,20 @@
 import math
 
 
+def stop_risk_quantity(total_assets, price, stop_price, risk_ratio=0.005,
+                       buy_fee_rate=0.0, sell_cost_rate=0.0):
+    """Quantity from an explicit stop; prices may already include fill slippage."""
+    values = (total_assets, price, stop_price, risk_ratio, buy_fee_rate, sell_cost_rate)
+    if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in values):
+        raise ValueError("risk sizing requires finite numbers")
+    if total_assets <= 0 or price <= stop_price or stop_price <= 0 or not 0 < risk_ratio <= 1:
+        raise ValueError("invalid assets, entry, stop, or risk ratio")
+    if not 0 <= buy_fee_rate < 1 or not 0 <= sell_cost_rate < 1:
+        raise ValueError("invalid fee rate")
+    unit_loss = price * (1 + buy_fee_rate) - stop_price * (1 - sell_cost_rate)
+    return math.floor(total_assets * risk_ratio / unit_loss)
+
+
 def atr_risk_quantity(total_assets, price, entry_atr, risk_ratio=0.005,
                       initial_multiple=2.0):
     """초기 ATR 청산선에 체결된다는 가정에서 계획 손실액을 제한한다.

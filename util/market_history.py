@@ -15,10 +15,11 @@
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
+import math
 import time
 from typing import Dict, Iterable, Iterator
 
@@ -211,9 +212,11 @@ def _is_company_stock_name(code_name: str) -> bool:
     return not any(keyword in name for keyword in EXCLUDED_COMPANY_NAME_KEYWORDS)
 
 
-def load_company_stock_master(db_path: Path = DB_PATH) -> pd.DataFrame:
+def load_company_stock_master(db_path: Path = DB_PATH, read_only=False) -> pd.DataFrame:
     """32bit Kiwoom도 사용할 수 있도록 DB에 저장된 활성 기업주식 목록을 읽는다."""
-    with _connect(db_path) as con:
+    connection = (closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15))
+                  if read_only else _connect(db_path))
+    with connection as con:
         df = pd.read_sql_query(
             """
             SELECT code, code_name, market
@@ -688,6 +691,20 @@ def load_breakout_metrics(
         }
 
     return metrics
+
+
+def load_completed_close_sum(code, before_date, count, db_path=DB_PATH):
+    """Latest N completed closes, excluding the decision day; no padded history."""
+    if not isinstance(count, int) or count < 1:
+        return None
+    with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)) as con:
+        rows = con.execute(
+            "SELECT date, close FROM daily_price WHERE code=? AND date<? ORDER BY date DESC LIMIT ?",
+            (str(code).zfill(6), before_date, count),
+        ).fetchall()
+    if len(rows) != count or any(not math.isfinite(float(row[1])) or float(row[1]) <= 0 for row in rows):
+        return None
+    return {"close_sum": sum(float(row[1]) for row in rows), "latest_date": rows[0][0]}
 
 
 def load_daily_bar(

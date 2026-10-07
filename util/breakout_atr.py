@@ -7,6 +7,7 @@ ATR은 첫 14개 TR의 단순평균으로 시작하고 이후 Wilder 방식으�
 from __future__ import annotations
 
 from contextlib import closing
+from datetime import datetime
 from itertools import groupby
 from pathlib import Path
 import json
@@ -196,6 +197,36 @@ def atr_exit_signal(current_price, state):
         "condition_data": dict(state),
         "market_order": True,
     }
+
+
+def ma_profit_exit_signal(current_price, entry_price, state, previous_close_sum,
+                          ma_period=5, exit_ratio=0.97, now=None):
+    """Legacy 15:19 MA profit exit. This is an estimated MA, not a close signal."""
+    now = now or datetime.now()
+    updated = dict(state)
+    if not (151900 <= int(now.strftime("%H%M%S")) < 152000):
+        return None, updated
+    if previous_close_sum is None or not _positive(current_price) or not _positive(entry_price):
+        return None, updated
+    today = now.strftime("%Y%m%d")
+    if updated.get("ma_profit_date") != today:
+        reference = float(current_price)
+        estimated_ma = (float(previous_close_sum) + reference) / ma_period
+        updated.update(ma_profit_date=today, ma_reference_price=reference,
+                       ma_profit_period=ma_period, ma_profit_ratio=exit_ratio,
+                       ma_profit_stop=estimated_ma * exit_ratio)
+    if current_price <= entry_price or current_price > updated["ma_profit_stop"]:
+        return None, updated
+    return {
+        "reason_code": "MA_PROFIT_EXIT", "market_order": True,
+        "current_price": float(current_price),
+        "signal_reason": f"15:19 MA{updated['ma_profit_period']} × {updated['ma_profit_ratio']:.3f} 수익 청산선 도달",
+        "condition_data": {"entry_price": entry_price,
+                           "ma_reference_price": updated["ma_reference_price"],
+                           "ma_period": updated["ma_profit_period"],
+                           "exit_ratio": updated["ma_profit_ratio"],
+                           "ma_stop": updated["ma_profit_stop"]},
+    }, updated
 
 
 class AtrStateStore:

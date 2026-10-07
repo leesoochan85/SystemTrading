@@ -18,6 +18,7 @@ from util.market_history import (
     get_db_path as get_market_history_db_path,
     load_breakout_metrics,
     load_company_stock_master,
+    load_completed_close_sum,
 )
 from util.breakout_atr import (
     ATR_PERIOD as DEFAULT_ATR_PERIOD,
@@ -26,11 +27,15 @@ from util.breakout_atr import (
     AtrStateStore, load_atr_metrics, load_atr_history,
     new_atr_state, new_atr_state_from_value,
     advance_atr_state, atr_exit_signal,
+    ma_profit_exit_signal,
 )
+from util.strategy_settings import load_ma_settings_for_date, acknowledge_ma_settings
+from util.momentum_breakout import previous_market_date
 from util.notifier import send_message
 from util.time_helper import (
     check_adjacent_transaction_closed_for_buying,
     check_transaction_open,
+    is_market_business_day,
 )
 
 
@@ -80,6 +85,10 @@ class HighBreakoutStrategy(QThread):
         self.atr_history_date = None
         self.atr_history_cache = {}
         self.atr_state_cache = {}
+        self.ma_settings_date = None
+        self.active_ma_settings = None
+        self.ma_close_sum_cache = {}
+        self.ma_settings_db_path = self.market_history_db_path.parent / "strategy_settings.db"
         self.atr_state_store = AtrStateStore(
             self.market_history_db_path.parent / "breakout_atr_state.db"
         )
@@ -238,6 +247,7 @@ class HighBreakoutStrategy(QThread):
                 "신고가 계산 가능한 종목이 없습니다. "
                 f"최소 {MIN_HISTORY_DAYS}거래일을 구축하세요."
             )
+        self._ensure_ma_settings(now)
 
     def get_realtime_candidate_codes(self):
         """신규매수 가능 종목 + 이 전략 기존 보유종목."""
@@ -318,6 +328,7 @@ class HighBreakoutStrategy(QThread):
                 get_fid("고가"),
                 get_fid("저가"),
                 get_fid("누적거래량"),
+                get_fid("거래량"),
                 get_fid("(최우선)매도호가"),
                 get_fid("(최우선)매수호가"),
             ]
@@ -483,6 +494,50 @@ class HighBreakoutStrategy(QThread):
         )
         return atr_exit_signal(current_price, updated), updated
 
+    def _ensure_ma_settings(self, now=None):
+        now = now or datetime.now()
+        today = now.strftime("%Y%m%d")
+        if self.ma_settings_date == today:
+            return
+        if not is_market_business_day(now):
+            return
+        settings = load_ma_settings_for_date(today, db_path=self.ma_settings_db_path)
+        acknowledge_ma_settings(settings, today, db_path=self.ma_settings_db_path, now=now)
+        self.active_ma_settings = settings
+        self.ma_settings_date = today
+        self.ma_close_sum_cache.clear()
+        print(f"[HighBreakout] MA 청산 설정 적용: v{settings['revision']} / MA{settings['ma_period']} × {settings['exit_ratio']:.3f} / {today}")
+
+    def evaluate_sell_signal(self, code, current_price, entry_price, entry_at, state=None, now=None):
+        """Same ATR-first rules for live, legacy virtual, and cash-backed paper."""
+        now = now or datetime.now()
+        signal, updated = self.evaluate_atr_exit(code, current_price, entry_price, entry_at, state)
+        if signal:
+            return signal, updated
+        try:
+            self._ensure_ma_settings(now)
+            settings = self.active_ma_settings
+            if settings is None:
+                return None, updated
+            today = now.strftime("%Y%m%d")
+            if not (151900 <= int(now.strftime("%H%M%S")) < 152000):
+                return None, updated
+            key = (code, today, settings["ma_period"])
+            if key not in self.ma_close_sum_cache:
+                self.ma_close_sum_cache[key] = load_completed_close_sum(
+                    code, today, settings["ma_period"] - 1, db_path=self.market_history_db_path)
+            summary = self.ma_close_sum_cache[key]
+            previous_sum = summary["close_sum"] if summary and summary["latest_date"] == previous_market_date(today) else None
+            return ma_profit_exit_signal(current_price, entry_price, updated, previous_sum,
+                                         settings["ma_period"], settings["exit_ratio"], now)
+        except Exception as exc:
+            # A settings/MA database failure must never disable an existing ATR stop.
+            key = ("ma_settings", code)
+            if time.time() - self.last_signal_log_at.get(key, 0) >= 60:
+                print(f"[HighBreakout] MA 설정 적용 지연: {exc}")
+                self.last_signal_log_at[key] = time.time()
+            return None, updated
+
     def _get_buy_signal(self, code, tick=None):
         """순수 전략 매수조건만 판정한다. 주문 가능 여부는 여기서 판단하지 않는다."""
         self._ensure_daily_metrics()
@@ -614,6 +669,8 @@ class HighBreakoutStrategy(QThread):
             price=bid,
             rqname="send_buy_order",
             screen_no="2004",
+            entry_atr=signal["condition_data"]["atr14"],
+            initial_atr_multiple=self.INITIAL_ATR_MULTIPLIER,
         )
 
         if order is None:
@@ -679,7 +736,7 @@ class HighBreakoutStrategy(QThread):
             state = cached
             entry_at = state["entry_at"]
 
-        signal, updated = self.evaluate_atr_exit(
+        signal, updated = self.evaluate_sell_signal(
             code, current_price, entry_price, entry_at, state,
         )
         if updated != state:

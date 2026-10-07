@@ -3,6 +3,7 @@ from api.Kiwoom import *
 from strategy.HighBreakoutStrategy import HighBreakoutStrategy
 from strategy.PullbackTrendStrategy import PullbackTrendStrategy
 from strategy.ValueQualityStrategy import ValueQualityStrategy
+from strategy.MomentumContractionStrategy import MomentumContractionStrategy
 
 from strategy.StrategyManager import StrategyManager
 
@@ -41,12 +42,15 @@ print("ValueQuality 객체 생성 완료")
 
 print("전략 매니저 시작")
 
+momentum_contraction_strategy = MomentumContractionStrategy(kiwoom)
+
 manager = StrategyManager(
     kiwoom,
     [
         high_breakout_strategy,
         pullback_trend_strategy,
         value_quality_strategy,
+        momentum_contraction_strategy,
     ],
 )
 

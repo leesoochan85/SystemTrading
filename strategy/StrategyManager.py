@@ -39,6 +39,7 @@ from util.hankyung_report_helper import (
 )
 from util.virtual_strategy_engine import VirtualStrategyEngine
 from util.position_sizing import atr_risk_quantity
+from util.paper_trading import PROFILES as PAPER_PROFILES
 from util.virtual_trading import (
     init_virtual_trading_tables,
     save_virtual_strategy_daily_snapshots,
@@ -406,6 +407,10 @@ class StrategyManager(QObject):
         price = int(price or 0)
         self.last_buy_rejections.pop(code, None)
 
+        paper_strategy = next((s for s in self.strategies if s.strategy_name == strategy_name), None)
+        if strategy_name in PAPER_PROFILES or getattr(paper_strategy, "paper_only", False):
+            return self._set_buy_rejection(code, "가상 전용 전략의 실전 주문은 허용되지 않음")
+
         if buy_fee_rate is None:
             buy_fee_rate = self.DEFAULT_BUY_FEE_RATE
         buy_fee_rate = max(0.0, float(buy_fee_rate))
@@ -689,6 +694,10 @@ class StrategyManager(QObject):
             codes_override=union_codes,
             force_refresh=force_refresh,
         )
+        for strategy in active:
+            registered = getattr(strategy, "on_realtime_registered", None)
+            if callable(registered):
+                registered()
 
         print(
             "[StrategyManager] event-driven 공통 실시간 등록: "

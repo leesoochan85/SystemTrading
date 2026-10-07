@@ -41,6 +41,8 @@ class Kiwoom(QAxWidget):
         }
 
         self.stock_realtime_fid_names = {
+            "체결시간",
+            "거래량",
             "현재가",
             "시가",
             "고가",

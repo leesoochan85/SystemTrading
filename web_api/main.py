@@ -31,6 +31,7 @@ from .database import (
     get_virtual_strategy_index_history,
     get_virtual_event_summary,
     get_virtual_events,
+    get_paper_comparison,
 )
 from .strategies import (
     get_all_strategy_configs,
@@ -161,6 +162,15 @@ def strategies():
         )
 
     return {"items": result}
+
+
+@app.get("/api/strategies/{strategy_name}/paper-comparison")
+def paper_comparison(strategy_name: str, candidate_limit: int = Query(100, ge=1, le=200),
+                     trade_limit: int = Query(100, ge=1, le=200)):
+    config = _require_strategy(strategy_name)
+    if not config.get("paper_only"):
+        raise HTTPException(status_code=404, detail="가상 계좌 비교를 지원하지 않는 전략입니다")
+    return get_paper_comparison(candidate_limit, trade_limit)
 
 
 @app.get("/api/strategies/{strategy_name}")

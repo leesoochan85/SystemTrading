@@ -5,6 +5,7 @@ import time
 
 from util.db_helper import save_strategy_signal
 from util.time_helper import check_transaction_open
+from util.paper_strategy_engine import PaperComparisonEngine
 from util.virtual_trading import (
     bulk_update_virtual_positions,
     close_virtual_position,
@@ -39,6 +40,7 @@ class VirtualStrategyEngine:
         self.position_cache = {}
         self.dirty_position_keys = set()
         self.last_snapshot_at = 0.0
+        self.paper_engine = PaperComparisonEngine(strategies)
 
         self.reentry_guard_date = None
         self.entered_today_keys = set()
@@ -106,7 +108,7 @@ class VirtualStrategyEngine:
 
     def get_open_codes(self):
         """가상 보유 중인 종목을 실시간 등록 대상에 강제 포함하기 위해 반환한다."""
-        return sorted({code for _, code in self.position_cache.keys()})
+        return sorted({code for _, code in self.position_cache.keys()} | self.paper_engine.get_open_codes())
 
     def _get_cached_position(self, strategy_name, code):
         return self.position_cache.get(
@@ -178,6 +180,10 @@ class VirtualStrategyEngine:
         ]
 
         saved = bulk_update_virtual_positions(dirty_positions)
+        try:
+            saved += self.paper_engine.flush_snapshot_if_due(force=force)
+        except Exception as exc:
+            print(f"[VirtualStrategyEngine] 가상 비교 스냅샷 오류: {exc}")
 
         self.dirty_position_keys.clear()
         self.last_snapshot_at = now
@@ -196,7 +202,14 @@ class VirtualStrategyEngine:
         if current_price <= 0:
             return
 
+        try:
+            self.paper_engine.on_realtime_tick(code, tick)
+        except Exception as exc:
+            print(f"[VirtualStrategyEngine] 가상 비교 처리 오류 {code}: {exc}")
+
         for strategy in self.strategies.values():
+            if getattr(strategy, "paper_only", False):
+                continue
             if not getattr(strategy, "is_init_success", False):
                 continue
 

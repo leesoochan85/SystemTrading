@@ -25,7 +25,7 @@ export default function StrategyCard({ strategy }) {
 
       <div className="strategy-card__head">
         <div>
-          <span className="eyebrow">STRATEGY</span>
+          <span className="eyebrow">{strategy.paper_only ? "가상 계좌 · A/B/C 비교" : "STRATEGY"}</span>
           <div className="strategy-card__title-row">
             <h2>{strategy.display_name}</h2>
             {videoUrl && (

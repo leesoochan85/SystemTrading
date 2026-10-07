@@ -1,0 +1,36 @@
+{
+  "strategy": {
+    "momentum_mode": "video_low126",
+    "top_percent": 2.0,
+    "min_adr_pct": 3.5,
+    "min_avg_trading_value": 2000000000,
+    "consolidation_days": 20,
+    "prior_move_window": 60,
+    "min_prior_move_pct": 30.0,
+    "recent_range_days": 5,
+    "max_tr_ratio": 0.7,
+    "opening_range_minutes": 5,
+    "stop_atr_multiple": 1.0,
+    "partial_after_sessions": 4,
+    "partial_ratio": 0.3333333333333333,
+    "partial_only_profit": true,
+    "trailing_ma_period": 10
+  },
+  "account": {
+    "initial_cash": 10000000,
+    "risk_ratio": 0.005,
+    "max_position_ratio": 0.1,
+    "max_positions": 10,
+    "buy_fee_rate": 0.00035,
+    "sell_fee_rate": 0.00035,
+    "sell_tax_rate": 0.002,
+    "slippage_bps": 5.0
+  },
+  "provenance": {
+    "video": "C / MINL126; ADR % 20 days > 3.5 (previously inspected screen, no audio)",
+    "pdf": "Top 1-2%; higher lows/tightening range; opening range entry; day-low stop no wider than ATR/ADR; partial after 3-5 days; MA10/20 close exit",
+    "author_adr_formula": "https://qullamaggie.com/faq/ : 100 * (mean(high / low, 20) - 1)",
+    "experimental": "20-bar base, 60-bar prior-close low and 30% advance, 5/15-bar TR ratio 0.7, block-low test, 5-minute OR, day 4 and 1/3 partial, profit-only partial",
+    "costs": "Account cost rates and slippage are explicit simulation assumptions, not a statement of current brokerage fees or tax law. Set these to the account conditions before evaluating results."
+  }
+}

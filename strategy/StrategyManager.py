@@ -38,8 +38,8 @@ from util.hankyung_report_helper import (
     scan_new_hankyung_reports,
 )
 from util.virtual_strategy_engine import VirtualStrategyEngine
-from util.position_sizing import atr_risk_quantity
-from util.paper_trading import PROFILES as PAPER_PROFILES
+from util.const import get_fid
+from util.position_sizing import stop_risk_quantity
 from util.virtual_trading import (
     init_virtual_trading_tables,
     save_virtual_strategy_daily_snapshots,
@@ -56,19 +56,18 @@ from util.value_quality_data import (
 
 class StrategyManager(QObject):
     """
-    신고가/눌림목/저평가 우량주 실시간 전략을 통합 관리한다.
+    우량주/모멘텀 운영 전략과 A/B/C 가상 비교를 관리한다.
 
     핵심 자금 정책
     -------------
     1. 전략별 예산 배분 없음
     2. 모든 전략이 하나의 계좌 공용 현금을 사용
-    3. 신규 종목 1개당 총자산의 최대 10%까지 매수; 신고가 전략은 ATR 위험 한도도 적용
+    3. 신규 종목 1개당 총자산의 최대 10%까지 매수
     4. 계좌 전체 보유 + 신규매수 미체결 + Manager 예약 종목은 최대 10개
     5. SendOrder 직전에 Manager가 예산을 선예약하여 동시 주문의 중복 사용 방지
     """
 
     MAX_POSITION_RATIO = 0.10
-    BREAKOUT_RISK_RATIO = 0.005  # 초기 ATR 청산선 기준 계획 손실: 계좌 총자산의 0.5%
     MAX_ACCOUNT_POSITIONS = 10
     DEFAULT_BUY_FEE_RATE = 0.00035
 
@@ -394,8 +393,9 @@ class StrategyManager(QObject):
         rqname,
         screen_no,
         buy_fee_rate=None,
-        entry_atr=None,
-        initial_atr_multiple=None,
+        stop_price=None,
+        risk_ratio=None,
+        sell_cost_rate=0.0,
     ):
         """모든 전략의 신규 매수 요청이 통과해야 하는 단일 관문.
 
@@ -408,8 +408,11 @@ class StrategyManager(QObject):
         self.last_buy_rejections.pop(code, None)
 
         paper_strategy = next((s for s in self.strategies if s.strategy_name == strategy_name), None)
-        if strategy_name in PAPER_PROFILES or getattr(paper_strategy, "paper_only", False):
+        if paper_strategy is None or getattr(paper_strategy, "paper_only", False):
             return self._set_buy_rejection(code, "가상 전용 전략의 실전 주문은 허용되지 않음")
+
+        if strategy_name == "MomentumContractionStrategy" and not getattr(paper_strategy, "allow_new_buys", False):
+            return self._set_buy_rejection(code, "모멘텀 실계좌 신규매수 활성 설정 꺼짐")
 
         if buy_fee_rate is None:
             buy_fee_rate = self.DEFAULT_BUY_FEE_RATE
@@ -467,21 +470,15 @@ class StrategyManager(QObject):
 
             unit_cost = price * (1.0 + buy_fee_rate)
             quantity = int(buy_budget // unit_cost)
-
-            if strategy_name == "HighBreakoutStrategy":
-                try:
-                    risk_quantity = atr_risk_quantity(
-                        total_assets, price, entry_atr,
-                        risk_ratio=self.BREAKOUT_RISK_RATIO,
-                        initial_multiple=initial_atr_multiple,
-                    )
-                except (TypeError, ValueError, OverflowError) as exc:
-                    return self._set_buy_rejection(code, f"ATR 위험 수량 산정 실패: {exc}")
-                quantity = min(quantity, risk_quantity)
+            if strategy_name == "MomentumContractionStrategy":
+                if stop_price is None or risk_ratio is None:
+                    return self._set_buy_rejection(code, "모멘텀 실매수 손절/위험 설정 누락")
+                quantity = min(quantity, stop_risk_quantity(total_assets, price, stop_price,
+                    risk_ratio=risk_ratio, buy_fee_rate=buy_fee_rate, sell_cost_rate=sell_cost_rate))
 
             if quantity <= 0:
                 reason = (
-                    f"예산 또는 ATR 위험 한도로 1주 매수 불가 "
+                    f"예산 한도로 1주 매수 불가 "
                     f"(가격 {price:,}원 / 가용 {buy_budget:,}원)"
                 )
                 print(
@@ -540,7 +537,6 @@ class StrategyManager(QObject):
                 f"예약 {estimated_amount:,}원 / "
                 f"총자산 {total_assets:,}원 / "
                 f"종목한도 {max_position_amount:,}원 / "
-                f"ATR 위험한도 수량 {risk_quantity if strategy_name == 'HighBreakoutStrategy' else '해당 없음'}주 / "
                 f"남은 공용현금 {self.get_available_buy_cash():,}원"
             )
 
@@ -649,7 +645,7 @@ class StrategyManager(QObject):
     def get_event_realtime_union_codes(self, strategies=None):
         strategies = strategies or self.get_event_driven_strategies()
 
-        codes = set()
+        codes = set(self.virtual_strategy_engine.paper_engine.get_candidate_codes())
         for strategy in strategies:
             if not getattr(strategy, "is_init_success", False):
                 continue
@@ -686,14 +682,17 @@ class StrategyManager(QObject):
                 "event-driven 전략의 실시간 등록 가능 종목이 없습니다."
             )
 
-        # 두 전략이 동일 시장 종목을 감시하므로 SetRealReg는 한 전략을 통해
-        # 후보 합집합으로 한 번만 등록한다.
-        registrar = active[0]
-        registrar.set_universe_real_time(
-            register_market=True,
-            codes_override=union_codes,
-            force_refresh=force_refresh,
-        )
+        # Operational strategies and A/B/C paper accounts share one tick stream.
+        fid_names = ("체결시간", "현재가", "시가", "고가", "저가", "누적거래량", "거래량", "(최우선)매수호가", "(최우선)매도호가")
+        self.kiwoom.set_stock_realtime_fid_names(fid_names)
+        fids = ";".join(get_fid(name) for name in fid_names)
+        screens = (len(union_codes) + 89) // 90
+        if screens > 190:
+            raise RuntimeError("공통 실시간 화면 안전 한도 초과")
+        for index in range(0, len(union_codes), 90):
+            result = self.kiwoom.set_real_reg(str(7000 + index // 90), ";".join(union_codes[index:index + 90]), fids, "0")
+            if result not in (0, None):
+                raise RuntimeError(f"공통 실시간 등록 실패: {result}")
         for strategy in active:
             registered = getattr(strategy, "on_realtime_registered", None)
             if callable(registered):
@@ -1358,6 +1357,8 @@ class StrategyManager(QObject):
             if callable(getter):
                 codes.update(getter())
 
+        codes.update(self.virtual_strategy_engine.paper_engine.get_candidate_codes())
+        codes.update(self.virtual_strategy_engine.get_open_codes())
         return sorted(codes)
 
     def save_today_realtime_bars_to_shared_db(self, codes=None):
@@ -1496,6 +1497,7 @@ class StrategyManager(QObject):
             if failed:
                 return False
 
+            self.virtual_strategy_engine.paper_engine.get_candidate_codes(force=True)
             self.register_shared_event_realtime(
                 active,
                 force_refresh=True,

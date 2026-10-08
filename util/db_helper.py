@@ -1372,7 +1372,7 @@ def reduce_position_from_sell_fill(code, fill_quantity):
         ))
 
 # ---------------------------------------------------------------------------
-# PullbackTrendStrategy 실시간 실행 상태 저장
+# 과거 눌림목 상태는 DB에 기록 보존 (현재 운영하지 않음)
 # ---------------------------------------------------------------------------
 
 
@@ -1956,178 +1956,12 @@ def get_position_snapshots(strategy_name=None):
 
     return [dict(row) for row in rows]
 
-def init_pullback_runtime_table():
-    """눌림목 전략의 전고점 부분익절/다음날 거래량 비교 상태를 저장한다."""
-    with sqlite3.connect(MONITORING_DB) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS pullback_runtime_state (
-                code TEXT PRIMARY KEY,
-                strategy_name TEXT NOT NULL,
-                previous_high REAL,
-                high_touch_date TEXT,
-                high_touch_volume INTEGER NOT NULL DEFAULT 0,
-                partial_exit_requested INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            )
-        """)
 
 
-def save_pullback_runtime_state(
-    code,
-    strategy_name,
-    previous_high=None,
-    high_touch_date=None,
-    high_touch_volume=None,
-    partial_exit_requested=None,
-):
-    """
-    눌림목 전략 실행 상태를 저장한다.
-
-    None으로 전달된 값은 기존 값이 있으면 보존한다.
-    따라서 전고점 터치 당일에는 high_touch_volume만 계속 갱신할 수 있다.
-    """
-    init_pullback_runtime_table()
-
-    normalized_code = str(code).strip().upper().zfill(6)
-    now_text = _now_text()
-
-    with sqlite3.connect(MONITORING_DB) as con:
-        row = con.execute("""
-            SELECT
-                strategy_name,
-                previous_high,
-                high_touch_date,
-                high_touch_volume,
-                partial_exit_requested
-            FROM pullback_runtime_state
-            WHERE code = ?
-        """, (normalized_code,)).fetchone()
-
-        if row is None:
-            con.execute("""
-                INSERT INTO pullback_runtime_state (
-                    code,
-                    strategy_name,
-                    previous_high,
-                    high_touch_date,
-                    high_touch_volume,
-                    partial_exit_requested,
-                    updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                normalized_code,
-                str(strategy_name),
-                None if previous_high is None else float(previous_high),
-                None if high_touch_date is None else str(high_touch_date),
-                int(high_touch_volume or 0),
-                1 if bool(partial_exit_requested) else 0,
-                now_text,
-            ))
-            return
-
-        (
-            stored_strategy_name,
-            stored_previous_high,
-            stored_high_touch_date,
-            stored_high_touch_volume,
-            stored_partial_exit_requested,
-        ) = row
-
-        new_strategy_name = (
-            str(strategy_name)
-            if strategy_name not in (None, "")
-            else stored_strategy_name
-        )
-        new_previous_high = (
-            float(previous_high)
-            if previous_high is not None
-            else stored_previous_high
-        )
-
-        # high_touch_date는 신규 진입 시 명시적으로 None을 넣어 초기화해야 하는 경우가 있다.
-        # save_position 직후에는 기존 행을 먼저 delete한 뒤 저장하므로 None은 정상적으로 NULL 저장된다.
-        # 기존 행 업데이트에서 None은 "값 유지"로 취급한다.
-        new_high_touch_date = (
-            str(high_touch_date)
-            if high_touch_date is not None
-            else stored_high_touch_date
-        )
-        new_high_touch_volume = (
-            int(high_touch_volume)
-            if high_touch_volume is not None
-            else int(stored_high_touch_volume or 0)
-        )
-        new_partial_exit_requested = (
-            1 if bool(partial_exit_requested) else 0
-            if partial_exit_requested is not None
-            else int(stored_partial_exit_requested or 0)
-        )
-
-        con.execute("""
-            UPDATE pullback_runtime_state
-            SET
-                strategy_name = ?,
-                previous_high = ?,
-                high_touch_date = ?,
-                high_touch_volume = ?,
-                partial_exit_requested = ?,
-                updated_at = ?
-            WHERE code = ?
-        """, (
-            new_strategy_name,
-            new_previous_high,
-            new_high_touch_date,
-            new_high_touch_volume,
-            new_partial_exit_requested,
-            now_text,
-            normalized_code,
-        ))
 
 
-def get_pullback_runtime_state(code):
-    """종목의 눌림목 런타임 상태를 dict로 반환한다."""
-    init_pullback_runtime_table()
-
-    normalized_code = str(code).strip().upper().zfill(6)
-
-    with sqlite3.connect(MONITORING_DB) as con:
-        con.row_factory = sqlite3.Row
-        row = con.execute("""
-            SELECT
-                code,
-                strategy_name,
-                previous_high,
-                high_touch_date,
-                high_touch_volume,
-                partial_exit_requested,
-                updated_at
-            FROM pullback_runtime_state
-            WHERE code = ?
-        """, (normalized_code,)).fetchone()
-
-    if row is None:
-        return None
-
-    result = dict(row)
-    result["high_touch_volume"] = int(result.get("high_touch_volume") or 0)
-    result["partial_exit_requested"] = bool(
-        result.get("partial_exit_requested")
-    )
-    return result
 
 
-def delete_pullback_runtime_state(code):
-    """전량매도 완료 또는 신규 진입 초기화 시 눌림목 런타임 상태를 삭제한다."""
-    init_pullback_runtime_table()
-
-    normalized_code = str(code).strip().upper().zfill(6)
-
-    with sqlite3.connect(MONITORING_DB) as con:
-        con.execute(
-            "DELETE FROM pullback_runtime_state WHERE code = ?",
-            (normalized_code,),
-        )
 
 
 # ---------------------------------------------------------------------------

@@ -92,7 +92,7 @@ def replay(ticks_path, market_db_path, paper_db_path, config_path=None):
     # Exclusive reservation prevents an accidental overwrite/race with another run.
     fd = os.open(str(paper_db_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
-    engine = PaperComparisonEngine([strategy], paper_db_path, record_ticks=False)
+    engine = PaperComparisonEngine([strategy], paper_db_path, record_ticks=False, enable_baseline=False)
     current[0] = first[0]
     strategy.check_and_get_price_data()  # Persist first-day candidate diagnostics.
     registration, unknown = first[1], 0

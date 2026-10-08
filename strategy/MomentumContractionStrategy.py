@@ -66,8 +66,8 @@ class MomentumContractionStrategy:
         return sorted(code for code, metric in self.metrics.items() if metric["eligible"])
 
     def set_universe_real_time(self, register_market=True, codes_override=None, force_refresh=False):
-        # Normally HighBreakout performs the union registration. Also support a
-        # paper-only startup if it is the only strategy with sufficient history.
+        # StrategyManager performs shared registration, including A/B candidates.
+        # This method also supports standalone paper startup.
         if not register_market:
             return
         codes = sorted(set(codes_override or self.get_realtime_candidate_codes()))

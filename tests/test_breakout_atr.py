@@ -34,12 +34,12 @@ from util.breakout_atr import (
     new_atr_state_from_value,
 )
 from util.market_history import load_breakout_metrics
-from strategy.HighBreakoutStrategy import HighBreakoutStrategy
+from util.paper_breakout_baseline import PaperBreakoutBaseline
 
 
 class BreakoutAtrTest(unittest.TestCase):
     def test_180_day_breakout_buy_boundaries(self):
-        strategy = HighBreakoutStrategy(types.SimpleNamespace(), auto_init=False)
+        strategy = PaperBreakoutBaseline(types.SimpleNamespace(), auto_init=False)
         self.assertEqual(strategy.BREAKOUT_WINDOW, 180)
         strategy.metrics_date = datetime.now().strftime("%Y%m%d")
         strategy.breakout_metrics = {

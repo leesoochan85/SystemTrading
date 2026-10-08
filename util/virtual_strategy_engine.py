@@ -64,6 +64,8 @@ class VirtualStrategyEngine:
         self.position_cache = {}
 
         for position in get_all_virtual_positions():
+            if position.get("strategy_name") not in self.strategies:
+                continue
             key = self._position_key(
                 position.get("strategy_name"),
                 position.get("code"),
@@ -208,7 +210,7 @@ class VirtualStrategyEngine:
             print(f"[VirtualStrategyEngine] 가상 비교 처리 오류 {code}: {exc}")
 
         for strategy in self.strategies.values():
-            if getattr(strategy, "paper_only", False):
+            if getattr(strategy, "paper_only", False) or not getattr(strategy, "legacy_virtual", True):
                 continue
             if not getattr(strategy, "is_init_success", False):
                 continue
@@ -299,58 +301,7 @@ class VirtualStrategyEngine:
         signal = None
         state = {}
 
-        if name == "HighBreakoutStrategy":
-            signal = strategy._get_buy_signal(code, tick=tick)
-            if signal:
-                _, state = strategy.evaluate_atr_exit(
-                    code, current_price, current_price,
-                    datetime.now().strftime("%Y%m%d%H%M%S"),
-                )
-
-        elif name == "PullbackTrendStrategy":
-            metric = strategy._metric(code)
-            mas = strategy._dynamic_mas(code, current_price)
-            if not metric or mas is None:
-                return
-
-            ma5, ma20, ma60 = mas
-            if ma20 <= 0:
-                return
-
-            distance = current_price / ma20 * 100.0
-            if not (
-                ma5 > ma20 > ma60
-                and strategy.DISTANCE_MIN_PCT
-                <= distance
-                <= strategy.DISTANCE_MAX_PCT
-                and current_price >= ma20
-            ):
-                return
-
-            signal = {
-                "reason_code": "PULLBACK_ENTRY",
-                "signal_reason": (
-                    "MA5 > MA20 > MA60 정배열 + 20일선 눌림목 조건 충족"
-                ),
-                "current_price": current_price,
-                "condition_data": {
-                    "current_price": current_price,
-                    "ma5": ma5,
-                    "ma20": ma20,
-                    "ma60": ma60,
-                    "distance_pct": distance,
-                },
-            }
-            state = {
-                "previous_high": float(
-                    metric.get("previous_high", 0) or 0
-                ),
-                "high_touch_date": None,
-                "high_touch_volume": 0,
-                "partial_exit_requested": False,
-            }
-
-        elif name == "ValueQualityStrategy":
+        if name == "ValueQualityStrategy":
             if not strategy._is_qualified_candidate(code):
                 return
 
@@ -418,26 +369,6 @@ class VirtualStrategyEngine:
             (current_price - entry_price) / entry_price * 100.0
         )
 
-        if name == "HighBreakoutStrategy":
-            previous_state = position.get("state") or {}
-            signal, state = strategy.evaluate_sell_signal(
-                code, current_price, entry_price, position["entry_at"],
-                previous_state or None,
-            )
-            position["state"] = state
-            # 일별 청산선/초기 상태는 즉시 저장. 일반 현재가 갱신은 기존 5초 주기.
-            if state != previous_state:
-                update_virtual_position(
-                    name, code, current_price, state=state,
-                )
-            if signal:
-                return self._close(
-                    strategy, code, current_price,
-                    signal["reason_code"], signal["signal_reason"],
-                    1.0, signal["condition_data"],
-                )
-            return
-
         if name == "ValueQualityStrategy":
             if return_pct <= strategy.STOP_LOSS_PCT:
                 return self._close(
@@ -473,140 +404,6 @@ class VirtualStrategyEngine:
                     },
                 )
             return
-
-        if name != "PullbackTrendStrategy":
-            return
-
-        state = position.setdefault("state", {})
-
-        # 고정 손절은 과거 지표 유무와 무관하게 즉시 검사한다.
-        if return_pct <= strategy.STOP_LOSS_PCT:
-            return self._close(
-                strategy,
-                code,
-                current_price,
-                "STOP_LOSS",
-                (
-                    f"가상 수익률 {return_pct:.2f}% "
-                    f"<= {strategy.STOP_LOSS_PCT:.0f}%"
-                ),
-                1.0,
-                {
-                    "entry_price": entry_price,
-                    "return_pct": return_pct,
-                },
-            )
-
-        metric = strategy._metric(code)
-        if not metric:
-            return
-
-        mas = strategy._dynamic_mas(code, current_price)
-        if mas is not None:
-            _, ma20, _ = mas
-            if current_price < ma20:
-                return self._close(
-                    strategy,
-                    code,
-                    current_price,
-                    "MA20_BREAKDOWN",
-                    f"현재가 {current_price:,.0f}원 < MA20 {ma20:,.1f}원",
-                    1.0,
-                    {
-                        "entry_price": entry_price,
-                        "return_pct": return_pct,
-                        "ma20": ma20,
-                    },
-                )
-
-        if strategy._bearish_volume_exit(code, tick):
-            return self._close(
-                strategy,
-                code,
-                current_price,
-                "BEARISH_VOLUME",
-                "전일 대비 거래량 15% 이상 증가 + 음봉",
-                1.0,
-                {
-                    "entry_price": entry_price,
-                    "return_pct": return_pct,
-                },
-            )
-
-        today = datetime.now().strftime("%Y%m%d")
-        previous_high = float(
-            state.get("previous_high")
-            or metric.get("previous_high", 0)
-            or 0
-        )
-
-        # 전고점 도달 당일 누적거래량은 메모리에서만 계속 최신화한다.
-        # 5초 스냅샷 때 state_json과 함께 DB에 저장된다.
-        if state.get("high_touch_date") == today:
-            state["high_touch_volume"] = int(
-                tick.get("누적거래량", 0) or 0
-            )
-            self.dirty_position_keys.add(
-                self._position_key(name, code)
-            )
-
-        if (
-            state.get("partial_exit_requested")
-            and strategy._is_next_day_volume_fade(code, tick, state)
-        ):
-            return self._close(
-                strategy,
-                code,
-                current_price,
-                "NEXT_DAY_VOLUME_FADE",
-                "전고점 도달 다음 거래일 거래량 감소",
-                float(position.get("remaining_ratio") or 1.0),
-                {
-                    "entry_price": entry_price,
-                    "return_pct": return_pct,
-                },
-            )
-
-        if (
-            previous_high > 0
-            and current_price >= previous_high
-            and not state.get("partial_exit_requested")
-        ):
-            closed = self._close(
-                strategy,
-                code,
-                current_price,
-                "PREVIOUS_HIGH_PARTIAL_EXIT",
-                "전고점 도달 30% 부분매도",
-                strategy.PARTIAL_EXIT_RATIO,
-                {
-                    "entry_price": entry_price,
-                    "return_pct": return_pct,
-                    "previous_high": previous_high,
-                },
-            )
-
-            if closed:
-                remaining_position = self._get_cached_position(name, code)
-                if remaining_position:
-                    state = remaining_position.setdefault("state", {})
-                    state["high_touch_date"] = today
-                    state["high_touch_volume"] = int(
-                        tick.get("누적거래량", 0) or 0
-                    )
-                    state["partial_exit_requested"] = True
-
-                    # 부분청산 여부는 재시작 후에도 반드시 유지돼야 하므로
-                    # 이 이벤트 순간에는 5초를 기다리지 않고 즉시 저장한다.
-                    update_virtual_position(
-                        name,
-                        code,
-                        current_price,
-                        state=state,
-                    )
-                    self.dirty_position_keys.discard(
-                        self._position_key(name, code)
-                    )
 
     def _close(
         self,

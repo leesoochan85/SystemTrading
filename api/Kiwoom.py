@@ -25,6 +25,8 @@ class Kiwoom(QAxWidget):
         self.balance={}
         self.universe_realtime_transaction_info = {}
         self.pending_order_strategy = {}
+        self.order_listeners = []
+        self.pending_order_intents = {}
 
         # 주식체결 실시간 틱을 전략이 직접 구독할 수 있도록 한다.
         # ORBStrategy는 09:00~09:04:59 틱만 집계해 첫 5분봉을 정확히 확정한다.
@@ -588,6 +590,8 @@ class Kiwoom(QAxWidget):
         if strategy_name:
             self.pending_order_strategy[code] = strategy_name
 
+        if order_type in (1, 2):
+            self.pending_order_intents[code] = {"rqname": rqname, "strategy_name": strategy_name, "order_no": ""}
         order_result = self.dynamicCall("SendOrder(QString, QString, QString, int, QString, int, int, QString, QString)",
                                          [rqname, screen_no, self.account_number, order_type, code, order_quantity, order_price, order_classification, origin_order_number])
 
@@ -599,8 +603,22 @@ class Kiwoom(QAxWidget):
             order_status="전송요청" if order_result == 0 else f"전송실패({order_result})",
             event_type="REQUESTED" if order_result == 0 else "FAILED",
         )
+        if order_result != 0 and order_type in (1, 2):
+            self.pending_order_intents.pop(code, None)
         return order_result
     
+    def add_order_listener(self, callback):
+        if callback not in self.order_listeners:
+            self.order_listeners.append(callback)
+
+    def _emit_order_event(self, event):
+        for callback in list(self.order_listeners):
+            try:
+                callback(event)
+            except Exception as exc:
+                # Keep broker balance/position recording alive; operator can inspect persistent state.
+                print(f"[Kiwoom] 전략 체결 상태 저장 실패 {event['code']}: {exc}")
+
     def _on_receive_msg(self, screen_no, rqname, trcode, msg):
         print("[Kiwoom] _on_receive_msg is called {} / {} / {} / {}".format(screen_no, rqname, trcode, msg))
 
@@ -772,6 +790,20 @@ class Kiwoom(QAxWidget):
                     )
                     
                 order_type = str(order_info.get("주문구분", "")).strip().lstrip("+").lstrip("-")
+                intent = self.pending_order_intents.get(code, {})
+                if not intent.get("order_no") and order_no and order_type in ("매수", "매도"):
+                    intent["order_no"] = order_no
+                intent_matches = bool(intent) and intent.get("order_no") == order_no
+                from datetime import datetime
+                self._emit_order_event({"code": code, "order_type": order_type,
+                    "strategy_name": position_info["strategy_name"] if position_info else strategy_name,
+                    "order_no": order_no, "original_order_no": str(order_info.get("원주문번호") or ""),
+                    "fill_no": fill_no, "fill_quantity": fill_quantity_for_db, "fill_price": executed_price,
+                    "remaining": left_quantity, "status": order_status,
+                    "rqname": intent.get("rqname", "") if intent_matches else "",
+                    "at": datetime.now().strftime("%Y%m%d%H%M%S")})
+                if intent_matches and (left_quantity == 0 or "거부" in order_status):
+                    self.pending_order_intents.pop(code, None)
 
         elif int(s_gubun) == 1:
             print("* 잔고 출력(self.balance)")

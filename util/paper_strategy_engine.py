@@ -7,6 +7,7 @@ import os
 import time
 
 from util.breakout_atr import new_atr_state_from_value
+from util.paper_breakout_baseline import PaperBreakoutBaseline
 from util.momentum_breakout import momentum_exit
 from util.paper_trading import PaperBroker, BASELINE, FILTERED, MOMENTUM
 from util.paper_tick_recorder import PaperTickRecorder
@@ -14,9 +15,12 @@ from util.time_helper import check_adjacent_transaction_closed_for_buying, check
 
 
 class PaperComparisonEngine:
-    def __init__(self, strategies, db_path=None, record_ticks=True):
+    def __init__(self, strategies, db_path=None, record_ticks=True, enable_baseline=True):
         self.momentum = next((s for s in strategies if s.strategy_name == MOMENTUM), None)
-        self.baseline = next((s for s in strategies if s.strategy_name == "HighBreakoutStrategy"), None)
+        self.baseline = next((s for s in strategies if isinstance(s, PaperBreakoutBaseline)), None)
+        if self.baseline is None and self.momentum and enable_baseline:
+            self.baseline = PaperBreakoutBaseline(market_db_path=self.momentum.market_history_db_path, clock=self.momentum.clock)
+        self.baseline_retry_after = 0.0
         self.broker = None
         self.last_snapshot_at = 0.0
         self.dirty = False
@@ -33,6 +37,29 @@ class PaperComparisonEngine:
                     self.tick_recorder = PaperTickRecorder(os.environ["SYSTEMTRADING_PAPER_TICK_CSV"])
                 except (OSError, ValueError) as exc:
                     print(f"[PaperComparison] 틱 기록 시작 실패: {exc}")
+
+    def prepare_baseline(self, force=False):
+        if not self.baseline:
+            return
+        if not force and time.monotonic() < self.baseline_retry_after:
+            return
+        try:
+            if not self.baseline.universe:
+                self.baseline.check_and_get_universe()
+            if force:
+                self.baseline.check_and_get_price_data()
+            else:
+                self.baseline._ensure_daily_metrics()
+            self.baseline.is_init_success = True
+            self.baseline_retry_after = 0.0
+        except Exception as exc:
+            self.baseline.is_init_success = False
+            self.baseline_retry_after = time.monotonic() + 60
+            print(f"[PaperComparison] A/B 기준값 준비 실패 (C 손절 관리 유지): {exc}")
+
+    def get_candidate_codes(self, force=False):
+        self.prepare_baseline(force=force)
+        return self.baseline.get_realtime_candidate_codes() if self.baseline and self.baseline.is_init_success else []
 
     def _record_tick(self, code, tick, now):
         if not self.tick_recorder:
@@ -71,6 +98,7 @@ class PaperComparisonEngine:
                 self.momentum.metrics = {}
                 self.metrics_retry_after = time.monotonic() + 60
                 print(f"[PaperComparison] 후보 갱신 실패: {exc}")
+        self.prepare_baseline()
         self._record_tick(code, tick, now)
         day = now.strftime("%Y%m%d")
         if self.tick_date != day:

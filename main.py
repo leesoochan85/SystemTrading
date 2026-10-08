@@ -1,61 +1,18 @@
-from api.Kiwoom import *
-
-from strategy.HighBreakoutStrategy import HighBreakoutStrategy
-from strategy.PullbackTrendStrategy import PullbackTrendStrategy
+from PyQt5.QtWidgets import QApplication
+from api.Kiwoom import Kiwoom
 from strategy.ValueQualityStrategy import ValueQualityStrategy
-from strategy.MomentumContractionStrategy import MomentumContractionStrategy
-
 from strategy.StrategyManager import StrategyManager
-
 import sys
+import os
+from strategy.LiveMomentumContractionStrategy import LiveMomentumContractionStrategy
 
 app = QApplication(sys.argv)
-
 kiwoom = Kiwoom()
-
-print("HighBreakout 객체 생성 시작")
-
-high_breakout_strategy = HighBreakoutStrategy(
-    kiwoom,
-    auto_init=False,
-)
-
-print("HighBreakout 객체 생성 완료")
-
-print("PullbackTrend 객체 생성 시작")
-
-pullback_trend_strategy = PullbackTrendStrategy(
-    kiwoom,
-    auto_init=False,
-)
-
-print("PullbackTrend 객체 생성 완료")
-
-print("ValueQuality 객체 생성 시작")
-
-value_quality_strategy = ValueQualityStrategy(
-    kiwoom,
-    auto_init=False,
-)
-
-print("ValueQuality 객체 생성 완료")
-
-print("전략 매니저 시작")
-
-momentum_contraction_strategy = MomentumContractionStrategy(kiwoom)
-
-manager = StrategyManager(
-    kiwoom,
-    [
-        high_breakout_strategy,
-        pullback_trend_strategy,
-        value_quality_strategy,
-        momentum_contraction_strategy,
-    ],
-)
-
+value_quality_strategy = ValueQualityStrategy(kiwoom, auto_init=False)
+# Existing live momentum holdings remain managed even when new buys are disabled.
+momentum_contraction_strategy = LiveMomentumContractionStrategy(
+    kiwoom, allow_new_buys=os.getenv("SYSTEMTRADING_MOMENTUM_LIVE") == "1")
+print("[Momentum] 증권사 신규매수 활성" if momentum_contraction_strategy.allow_new_buys else "[Momentum] 신규매수 중지 · 기존 실보유 매도관리 유지")
+manager = StrategyManager(kiwoom, [value_quality_strategy, momentum_contraction_strategy])
 manager.start()
-
-print("전략 매니저 시작 완료")
-
 app.exec_()

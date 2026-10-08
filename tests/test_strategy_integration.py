@@ -11,7 +11,7 @@ from unittest.mock import Mock, patch
 from paper_fixture import history, market_db, qt_stubs
 qt_stubs()
 
-from strategy.HighBreakoutStrategy import HighBreakoutStrategy
+from util.paper_breakout_baseline import PaperBreakoutBaseline
 from strategy.MomentumContractionStrategy import MomentumContractionStrategy
 from strategy.StrategyManager import StrategyManager
 from util.breakout_atr import ma_profit_exit_signal, load_atr_metrics, new_atr_state_from_value
@@ -33,7 +33,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.momentum = MomentumContractionStrategy(self.kiwoom, market_db_path=self.path, clock=lambda: self.now)
         self.momentum.check_and_get_universe()
         self.momentum.is_init_success = True
-        self.high = HighBreakoutStrategy(self.kiwoom, auto_init=False)
+        self.high = PaperBreakoutBaseline(self.kiwoom, auto_init=False)
         self.high.market_history_db_path = self.path
         self.high.ma_settings_db_path = Path(self.directory.name) / "settings.db"
         self.high.universe = self.momentum.universe
@@ -179,24 +179,11 @@ class StrategyIntegrationTest(unittest.TestCase):
             self.assertIn("가상 전용", manager.last_buy_rejections["000001"])
         self.kiwoom.send_order.assert_not_called()
 
-    def test_existing_live_buy_supplies_atr_for_manager_sizing(self):
-        self.high.buy_order_handler = Mock(return_value={"quantity": 5})
-        self.high.atr_state_store = Mock()
-        self.high.order_guard = lambda: True
-        with patch("strategy.HighBreakoutStrategy.check_transaction_open", return_value=True), \
-             patch("strategy.HighBreakoutStrategy.check_adjacent_transaction_closed_for_buying", return_value=False), \
-             patch("strategy.HighBreakoutStrategy.save_strategy_signal", return_value="fixture"), \
-             patch("strategy.HighBreakoutStrategy.update_strategy_signal_order_result"), \
-             patch("strategy.HighBreakoutStrategy.save_position_strategy"):
-            self.high.check_buy_signal_and_order("000001", {"현재가": 16600, "누적거래량": 250000, "(최우선)매수호가": 16590})
-        arguments = self.high.buy_order_handler.call_args.kwargs
-        self.assertEqual(arguments["entry_atr"], self.high.breakout_metrics["000001"]["atr14"])
-        self.assertEqual(arguments["initial_atr_multiple"], 2)
-
     def test_legacy_virtual_processing_survives_paper_failure(self):
         virtual = VirtualStrategyEngine.__new__(VirtualStrategyEngine)
         virtual.paper_engine = SimpleNamespace(on_realtime_tick=Mock(side_effect=RuntimeError("fixture failure")))
-        virtual.strategies = {self.high.strategy_name: self.high}
+        value = SimpleNamespace(strategy_name="ValueQualityStrategy", is_init_success=True, universe={"000001": {}})
+        virtual.strategies = {value.strategy_name: value}
         virtual._get_cached_position = Mock(return_value=None)
         virtual._process_strategy = Mock()
         with patch("util.virtual_strategy_engine.check_transaction_open", return_value=True):

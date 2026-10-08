@@ -1,6 +1,8 @@
+import StrategySourceLink from "../components/StrategySourceLink";
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { getPaperComparison } from "../api/tradingApi";
+import MaSettingsPanel from "../components/MaSettingsPanel";
+import { getStrategy, getPaperComparison } from "../api/tradingApi";
 
 const PROFILES = [
   ["HighBreakoutBaselinePaper", "A · 기존 신고가", "#5b8def"],
@@ -56,14 +58,15 @@ function ComparisonChart({ items }) {
 export default function MomentumPage() {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
+  const [maSettings, setMaSettings] = useState(null);
   useEffect(() => {
     let active = true, busy = false;
     const load = async () => {
       if (busy) return;
       busy = true;
       try {
-        const result = await getPaperComparison();
-        if (active) { setData(result); setError(""); }
+        const [result, detail] = await Promise.all([getPaperComparison(), getStrategy("MomentumContractionStrategy")]);
+        if (active) { setData(result); setMaSettings(detail.ma_settings); setError(""); }
       } catch (e) { if (active) setError(e.message); }
       finally { busy = false; }
     };
@@ -76,7 +79,7 @@ export default function MomentumPage() {
   const costs = c?.costs;
   return <main className="page-shell">
     <Link className="back" to="/">← 전체 전략</Link>
-    <header className="detail-head"><div><span className="eyebrow">가상 계좌 · A/B/C 비교</span><h1>모멘텀 수축 돌파</h1><p>같은 초기 자금·보유 한도·거래 비용을 적용한 세 계좌를 비교합니다.</p></div></header>
+    <header className="detail-head"><div><span className="eyebrow">가상 계좌 · A/B/C 비교</span><h1>모멘텀 수축 돌파</h1><StrategySourceLink name="MomentumContractionStrategy" /><p>같은 초기 자금·보유 한도·거래 비용을 적용한 세 계좌를 비교합니다.</p></div></header>
     {error && <div className="error-box">{error}</div>}
     {!data?.ready && <div className="metric-note">매매 프로그램을 실행하면 가상 계좌와 후보가 준비됩니다.</div>}
     <section className="summary-strip">
@@ -97,7 +100,8 @@ export default function MomentumPage() {
       </tbody></table></div>
       <p className="metric-note">A/B는 기존 ATR·장 마감 전 예상 MA 청산을 사용하고, C는 당일 저가 손절·부분 매도·확정 종가 MA 청산을 사용합니다. 완료 거래는 잔량까지 전부 청산된 진입 건입니다. MDD는 5초 간격으로 기록한 평가액 기준입니다.</p>
     </section>
-    <section className="panel"><div className="panel-title"><h2>적용 조건</h2><span>실전 주문 차단</span></div>
+    {maSettings && <MaSettingsPanel name="MomentumContractionStrategy" status={maSettings} onSaved={setMaSettings} />}
+    <section className="panel"><div className="panel-title"><h2>적용 조건</h2><span>C는 가상 계좌 · 실제 주문 모드는 매매 프로세스에서 설정</span></div>
       {rules && <p>{rules.momentum_mode === "video_low126" ? "126거래일 최저가 대비 상승" : "21·63·126거래일 수익률"} 상위 {rules.top_percent}% · ADR(20) &gt; {rules.min_adr_pct}% · 첫 {rules.opening_range_minutes}분 고가 돌파 · ATR {rules.stop_atr_multiple}배 이내 손절 · {rules.partial_after_sessions}거래일 후 약 {(rules.partial_ratio * 100).toFixed(1)}% 부분 매도 · MA{rules.trailing_ma_period} 확정 종가 청산</p>}
       {rules && <p className="metric-note">횡보 {rules.consolidation_days}일, 최근 {rules.recent_range_days}일 TR 비율 {rules.max_tr_ratio}, 선행 상승 {rules.min_prior_move_pct}%와 저점 블록 비교는 자동 판정을 위한 실험값입니다.</p>}
       {costs && <p className="metric-note">비용 가정: 매수 {costPercent(costs.buy_fee_rate)} · 매도 수수료 {costPercent(costs.sell_fee_rate)} · 매도 세금 {costPercent(costs.sell_tax_rate)} · 체결 슬리피지 {costs.slippage_bps}bp. 실제 계좌 비용·현행 세율을 보장하는 값이 아닙니다.</p>}

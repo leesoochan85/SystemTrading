@@ -1,4 +1,4 @@
-"""신고가 MA 수익청산 설정: 웹 저장, 매매 프로세스의 다음 거래일 적용."""
+"""A/B 비교 MA 수익청산 설정: 기존 DB revision 유지, 다음 거래일 적용."""
 from __future__ import annotations
 
 import math
@@ -77,7 +77,7 @@ def get_ma_settings_status(db_path=SETTINGS_DB):
         "saved": saved,
         "applied": active,
         "pending": saved["revision"] > (active["revision"] if active else 0),
-        "effective_policy": "저장한 날짜 이후 첫 거래일에 매매 프로세스가 적용",
+        "effective_policy": "저장한 날짜 이후 첫 거래일에 A/B 비교 엔진이 적용",
     }
 
 

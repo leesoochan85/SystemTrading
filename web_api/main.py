@@ -168,7 +168,7 @@ def strategies():
 def paper_comparison(strategy_name: str, candidate_limit: int = Query(100, ge=1, le=200),
                      trade_limit: int = Query(100, ge=1, le=200)):
     config = _require_strategy(strategy_name)
-    if not config.get("paper_only"):
+    if not config.get("supports_paper_comparison"):
         raise HTTPException(status_code=404, detail="가상 계좌 비교를 지원하지 않는 전략입니다")
     return get_paper_comparison(candidate_limit, trade_limit)
 
@@ -180,7 +180,7 @@ def strategy_detail(strategy_name: str):
 
     return {
         **config,
-        **({"ma_settings": get_ma_settings_status()} if strategy_name == "HighBreakoutStrategy" else {}),
+        **({"ma_settings": get_ma_settings_status()} if strategy_name == "MomentumContractionStrategy" else {}),
         "virtual_performance": get_virtual_performance(strategy_name),
         "virtual_positions": get_virtual_positions(strategy_name),
         "today_virtual_events": get_virtual_event_summary(
@@ -197,8 +197,8 @@ class MaSettingsUpdate(BaseModel):
 
 def _require_breakout(strategy_name: str):
     _require_strategy(strategy_name)
-    if strategy_name != "HighBreakoutStrategy":
-        raise HTTPException(status_code=404, detail="이 전략에는 MA 청산 설정이 없습니다")
+    if strategy_name != "MomentumContractionStrategy":
+        raise HTTPException(status_code=404, detail="이 전략에는 A/B 비교 MA 청산 설정이 없습니다")
 
 
 @app.get("/api/strategies/{strategy_name}/ma-settings")

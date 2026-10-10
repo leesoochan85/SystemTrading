@@ -11,7 +11,7 @@ from util.db_helper import (
     save_strategy_signal,
     update_strategy_signal_order_result,
 )
-from util.notifier import send_message
+from util.notifier import send_error, send_message
 from util.time_helper import (
     check_adjacent_transaction_closed_for_buying,
     check_transaction_open,
@@ -143,8 +143,7 @@ class ValueQualityStrategy(QThread):
 
         except Exception:
             error_msg = traceback.format_exc()
-            print(error_msg)
-            send_message(error_msg)
+            send_error(error_msg, event_key='strategy.ValueQualityStrategy.init_strategy')
 
     def check_and_get_universe(
         self,
@@ -946,12 +945,14 @@ class ValueQualityStrategy(QThread):
                 f"Kiwoom SendOrder 실패 result={result}",
             )
 
-            send_message(
+            send_error(
                 f"[저평가 우량주 매도 실패] "
                 f"{self.universe[code].get('code_name', code)}"
                 f"({code}) "
                 f"{quantity}주 / "
-                f"{reason} / result={result}"
+                f"{reason} / result={result}",
+                event_key=f"strategy.ValueQualityStrategy.order_sell:{code}",
+                error_identity=f"SendOrder:{result}",
             )
             return False
 

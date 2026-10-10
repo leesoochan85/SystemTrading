@@ -53,6 +53,7 @@ def qt_stubs():
             setattr(core, name, type(name, (), {}))
     notifier = sys.modules.setdefault("util.notifier", types.ModuleType("util.notifier"))
     notifier.send_message = lambda *args, **kwargs: None
+    notifier.send_error = lambda *args, **kwargs: None
     notifier.get_updates = lambda *args, **kwargs: []
 
 

@@ -23,6 +23,7 @@ if "PyQt5.QtCore" not in sys.modules:
 if "util.notifier" not in sys.modules:
     notifier = types.ModuleType("util.notifier")
     notifier.send_message = lambda *args, **kwargs: None
+    notifier.send_error = lambda *args, **kwargs: None
     sys.modules["util.notifier"] = notifier
 
 from util.breakout_atr import (

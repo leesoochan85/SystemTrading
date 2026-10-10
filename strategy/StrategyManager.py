@@ -10,7 +10,7 @@ from util.time_helper import (
     check_transaction_closed,
     milliseconds_until_market_open,
 )
-from util.notifier import send_message, get_updates
+from util.notifier import send_error, send_message, get_updates
 from util.const import Telegram_chat_ID
 from util.market_history import (
     build_realtime_daily_bars,
@@ -118,9 +118,6 @@ class StrategyManager(QObject):
         self.last_account_failure_log_at = 0
         self.account_failure_log_interval = 30
         self.failed_account_retry_interval = 10
-
-        self.last_deposit_failure_notice_at = 0
-        self.deposit_failure_notice_interval = 60
 
         self.market_history_db_path = get_market_history_db_path()
         self.market_data_ready = False
@@ -551,10 +548,10 @@ class StrategyManager(QObject):
         except Exception:
             self.reserved_buy_orders.pop(code, None)
             error_msg = traceback.format_exc()
-            print(error_msg)
-            send_message(
+            send_error(
                 f"[StrategyManager 매수요청 오류] "
-                f"{code_name}({code}) / {strategy_name}\n{error_msg}"
+                f"{code_name}({code}) / {strategy_name}\n{error_msg}",
+                event_key=f"strategy.StrategyManager.request_buy_order:{code}",
             )
             self._set_buy_rejection(code, "StrategyManager 매수 요청 처리 중 예외 발생")
             return None
@@ -578,18 +575,11 @@ class StrategyManager(QObject):
         ):
             self.deposit_state_safe = False
 
-            now = time.time()
-            if (
-                now - self.last_deposit_failure_notice_at
-                >= self.deposit_failure_notice_interval
-            ):
-                message = (
-                    "[안전 중지] 주문가능금액 조회 실패 - "
-                    "마지막 정상 금액을 유지하고 신규 주문을 중단합니다."
-                )
-                print(f"[StrategyManager] {message}")
-                send_message(message)
-                self.last_deposit_failure_notice_at = now
+            send_error(
+                "[안전 중지] 주문가능금액 조회 실패 - "
+                "마지막 정상 금액을 유지하고 신규 주문을 중단합니다.",
+                event_key="strategy.StrategyManager.sync_deposit_from_kiwoom",
+            )
 
             return False
 
@@ -787,9 +777,9 @@ class StrategyManager(QObject):
                 except Exception:
                     strategy.is_init_success = False
                     error_msg = traceback.format_exc()
-                    print(error_msg)
-                    send_message(
-                        f"[{strategy.strategy_name} 초기화 실패]\n{error_msg}"
+                    send_error(
+                        f"[{strategy.strategy_name} 초기화 실패]\n{error_msg}",
+                        event_key=f"strategy.StrategyManager.initialize_strategies:{strategy.strategy_name}",
                     )
 
             ready = [
@@ -826,8 +816,7 @@ class StrategyManager(QObject):
             self.is_initialized = False
             self.market_data_ready = False
             error_msg = traceback.format_exc()
-            print(error_msg)
-            send_message(error_msg)
+            send_error(error_msg, event_key='strategy.StrategyManager.initialize_strategies')
 
     # ------------------------------------------------------------------
     # 계좌/미체결 동기화
@@ -995,16 +984,17 @@ class StrategyManager(QObject):
                         f"잔량 {remain_qty}주 / 전략: {strategy_name}"
                     )
                 else:
-                    send_message(
+                    send_error(
                         f"[매수 미체결 자동취소 실패] "
                         f"{self.get_code_name(code)}({code}) "
-                        f"result={result}"
+                        f"result={result}",
+                        event_key=f"strategy.StrategyManager.cancel_stale_buy_orders:{code}",
+                        error_identity=f"SendOrder:{result}",
                     )
 
             except Exception:
                 error_msg = traceback.format_exc()
-                print(error_msg)
-                send_message(error_msg)
+                send_error(error_msg, event_key=f"strategy.StrategyManager.cancel_stale_buy_orders:{code}")
 
     def cleanup_cancelled_buy_positions(self):
         for code, cancel_info in list(
@@ -1058,8 +1048,7 @@ class StrategyManager(QObject):
 
             except Exception:
                 error_msg = traceback.format_exc()
-                print(error_msg)
-                send_message(error_msg)
+                send_error(error_msg, event_key=f"strategy.StrategyManager.cleanup_cancelled_buy_positions:{code}")
 
     def sync_position_quantities_from_balance(self):
         """
@@ -1264,11 +1253,11 @@ class StrategyManager(QObject):
                 callback(code)
             except Exception:
                 error_msg = traceback.format_exc()
-                print(error_msg)
-                send_message(
+                send_error(
                     f"[전략 포지션 종료 후처리 실패] "
                     f"{strategy_name} / {code}\n"
-                    f"{error_msg}"
+                    f"{error_msg}",
+                    event_key=f"strategy.StrategyManager.notify_strategy_position_closed:{code}",
                 )
             return
 
@@ -1335,8 +1324,7 @@ class StrategyManager(QObject):
 
             except Exception:
                 error_msg = traceback.format_exc()
-                print(error_msg)
-                send_message(error_msg)
+                send_error(error_msg, event_key=f"strategy.StrategyManager.cleanup_sold_positions:{code}")
 
     # ------------------------------------------------------------------
     # 일봉 갱신
@@ -1488,10 +1476,10 @@ class StrategyManager(QObject):
                 except Exception:
                     failed.append(strategy.strategy_name)
                     error_msg = traceback.format_exc()
-                    print(error_msg)
-                    send_message(
+                    send_error(
                         f"[유니버스/일봉 갱신 실패] "
-                        f"{strategy.strategy_name}\n{error_msg}"
+                        f"{strategy.strategy_name}\n{error_msg}",
+                        event_key=f"strategy.StrategyManager.refresh_daily_price_data_after_close:{strategy.strategy_name}",
                     )
 
             if failed:
@@ -2427,5 +2415,4 @@ class StrategyManager(QObject):
 
         except Exception:
             error_msg = traceback.format_exc()
-            print(error_msg)
-            send_message(error_msg)
+            send_error(error_msg, event_key='strategy.StrategyManager.step')

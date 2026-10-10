@@ -23,6 +23,56 @@ from util.virtual_strategy_engine import VirtualStrategyEngine
 
 
 class StrategyIntegrationTest(unittest.TestCase):
+    def test_step_repeated_failure_uses_error_throttle_and_keeps_console_traceback(self):
+        import io
+        from contextlib import redirect_stdout
+        from test_notifier_privacy import load_notifier
+
+        notifier = load_notifier()
+        response = Mock(ok=True)
+        response.json.return_value = {"ok": True}
+        notifier.requests.post.return_value = response
+        manager = StrategyManager.__new__(StrategyManager)
+        manager.is_running = True
+        manager.is_initialized = True
+        manager.virtual_strategy_engine = SimpleNamespace(
+            flush_snapshot_if_due=Mock(side_effect=RuntimeError("snapshot failure"))
+        )
+        console = io.StringIO()
+
+        def send_error(message, **kwargs):
+            return notifier.send_error(message, token="FAKE", chat_id="1", **kwargs)
+
+        with redirect_stdout(console), patch("strategy.StrategyManager.send_error", send_error), patch.object(notifier.time, "monotonic", return_value=1000):
+            for _ in range(3):
+                manager.step()
+        self.assertEqual(notifier.requests.post.call_count, 1)
+        self.assertEqual(console.getvalue().count("RuntimeError: snapshot failure"), 3)
+
+    def test_deposit_failure_throttles_alert_but_keeps_buy_guard_unsafe(self):
+        import io
+        from contextlib import redirect_stdout
+        from test_notifier_privacy import load_notifier
+
+        notifier = load_notifier()
+        response = Mock(ok=True)
+        response.json.return_value = {"ok": True}
+        notifier.requests.post.return_value = response
+        manager = StrategyManager.__new__(StrategyManager)
+        manager.deposit_state_safe = True
+        manager.kiwoom = SimpleNamespace(get_deposit=Mock(return_value=None), last_deposit_query_success=False)
+        console = io.StringIO()
+
+        def send_error(message, **kwargs):
+            return notifier.send_error(message, token="FAKE", chat_id="1", **kwargs)
+
+        with redirect_stdout(console), patch("strategy.StrategyManager.send_error", send_error), patch.object(notifier.time, "monotonic", return_value=1000):
+            for _ in range(3):
+                self.assertFalse(manager.sync_deposit_from_kiwoom())
+                self.assertFalse(manager.deposit_state_safe)
+        self.assertEqual(notifier.requests.post.call_count, 1)
+        self.assertEqual(console.getvalue().count("[안전 중지]"), 3)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)

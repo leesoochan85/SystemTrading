@@ -4,7 +4,7 @@ from PyQt5.QtCore import *
 import time
 import pandas as pd
 from util.const import *
-from util.notifier import send_message
+from util.notifier import send_error, send_message
 from util.db_helper import (
     get_position_detail,
     save_order_event,
@@ -571,8 +571,7 @@ class Kiwoom(QAxWidget):
                 f"[Kiwoom] 예수금 조회 예외 - "
                 f"마지막 정상 예수금 유지: {e}"
             )
-            print(error_message)
-            send_message(error_message)
+            send_error(error_message, event_key='api.Kiwoom.get_deposit')
 
             return previous_deposit
     
@@ -952,8 +951,7 @@ class Kiwoom(QAxWidget):
                 f"[Kiwoom] 미체결 주문 조회 예외 - "
                 f"기존 주문 유지: {e}"
             )
-            print(error_message)
-            send_message(error_message)
+            send_error(error_message, event_key='api.Kiwoom.get_order')
 
             return self.order
     
@@ -1116,8 +1114,7 @@ class Kiwoom(QAxWidget):
             error_message = (
                 f"[Kiwoom] 잔고 조회 예외 - 기존 잔고 유지: {e}"
             )
-            print(error_message)
-            send_message(error_message)
+            send_error(error_message, event_key='api.Kiwoom.get_balance')
 
             return self.balance
     

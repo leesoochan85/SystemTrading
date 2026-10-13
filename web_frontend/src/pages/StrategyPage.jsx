@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useCallback } from "react";
+import usePolling from "../hooks/usePolling";
 import { Link, useParams } from "react-router-dom";
 import MomentumPage from "./MomentumPage";
 import {
@@ -242,50 +243,25 @@ function DailyReturnChart({ items }) {
 
 export default function StrategyPage() {
   const { name } = useParams();
-  return name === "MomentumContractionStrategy" ? <MomentumPage /> : <LegacyStrategyPage />;
+  return name === "MomentumContractionStrategy" ? <MomentumPage /> : <VirtualStrategyPage />;
 }
 
-function LegacyStrategyPage() {
+function VirtualStrategyPage() {
   const { name } = useParams();
-  const [detail, setDetail] = useState(null);
-  const [virtual, setVirtual] = useState(null);
-  const [dailyPerformance, setDailyPerformance] = useState(null);
-  const [virtualIndex, setVirtualIndex] = useState(null);
-  const [events, setEvents] = useState([]);
-  const [trades, setTrades] = useState([]);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let active = true;
-    const load = async () => {
-      try {
-        const [d, v, daily, indexHistory, e, t] = await Promise.all([
-          getStrategy(name),
-          getVirtualPerformance(name),
-          getVirtualDailyPerformance(name),
-          getVirtualIndexHistory(name),
-          getVirtualEvents(name, 80),
-          getVirtualTrades(name, 80),
-        ]);
-        if (!active) return;
-        setDetail(d);
-        setVirtual(v);
-        setDailyPerformance(daily);
-        setVirtualIndex(indexHistory);
-        setEvents(e.items || []);
-        setTrades(t.items || []);
-        setError("");
-      } catch (e) {
-        if (active) setError(e.message);
-      }
-    };
-    load();
-    const timer = setInterval(load, 5000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
+  const load = useCallback(async () => {
+    const [detail, virtual, dailyPerformance, virtualIndex, events, trades] = await Promise.all([
+      getStrategy(name),
+      getVirtualPerformance(name),
+      getVirtualDailyPerformance(name),
+      getVirtualIndexHistory(name),
+      getVirtualEvents(name, 80),
+      getVirtualTrades(name, 80),
+    ]);
+    return { detail, virtual, dailyPerformance, virtualIndex,
+      events: events.items || [], trades: trades.items || [] };
   }, [name]);
+  const { data, error } = usePolling(load);
+  const { detail, virtual, dailyPerformance, virtualIndex, events = [], trades = [] } = data || {};
 
   const p = virtual?.performance || {};
 

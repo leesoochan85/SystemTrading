@@ -14,6 +14,24 @@
 - [전략 정리 패치 안내](docs/2026-10-08_strategy_cleanup.md)
 - [모멘텀 실제 주문 추가 안내](docs/2026-10-08_momentum_live.md)
 - [이전 돌파 구현 기록](docs/2026-10-08_breakout_implementation.md)
+- [미사용 코드 정리와 리팩토링 내역](docs/2026-10-13_code_refactoring.md)
+- [DB·주문·잔고 관리 모듈 분리](docs/2026-10-13_persistence_account_refactoring.md)
+
+### DB·주문·잔고 관리 분리 (2026-10-13, 후속 작업)
+
+- `util/db_helper.py`의 28개 함수는 기존 이름·인자를 유지하면서 스키마, 포지션, 주문/체결, 성과 저장 모듈로 위임합니다. DB 경로 설정도 유지합니다.
+- `StrategyManager`의 19개 메서드는 `OrderCoordinator`와 `AccountStateSynchronizer`로 분리했습니다. 예약 현금·조회 실패 상태·삭제 확인 횟수는 같은 Manager 상태를 공유하며, Qt 호출 순서와 주문 정책은 유지합니다.
+- SQLite 트랜잭션 종료 후 연결을 명시적으로 닫습니다. 커밋·롤백 조건은 유지합니다.
+- 전체 Python 테스트는 웹 의존성이 있는 환경에서 실행합니다. `webenv\Scripts\python.exe -m pip install -r requirements-test.txt`로 준비하고 `run_tests.bat`을 실행하세요. 매매 실행은 기존 Python 3.9 32bit BAT를 사용합니다.
+
+### 코드 정리 · 리팩토링 (2026-10-13)
+
+- 현재 실행 경로에서 호출하지 않는 구형 ORB·뉴스·DB 조회 함수와 네이버 시총 상위 100종목 수집기를 제거했습니다.
+- `util.db_helper`를 import할 때 만들던 `universe_price.db`와, 시작 시 불필요하게 만들던 `sent_news.db`를 더 이상 생성하지 않습니다. 기존 DB 파일과 거래 기록은 유지됩니다.
+- Telegram `/status` 메시지 작성은 `util/status_message.py`로 분리했습니다. 메시지 내용과 주문 정책은 유지합니다.
+- 웹 전략 요약 계산을 통합하고, React 세 페이지가 공통 `usePolling`으로 5초 갱신합니다. 앞선 요청이 끝나지 않으면 새 갱신 요청을 건너뜁니다.
+- `main.py`는 직접 실행할 때만 Qt·Kiwoom을 초기화합니다. 기존 BAT 실행 방법과 모멘텀 신규매수 활성 조건은 그대로입니다.
+- 검증: `run_tests.bat`, `web_frontend`에서 `npm test`, `npm run build`.
 
 > 대상: 저장소를 처음 받은 PC에서 **과거 데이터 수집 → Kiwoom 자동매매 → Telegram → FastAPI/React 웹 모니터링**까지 실행 가능한 상태를 만드는 절차입니다.
 >

@@ -117,26 +117,26 @@ def health():
     }
 
 
+def _strategy_summaries(event_date: str) -> list[dict]:
+    return [
+        {
+            **config,
+            "virtual_performance": get_virtual_performance(config["strategy_name"]),
+            "today_virtual_events": get_virtual_event_summary(
+                config["strategy_name"], event_date=event_date
+            ),
+        }
+        for config in get_all_strategy_configs()
+    ]
+
+
 @app.get("/api/dashboard")
 def dashboard():
-    today = datetime.now().strftime("%Y%m%d")
-    strategies = []
-
-    for config in get_all_strategy_configs():
-        strategy_name = config["strategy_name"]
-        strategies.append(
-            {
-                **config,
-                "virtual_performance": get_virtual_performance(strategy_name),
-                "today_virtual_events": get_virtual_event_summary(
-                    strategy_name, event_date=today
-                ),
-            }
-        )
+    now = datetime.now()
 
     return {
-        "as_of": datetime.now().isoformat(timespec="seconds"),
-        "strategies": strategies,
+        "as_of": now.isoformat(timespec="seconds"),
+        "strategies": _strategy_summaries(now.strftime("%Y%m%d")),
         "metric_note": (
             "승률/평균수익률/최고/최저는 가상 BUY 후 100% 청산이 완료된 "
             "거래를 기준으로 계산합니다. 부분청산만 진행된 포지션은 완료 거래에 포함하지 않습니다."
@@ -146,22 +146,7 @@ def dashboard():
 
 @app.get("/api/strategies")
 def strategies():
-    today = datetime.now().strftime("%Y%m%d")
-    result = []
-
-    for config in get_all_strategy_configs():
-        strategy_name = config["strategy_name"]
-        result.append(
-            {
-                **config,
-                "virtual_performance": get_virtual_performance(strategy_name),
-                "today_virtual_events": get_virtual_event_summary(
-                    strategy_name, event_date=today
-                ),
-            }
-        )
-
-    return {"items": result}
+    return {"items": _strategy_summaries(datetime.now().strftime("%Y%m%d"))}
 
 
 @app.get("/api/strategies/{strategy_name}/paper-comparison")

@@ -10,7 +10,6 @@ from contextlib import closing
 from datetime import datetime
 from itertools import groupby
 from pathlib import Path
-import json
 import math
 import sqlite3
 
@@ -227,28 +226,3 @@ def ma_profit_exit_signal(current_price, entry_price, state, previous_close_sum,
                            "exit_ratio": updated["ma_profit_ratio"],
                            "ma_stop": updated["ma_profit_stop"]},
     }, updated
-
-
-class AtrStateStore:
-    """실계좌 전용 상태. 가상 포지션은 기존 monitoring.db의 state_json을 사용한다."""
-    def __init__(self, path):
-        self.path = Path(path)
-
-    def _connect(self):
-        con = sqlite3.connect(str(self.path), timeout=15)
-        con.execute("CREATE TABLE IF NOT EXISTS breakout_atr_state (code TEXT PRIMARY KEY, state_json TEXT NOT NULL)")
-        return con
-
-    def load(self, code):
-        with closing(self._connect()) as con:
-            row = con.execute("SELECT state_json FROM breakout_atr_state WHERE code = ?", (str(code).zfill(6),)).fetchone()
-        return json.loads(row[0]) if row else None
-
-    def save(self, code, state):
-        with closing(self._connect()) as con, con:
-            con.execute("INSERT OR REPLACE INTO breakout_atr_state VALUES (?, ?)",
-                        (str(code).zfill(6), json.dumps(state, ensure_ascii=False, allow_nan=False)))
-
-    def delete(self, code):
-        with closing(self._connect()) as con, con:
-            con.execute("DELETE FROM breakout_atr_state WHERE code = ?", (str(code).zfill(6),))

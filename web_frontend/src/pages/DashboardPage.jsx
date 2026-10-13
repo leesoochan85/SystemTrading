@@ -1,31 +1,9 @@
-import { useEffect, useState } from "react";
+import usePolling from "../hooks/usePolling";
 import { getDashboard } from "../api/tradingApi";
 import StrategyCard from "../components/StrategyCard";
 
 export default function DashboardPage() {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    let active = true;
-    const load = async () => {
-      try {
-        const result = await getDashboard();
-        if (active) {
-          setData(result);
-          setError("");
-        }
-      } catch (e) {
-        if (active) setError(e.message);
-      }
-    };
-    load();
-    const timer = setInterval(load, 5000);
-    return () => {
-      active = false;
-      clearInterval(timer);
-    };
-  }, []);
+  const { data, error } = usePolling(getDashboard);
 
   return (
     <main className="page-shell">

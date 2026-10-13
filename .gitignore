@@ -38,21 +38,12 @@ web_frontend/yarn-error.log*
 cleanup_backup_*/
 
 kiwoom/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.sqlite3
-*.xlsx
-*.csv
-.env
-.vscode/
 
-__pycache__/
-*.pyc
 
 # Financial collection cache, diagnostics and API credentials
 data/value_cache/
 data/value_reports/
-.env
 .venv-data/
+
+# Generated local replay result; keep demo/expected_report.json as a fixture.
+demo/my_report.json

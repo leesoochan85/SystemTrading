@@ -27,7 +27,6 @@ import pandas as pd
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "market_history.db"
-MIN_HISTORY_DAYS = 65
 DEFAULT_LOOKBACK_CALENDAR_DAYS = 400
 DEFAULT_REQUIRED_HISTORY_ROWS = 180
 DEFAULT_INCREMENTAL_OVERLAP_CALENDAR_DAYS = 10
@@ -307,17 +306,6 @@ def refresh_company_stock_master(
     return df[["code", "code_name", "market"]].copy()
 
 
-def get_current_universe_codes(db_path: Path = DB_PATH) -> list[str]:
-    """현재 활성 KOSPI+KOSDAQ 기업주식 전체 코드를 반환한다.
-
-    64bit bootstrap 실행 시에는 pykrx로 stock_master를 먼저 갱신하고,
-    32bit 런타임에서는 이 함수가 외부 조회 없이 DB만 읽는다.
-    """
-    df = load_company_stock_master(db_path=db_path)
-    if df.empty:
-        return []
-    return list(dict.fromkeys(df["code"].astype(str).str.upper().str.zfill(6).tolist()))
-
 def bootstrap_market_history(
     db_path: Path = DB_PATH,
     lookback_calendar_days: int = DEFAULT_LOOKBACK_CALENDAR_DAYS,
@@ -526,8 +514,6 @@ def get_code_history_counts(codes: Iterable[str], db_path: Path = DB_PATH,
     return {code: counts.get(code, 0) for code in normalized}
 
 
-
-
 def get_code_latest_dates(codes: Iterable[str], db_path: Path = DB_PATH) -> Dict[str, str | None]:
     """종목별 DB 최신 일봉 날짜(YYYYMMDD)를 반환한다."""
     normalized = list(dict.fromkeys(str(code).strip().upper().zfill(6) for code in codes))
@@ -543,59 +529,6 @@ def get_code_latest_dates(codes: Iterable[str], db_path: Path = DB_PATH) -> Dict
 
     latest = {str(code): (str(date) if date else None) for code, date in rows}
     return {code: latest.get(code) for code in normalized}
-
-def get_missing_history_codes(
-    codes: Iterable[str],
-    minimum_rows: int = MIN_HISTORY_DAYS,
-    db_path: Path = DB_PATH,
-) -> list[str]:
-    counts = get_code_history_counts(codes, db_path=db_path)
-    return [code for code, count in counts.items() if count < minimum_rows]
-
-
-def load_daily_price_map(
-    codes: Iterable[str],
-    minimum_rows: int = MIN_HISTORY_DAYS,
-    db_path: Path = DB_PATH,
-) -> Dict[str, pd.DataFrame]:
-    """32bit 자동매매가 공통 과거 일봉을 읽는 주 진입점.
-
-    반환 DataFrame 형식은 기존 전략의 price_df와 동일하게
-    index=date, columns=open/high/low/close/volume 로 맞춘다.
-    """
-    normalized = list(dict.fromkeys(str(code).strip().upper().zfill(6) for code in codes))
-    if not normalized:
-        return {}
-
-    placeholders = ",".join("?" for _ in normalized)
-    with _connect(db_path) as con:
-        df = pd.read_sql_query(
-            f"""
-            SELECT code, date, open, high, low, close, volume
-            FROM daily_price
-            WHERE code IN ({placeholders})
-            ORDER BY code, date
-            """,
-            con,
-            params=normalized,
-        )
-
-    result: Dict[str, pd.DataFrame] = {}
-    if df.empty:
-        return result
-
-    for code, group in df.groupby("code", sort=False):
-        group = group.sort_values("date").copy()
-        if len(group) < minimum_rows:
-            continue
-        price_df = group[["date", "open", "high", "low", "close", "volume"]].copy()
-        price_df["date"] = price_df["date"].astype(str)
-        price_df = price_df.set_index("date")
-        for col in ["open", "high", "low", "close", "volume"]:
-            price_df[col] = pd.to_numeric(price_df[col], errors="coerce")
-        result[str(code)] = price_df
-
-    return result
 
 
 def load_breakout_metrics(
@@ -708,81 +641,6 @@ def load_completed_close_sum(code, before_date, count, db_path=DB_PATH):
     if len(rows) != count or any(not math.isfinite(float(row[1])) or float(row[1]) <= 0 for row in rows):
         return None
     return {"close_sum": sum(float(row[1]) for row in rows), "latest_date": rows[0][0]}
-
-
-def load_daily_bar(
-    code: str,
-    trade_date: str,
-    db_path: Path = DB_PATH,
-) -> dict | None:
-    """특정 종목/거래일의 완성 일봉 1건을 반환한다."""
-    normalized_code = str(code).strip().upper().zfill(6)
-    trade_date = str(trade_date).strip()
-    if not normalized_code or not trade_date:
-        return None
-
-    with _connect(db_path) as con:
-        row = con.execute(
-            """
-            SELECT code, date, open, high, low, close, volume, source, updated_at
-            FROM daily_price
-            WHERE code = ? AND date = ?
-            LIMIT 1
-            """,
-            (normalized_code, trade_date),
-        ).fetchone()
-
-    if row is None:
-        return None
-
-    return {
-        "code": str(row[0]),
-        "date": str(row[1]),
-        "open": int(row[2]),
-        "high": int(row[3]),
-        "low": int(row[4]),
-        "close": int(row[5]),
-        "volume": int(row[6]),
-        "source": str(row[7]),
-        "updated_at": str(row[8]),
-    }
-
-
-def has_completed_daily_bar_after(
-    code: str,
-    after_date: str,
-    before_date: str | None = None,
-    db_path: Path = DB_PATH,
-) -> bool:
-    """after_date 이후에 이미 완성된 일봉이 존재하는지 확인한다.
-
-    before_date가 주어지면 ``after_date < date < before_date`` 범위만 확인한다.
-    눌림목 전략에서 '전고점 도달 바로 다음 거래일'이 이미 지나갔는지 판별할 때 사용한다.
-    """
-    normalized_code = str(code).strip().upper().zfill(6)
-    after_date = str(after_date).strip()
-
-    if before_date is None:
-        sql = """
-            SELECT 1
-            FROM daily_price
-            WHERE code = ? AND date > ?
-            LIMIT 1
-        """
-        params = (normalized_code, after_date)
-    else:
-        before_date = str(before_date).strip()
-        sql = """
-            SELECT 1
-            FROM daily_price
-            WHERE code = ? AND date > ? AND date < ?
-            LIMIT 1
-        """
-        params = (normalized_code, after_date, before_date)
-
-    with _connect(db_path) as con:
-        return con.execute(sql, params).fetchone() is not None
-
 
 
 def build_realtime_daily_bars(realtime_map: Dict[str, dict], codes: Iterable[str] | None = None) -> Dict[str, dict]:

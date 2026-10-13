@@ -1,0 +1,5 @@
+# Run the complete suite in the existing 64bit webenv.
+-r requirements-web.txt
+httpx
+pandas
+requests

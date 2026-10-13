@@ -1,5 +1,5 @@
 import StrategySourceLink from "../components/StrategySourceLink";
-import { useEffect, useState } from "react";
+import usePolling from "../hooks/usePolling";
 import { Link } from "react-router-dom";
 import MaSettingsPanel from "../components/MaSettingsPanel";
 import { getStrategy, getPaperComparison } from "../api/tradingApi";
@@ -55,25 +55,16 @@ function ComparisonChart({ items }) {
   </>;
 }
 
+async function loadMomentum() {
+  const [comparison, detail] = await Promise.all([
+    getPaperComparison(), getStrategy("MomentumContractionStrategy"),
+  ]);
+  return { ...comparison, ma_settings: detail.ma_settings };
+}
+
 export default function MomentumPage() {
-  const [data, setData] = useState(null);
-  const [error, setError] = useState("");
-  const [maSettings, setMaSettings] = useState(null);
-  useEffect(() => {
-    let active = true, busy = false;
-    const load = async () => {
-      if (busy) return;
-      busy = true;
-      try {
-        const [result, detail] = await Promise.all([getPaperComparison(), getStrategy("MomentumContractionStrategy")]);
-        if (active) { setData(result); setMaSettings(detail.ma_settings); setError(""); }
-      } catch (e) { if (active) setError(e.message); }
-      finally { busy = false; }
-    };
-    load();
-    const interval = setInterval(load, 5000);
-    return () => { active = false; clearInterval(interval); };
-  }, []);
+  const { data, error, setData } = usePolling(loadMomentum);
+  const maSettings = data?.ma_settings;
   const c = data?.accounts?.find((a) => a.strategy_name === "MomentumContractionStrategy");
   const rules = data?.settings?.strategy;
   const costs = c?.costs;
@@ -100,7 +91,7 @@ export default function MomentumPage() {
       </tbody></table></div>
       <p className="metric-note">A/B는 기존 ATR·장 마감 전 예상 MA 청산을 사용하고, C는 당일 저가 손절·부분 매도·확정 종가 MA 청산을 사용합니다. 완료 거래는 잔량까지 전부 청산된 진입 건입니다. MDD는 5초 간격으로 기록한 평가액 기준입니다.</p>
     </section>
-    {maSettings && <MaSettingsPanel name="MomentumContractionStrategy" status={maSettings} onSaved={setMaSettings} />}
+    {maSettings && <MaSettingsPanel name="MomentumContractionStrategy" status={maSettings} onSaved={(status) => setData((current) => ({ ...current, ma_settings: status }))} />}
     <section className="panel"><div className="panel-title"><h2>적용 조건</h2><span>C는 가상 계좌 · 실제 주문 모드는 매매 프로세스에서 설정</span></div>
       {rules && <p>{rules.momentum_mode === "video_low126" ? "126거래일 최저가 대비 상승" : "21·63·126거래일 수익률"} 상위 {rules.top_percent}% · ADR(20) &gt; {rules.min_adr_pct}% · 첫 {rules.opening_range_minutes}분 고가 돌파 · ATR {rules.stop_atr_multiple}배 이내 손절 · {rules.partial_after_sessions}거래일 후 약 {(rules.partial_ratio * 100).toFixed(1)}% 부분 매도 · MA{rules.trailing_ma_period} 확정 종가 청산</p>}
       {rules && <p className="metric-note">횡보 {rules.consolidation_days}일, 최근 {rules.recent_range_days}일 TR 비율 {rules.max_tr_ratio}, 선행 상승 {rules.min_prior_move_pct}%와 저점 블록 비교는 자동 판정을 위한 실험값입니다.</p>}

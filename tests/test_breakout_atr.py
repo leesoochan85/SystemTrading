@@ -27,7 +27,6 @@ if "util.notifier" not in sys.modules:
     sys.modules["util.notifier"] = notifier
 
 from util.breakout_atr import (
-    AtrStateStore,
     advance_atr_state,
     atr_exit_signal,
     iter_atr_bars,
@@ -96,23 +95,6 @@ class BreakoutAtrTest(unittest.TestCase):
         unchanged = advance_atr_state(raised, 100, wider_atr, trailing_multiple=3)
         self.assertEqual(unchanged["stop_price"], 101)
         self.assertEqual(atr_exit_signal(101, unchanged)["reason_code"], "ATR_TRAILING_STOP")
-
-    def test_state_store_survives_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
-            store = AtrStateStore(Path(directory) / "atr.db")
-            state = {
-                "entry_at": "20260110100000",
-                "entry_price": 100.0,
-                "entry_atr": 2.0,
-                "initial_stop": 96.0,
-                "stop_price": 101.0,
-                "highest_close": 110.0,
-                "last_bar_date": "20260111",
-            }
-            store.save("1234", state)
-            self.assertEqual(store.load("001234"), state)
-            store.delete("001234")
-            self.assertIsNone(store.load("001234"))
 
     def test_existing_position_can_migrate_from_latest_atr(self):
         state = new_atr_state_from_value(

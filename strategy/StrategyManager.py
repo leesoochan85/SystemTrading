@@ -3,7 +3,7 @@ import traceback
 import sqlite3
 from datetime import datetime
 
-from PyQt5.QtCore import QObject, QTimer
+from PyQt5.QtCore import QObject, QTimer, QCoreApplication
 
 from util.time_helper import (
     check_transaction_open,
@@ -12,6 +12,7 @@ from util.time_helper import (
 )
 from util.notifier import send_error, send_message, get_updates
 from util.const import Telegram_chat_ID
+from util.telegram_poller import TelegramCommandPoller
 from util.market_history import (
     build_realtime_daily_bars,
     get_db_path as get_market_history_db_path,
@@ -171,7 +172,12 @@ class StrategyManager(QObject):
         self.telegram_update_offset = None
         self.command_timer = QTimer()
         self.command_timer.timeout.connect(self.poll_telegram_commands)
-        self.command_check_interval = 10000
+        # This timer only checks a completed Future; HTTP runs outside Qt.
+        self.command_check_interval = 250
+        self.telegram_command_poller = TelegramCommandPoller(get_updates)
+        application = QCoreApplication.instance()
+        if application is not None:
+            application.aboutToQuit.connect(self.telegram_command_poller.close)
 
         # 전략은 매수 조건만 판단한다.
         # 실제 주문 수량/예산/계좌 전체 포지션 제한은 Manager가 담당한다.
@@ -741,6 +747,7 @@ class StrategyManager(QObject):
             # 전략명이 이미 확정된 포지션에 한해서 실제 잔고로 안전 복구한다.
             # 일반 수량 불일치(수동 부분매도 등)도 같은 함수에서 실제 잔고 기준으로 보정한다.
             self.sync_position_quantities_from_balance()
+            self.cleanup_sold_positions()
             self.check_balance_position_db_consistency()
 
             print("[StrategyManager] 예수금 조회 시작")
@@ -885,8 +892,9 @@ class StrategyManager(QObject):
 
         if was_unsafe:
             message = (
-                "[안전 중지 해제] 미체결 주문 및 잔고 조회 정상 완료 - "
-                "전략 주문을 재개합니다."
+                "[계좌 조회 복구] 미체결 주문 및 잔고 조회 정상 완료 - "
+                + ("전략 주문 안전 조건을 다시 확인합니다."
+                   if self.is_initialized else "전략 초기화 대기 · 계좌 동기화만 유지합니다.")
             )
             if previous_reason:
                 message += f" / 직전 원인: {previous_reason}"
@@ -1791,8 +1799,8 @@ class StrategyManager(QObject):
 
     def poll_telegram_commands(self):
         try:
-            updates = get_updates(
-                offset=self.telegram_update_offset
+            updates = self.telegram_command_poller.poll(
+                self.telegram_update_offset
             )
 
             for update in updates:
@@ -2309,12 +2317,33 @@ class StrategyManager(QObject):
     # 주기 실행
     # ------------------------------------------------------------------
 
+    def sync_account_while_waiting_for_strategy(self, now):
+        """Keep broker reconciliation alive without strategy orders/cancels."""
+        self.set_timer_interval(
+            self.market_open_interval if check_transaction_open()
+            else self.market_closed_interval
+        )
+        if now - self.last_order_sync_at < self.order_sync_interval:
+            return
+        if not self.refresh_order_and_balance_state(allow_buy_cancel=False):
+            return
+        self.save_position_snapshot_if_due(force=True)
+        self.save_strategy_equity_snapshot_if_due(force=True)
+        if (not self.deposit_state_safe
+                or now - self.last_deposit_sync_at >= self.deposit_sync_interval):
+            if self.sync_deposit_from_kiwoom():
+                self.save_performance_snapshot()
+        print("[StrategyManager] 전략 초기화 대기 - 계좌 동기화/수동매도 DB 정리 유지")
+
     def step(self):
-        if not self.is_running or not self.is_initialized:
+        if not self.is_running:
             return
 
         try:
             now = time.time()
+            if not self.is_initialized:
+                self.sync_account_while_waiting_for_strategy(now)
+                return
 
             # 가상매매는 실계좌 상태와 독립적이다.
             # 실시간 틱에서는 메모리만 갱신하고, 여기서 최대 5초마다 SQLite에 일괄 저장한다.

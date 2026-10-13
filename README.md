@@ -20,11 +20,82 @@
 > 핵심은 실행 환경을 분리하는 것입니다.
 >
 > - **Python 3.9 32bit**: Kiwoom OpenAPI+ 자동매매
-> - **64bit Python/Conda**: pykrx 과거 일봉/종목 마스터 수집
+> - **Python 3.12 64bit / Conda marketdata**: pykrx 일봉·종목 마스터 및 KRX/OpenDART 재무 수집
 > - **별도 webenv**: FastAPI 웹 API
 > - **Node.js**: React/Vite 대시보드
 >
 > 자동매매 프로세스와 웹 프로세스는 직접 연결하지 않고 SQLite DB를 경계로 분리합니다.
+
+---
+
+## 매일 실행하는 순서 
+
+### 1. 데이터 갱신 후 결과 확인
+
+매매 프로그램을 종료한 상태에서 프로젝트 루트의 **CMD**에서 실행합니다.
+
+```cmd
+update_market_data.bat
+```
+
+기존 `%USERPROFILE%\anaconda3\envs\marketdata\python.exe`로 일봉 수집 → 전체 대상 재무 수집 → 재무 DB 상태 출력을 순서대로 실행합니다. 터미널에서 conda를 활성화할 필요는 없습니다. Anaconda 설치 경로가 다르면 배치 파일의 `DATA_PYTHON`을 수정합니다.
+
+일봉만 갱신하려면:
+
+```cmd
+update_market_data.bat history
+```
+
+일봉은 충분한 이력이 있으면 증분으로 보충합니다. 재무제표와 별개로 주가에 따라 PER/PBR이 바뀌므로 매일 최신 지표를 사용하려면 재무 스냅샷도 갱신합니다. 현재 재무 스냅샷의 시가총액 기준일 허용 기간은 7일입니다. `history` 옵션으로 재무 갱신을 무기한 생략할 수는 없습니다.
+
+완료 후 일봉 `eligible_code_count`, `failed_codes`, `insufficient_history_count`와 재무 `saved`, `fresh`, `qualified`를 확인합니다. 일부 종목의 일봉 조회 실패는 수집 프로세스 종료 코드에 반영되지 않을 수 있으므로 배치 완료만으로 전체 수집 성공을 판단하지 않습니다. `qualified=0`은 전략의 모든 재무 조건을 만족하는 후보가 없다는 뜻이며 수집 실패와 구분합니다.
+
+### 2. 키움 매매 프로그램 실행
+
+사용 중인 매매 실행 배치 파일을 실행하거나 다음 명령을 사용합니다.
+
+```cmd
+set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
+set "SYSTEMTRADING_PAPER_TICK_CSV=%CD%\ticks\breakout.csv"
+py -3.9-32 main.py
+```
+
+로그인, 잔고·미체결·예수금 조회, 전략 초기화, 공통 실시간 등록 결과를 확인합니다. 수집 완료가 전략 초기화 성공을 보증하지 않습니다.
+
+사용자가 제공한 매매 배치 파일은 `SYSTEMTRADING_MOMENTUM_LIVE`를 설정하지 않습니다. 환경에서 전달된 값이 `1`이면 모멘텀 신규매수가 활성화되고, 그렇지 않으면 중지됩니다. 확실하게 끄려면 실행 전에 `set "SYSTEMTRADING_MOMENTUM_LIVE=0"`을 지정합니다. 신규매수 활성화 방법은 13절을 참고하세요. 우량주 주문과 기존 모멘텀 실보유 매도 관리는 별도입니다.
+
+### 3. 웹 API 실행 — 별도 터미널
+
+```cmd
+webenv\Scripts\activate
+set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
+python run_web_api.py
+```
+
+`http://127.0.0.1:8000/health`와 `/docs`를 확인합니다. 매매 프로그램과 웹 API의 비교계좌 DB 경로가 같아야 합니다.
+
+### 4. React 실행 — 별도 터미널
+
+```cmd
+cd web_frontend
+npm run dev
+```
+
+최초 설치 때만 `npm install`이 필요합니다. 실행 로그에 표시된 주소로 접속합니다. 기본 주소는 `http://localhost:5173`입니다.
+
+### 요청 대상
+
+| 프로그램 | 요청 대상 | 실행 환경 |
+|---|---|---|
+| 일봉 수집기 | pykrx가 사용하는 외부 데이터 서버 | marketdata 64bit |
+| 재무 수집기 | KRX 시가총액 + OpenDART 기업·재무·주식수 정보 | marketdata 64bit |
+| main.py | Kiwoom OpenAPI, Telegram 등 | Python 3.9 32bit |
+| 웹 API | SQLite 조회, 웹 API 제공 및 기존 웹 기능 | 웹 의존성이 설치된 Python |
+| React | FastAPI HTTP 조회 | Node.js |
+
+두 수집기는 키움 API를 호출하지 않습니다. 일봉 요청 후 기본 1초, 캐시 없는 DART 요청 전 0.3초 대기를 적용하지만 KRX/DART 요청 제한을 보장하지는 않습니다. DART는 종목마다 여러 요청이 필요하며 성공 응답 캐시는 24시간입니다. `DART_STATUS:020` 등 DART 오류가 발생하면 수집을 중단합니다. 동시에 같은 수집기를 중복 실행하지 마세요.
+
+[OpenDART 공식 제한 안내](https://opendart.fss.or.kr/guide/detail.do?apiGrpCd=DS003&apiId=2019020)는 일반적으로 20,000건 이상 요청에서 제한 오류가 발생하며 설정에 따라 한도가 다를 수 있다고 설명합니다. 키움 매매 프로세스 자체의 TR/주문 제한 준수 여부는 별도입니다.
 
 ---
 
@@ -36,10 +107,10 @@
 3. Kiwoom OpenAPI+ 설치 + 서비스 신청/로그인 확인
 4. Python 3.9 32bit 설치
 5. Kiwoom용 32bit 가상환경 생성 + 패키지 설치
-6. 64bit Python/Conda marketdata 환경 생성 + pykrx 설치
+6. 기존 marketdata 환경 재사용 또는 새 PC에서 생성 + 수집용 패키지 설치
 7. Telegram 환경변수 설정
 8. market_history.db 초기 구축
-9. ValueQuality 사용 시 재무 CSV 입력
+9. KRX/OpenDART 인증 설정 후 ValueQuality 재무 자동 수집
 10. DB/환경 사전 점검
 11. 32bit 환경에서 main.py 실행
 12. webenv에서 FastAPI 실행
@@ -96,17 +167,13 @@ python -c "import struct; print(struct.calcsize('P') * 8)"
 
 자동매매 환경에서는 `32`가 나와야 합니다.
 
-### 2-2. 과거 데이터 수집용
+### 2-2. 과거 일봉·재무 데이터 수집용
 
-```text
-64-bit Python
-pykrx
-pandas
-numpy
-python-dotenv
-```
+현재 확인한 환경은 **Conda `marketdata` / Python 3.12.13 / 64bit**입니다. 기존 환경을 재사용하며 새 Python이나 `.venv-data`를 추가할 필요는 없습니다. 수집 수정본의 요구 버전은 `requirements-value-data.txt`에 지정된 `pykrx==1.2.9`입니다.
 
-`bootstrap_market_history.py`는 64bit 환경에서 실행합니다.
+`bootstrap_market_history.py`와 `collect_value_fundamentals.py`는 이 환경에서 실행합니다. 수집 패키지를 Kiwoom용 Python 3.9 32bit에 설치하지 않습니다.
+
+---
 
 ### 2-3. 웹 API용
 
@@ -164,21 +231,60 @@ pip install requests beautifulsoup4 lxml PyQt5 openpyxl xlrd deprecated multiple
 
 ## 5. 64bit marketdata 환경
 
-Conda 예시:
+### 기존 환경 재사용
+
+Anaconda Prompt에서:
+
+```cmd
+conda activate marketdata
+cd /d "C:\Users\leesoochan\OneDrive\바탕 화면\포트폴리오\SystemTrading"
+python -c "import sys,struct; from importlib.metadata import version; print(sys.executable); print(sys.version); print('bit:',struct.calcsize('P')*8); print('pykrx:',version('pykrx'))"
+```
+
+실행 경로가 `envs\marketdata\python.exe`, 비트 수가 `64`인지 확인합니다. 진행 중인 수집이 끝난 뒤 최초 설치 또는 요구 버전 변경 시:
+
+```cmd
+python -m pip install -r requirements-value-data.txt
+```
+
+매일 패키지를 재설치할 필요는 없습니다.
+
+VS Code의 CMD에서 conda 명령을 찾지 못하면:
+
+```cmd
+call "%USERPROFILE%\anaconda3\condabin\conda.bat" activate marketdata
+python -c "import sys; print(sys.executable)"
+```
+
+위 경로는 현재 사용자 설치 기준입니다. 설치 위치가 다르면 수정합니다. VS Code 하단 인터프리터 선택만으로 기존 터미널의 `python` 환경이 바뀌었다고 판단하지 말고 실행 경로를 확인하세요. `update_market_data.bat`는 marketdata 실행 파일을 직접 지정합니다.
+
+### 새 PC에 환경이 없는 경우에만
 
 ```cmd
 conda create -n marketdata python=3.12 -y
 conda activate marketdata
-pip install pykrx pandas numpy python-dotenv
+python -m pip install -r requirements-value-data.txt
 ```
 
-확인:
+기존 marketdata가 있다면 환경을 다시 만들지 않습니다.
+
+### 인증 설정
+
+프로젝트 루트의 `.env`에 입력합니다.
+
+```dotenv
+DART_API_KEY=발급받은40자리인증키
+KRX_ID=KRX로그인아이디
+KRX_PW=KRX로그인비밀번호
+```
+
+KRX 로그인과 DART 인증키는 서로 다릅니다. 재무 수집기는 pykrx import 전에 `.env`를 읽으며 이미 설정된 운영체제 환경변수가 우선합니다. `.env`와 인증 정보를 Git에 올리거나 로그 전체와 함께 공유하지 않습니다.
 
 ```cmd
-python -c "import struct, platform; print(platform.python_version(), struct.calcsize('P') * 8)"
+python collect_value_fundamentals.py --check-market
 ```
 
-`64`가 나와야 합니다.
+이 명령은 KRX 시가총액 조회를 점검하며 DART 재무 수집이나 스냅샷 저장은 수행하지 않습니다.
 
 ---
 
@@ -229,20 +335,26 @@ python -c "import os; print(bool(os.getenv('TELEGRAM_BOT_TOKEN')), bool(os.geten
 
 ---
 
-## 8. market_history.db 초기 구축
+## 8. market_history.db 초기 구축 및 증분 갱신
 
-64bit `marketdata` 환경에서:
+64bit marketdata 환경에서:
 
 ```cmd
-conda activate marketdata
-python bootstrap_market_history.py
+python bootstrap_market_history.py --lookback-days 400 --min-history-rows 180 --sleep 1
 ```
 
 A/B 비교의 신고가 기준에는 **당일을 제외한 직전 180거래일** 일봉이 필요합니다. C 모멘텀은 최소 127봉과 기준 거래일의 최신 일봉을 확인합니다. 실제 모멘텀도 동일한 후보·진입 규칙을 사용합니다.
-조회 옵션의 540은 달력일이며 필요한 봉수와 다릅니다. 기존 종목 이력을 늘릴 때는 `--overlap-days`도 지정합니다.
-수집기는 마지막 저장일이 수집 종료일 이상이면 봉수가 부족해도 건너뛸 수 있으므로 수집 로그와 종목별 봉수를 확인합니다.
 
-주요 데이터는 `stock_master`, `daily_price`입니다. 시작 전 기준값을 계산하고 장중에는 Kiwoom 실시간 틱으로 판단합니다.
+- `--lookback-days 400`은 달력일 조회 범위이며 400거래일을 뜻하지 않습니다.
+- 180봉 미만 종목은 최신 날짜가 저장되어 있어도 지정한 과거 범위로 보충 조회합니다.
+- 충분한 이력이 있는 종목은 마지막 저장일 주변 중복 구간과 누락분을 증분 조회합니다.
+- 최신 날짜와 180봉을 모두 충족한 종목은 일봉 조회를 생략합니다. 종목 마스터 갱신은 별도 수행합니다.
+- 신규 상장 등 실제 거래일이 부족한 종목은 이력이 쌓여야 합니다. 봉을 인위적으로 만들지 않습니다.
+- 휴장일은 조회 종료일이 달력상 어제로 계산되어 이미 저장된 구간을 재조회할 수 있습니다.
+
+이력 보충을 위해 `--overlap-days`를 수백 일로 늘릴 필요는 없습니다. 해당 옵션은 충분한 이력이 있는 종목의 증분 중복 구간을 지정합니다.
+
+주요 데이터는 `stock_master`, `daily_price`입니다. 시작 전 기준값을 계산하고 장중에는 Kiwoom 실시간 틱으로 판단합니다. 수집 완료 후 `eligible_code_count`, `insufficient_history_count`, `failed_codes`를 확인하세요.
 
 ---
 
@@ -267,49 +379,90 @@ python run_web_api.py
 
 `set`은 해당 CMD에서 시작하는 프로세스에만 적용됩니다. 실행할 때마다 입력하지 않으려면 프로젝트 최상위 `.bat`에 저장할 수 있습니다. [작업 기록의 실행 예시](docs/2026-10-08_README.md#6-가상-db와-틱-csv-설정)를 참고하세요.
 
+### 현재 사용 중인 두 배치 파일
+
+아래 파일명은 설명용 예시입니다. 기존 배치 파일의 이름을 바꾸지 않아도 됩니다. 두 파일을 프로젝트 루트에 둡니다.
+
+매매 실행용 배치 파일:
+
+```bat
+@echo off
+setlocal
+cd /d "%~dp0"
+set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
+set "SYSTEMTRADING_PAPER_TICK_CSV=%CD%\ticks\breakout.csv"
+py -3.9-32 main.py
+pause
+```
+
+웹 API 실행용 배치 파일:
+
+```bat
+@echo off
+setlocal
+cd /d "%~dp0"
+set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
+python run_web_api.py
+pause
+```
+
+웹 배치 파일의 `python`은 실행 터미널의 환경을 사용합니다. 먼저 webenv를 활성화한 CMD에서 실행하거나, 배치 안에서 `webenv\Scripts\python.exe run_web_api.py`처럼 웹 Python 경로를 명시합니다. 더블클릭할 때 기존 터미널의 marketdata/webenv가 자동으로 전달된다고 가정하지 않습니다.
+
+이 두 파일은 데이터 수집이나 React를 실행하지 않습니다. 데이터 갱신은 `update_market_data.bat`, React는 `web_frontend`에서 `npm run dev`로 따로 실행합니다. `setlocal`은 변수 설정 범위를 제한하고 `pause`는 종료 후 로그 확인을 위해 창을 유지합니다.
+
 A/B/C는 모두 가상 비교계좌입니다. 실제 모멘텀 주문은 별도 실행 어댑터가 담당하며 `SYSTEMTRADING_MOMENTUM_LIVE=1`로 신규매수를 켭니다. 우량주의 기존 증권사 주문은 유지됩니다.
 가상 DB 경로를 설정하는 것은 전체 프로그램을 가상 전용으로 바꾸는 기능이 아닙니다. CSV 기록과 `replay_momentum_breakout.py`는 C 대상이며 A/B 전체 재현용이 아닙니다.
 
 ---
 
-## 9. ValueQuality 재무 데이터
+## 9. ValueQuality 재무 데이터 자동 수집
 
-필요 CSV:
-
-```text
-code
-code_name
-as_of_date
-per_ttm
-pbr
-gross_margin_pct
-asset_turnover
-latest_annual_year
-source_note
-```
-
-입력:
+marketdata 환경에서 KRX 점검 후 20종목 시험 수집:
 
 ```cmd
-python bootstrap_value_quality_data.py data\value_fundamentals.csv
+python collect_value_fundamentals.py --check-market
+python collect_value_fundamentals.py --limit 20
 ```
+
+전체 대상 수집 및 상태 확인:
+
+```cmd
+python collect_value_fundamentals.py --limit 0
+python collect_value_fundamentals.py --stats
+```
+
+`--limit` 기본값은 20이며 `0`은 전체 대상입니다. 수집은 KRX 시가총액과 OpenDART 재무정보를 결합해 `value_quality.db`의 `value_fundamental_snapshot`에 검증된 지표를 저장합니다.
+
+| 출력 | 의미 |
+|---|---|
+| attempted | 수집 시도 종목 수 |
+| saved | 이번 실행에서 저장한 종목 수 |
+| skipped | 자료 부족 또는 검증 조건으로 제외된 종목 수 |
+| total | DB 스냅샷 행 수 |
+| validated | 수집기 검증 표시가 있는 행 수 |
+| fresh | 검증과 최신성 조건을 만족하는 행 수 |
+| qualified | 최신성 및 전략 재무 필터를 모두 통과한 후보 수 |
+
+2026-10-13 사용자 PC 로그에서 KRX 조회 2,781행, 20종목 시도 중 8종목 저장, validated/fresh 각각 8, qualified 0을 확인했습니다. 이는 당시 20종목 시험 결과이며 전체 시장 후보가 0이라는 뜻은 아닙니다.
 
 현재 필터:
 
 ```text
 0 < PER(TTM) <= 15
 0 < PBR <= 1
-30 <= 매출총이익률 <= 95
-1 <= 총자산회전율 <= 10
+30 <= 연간 매출총이익률 <= 95
+1 <= 연간 총자산회전율 <= 10
 ```
 
-재무데이터가 없거나 조건 충족 종목이 없으면:
+최근 12개월 이익으로 PER을 계산하고, 최신 자본으로 PBR을 계산합니다. 연결/별도 재무제표 기준을 혼합하지 않습니다. 현재 수집기는 12월 결산·원화·지원 계정 항목 및 단일 보통주 종류 등 제한된 조건을 지원합니다. 여러 주식 종류, 주식수 변경, 필수 항목 누락, 비양수 분모/이익은 제외 사유가 될 수 있으며 기업 자체의 투자 적격 여부를 뜻하지 않습니다.
 
-```text
-[ValueQuality] 저평가 우량주 후보 준비: 0종목
-```
+최신성 정책은 시가총액 기준일 7일, 최신 재무기간 말일 240일, 연간 재무기간 말일 550일 이내입니다. 수집 성공과 투자 조건 충족은 다릅니다. `qualified=0`이어도 `saved/fresh>0`이면 수집이 성공한 사례일 수 있습니다.
 
-이 출력될 수 있습니다.
+수집을 완료한 뒤 매매 프로그램을 재시작해 후보를 다시 로드합니다. 실행 중인 프로그램의 메모리 캐시가 수집 결과로 즉시 교체되는 방식은 아닙니다.
+
+### 기존 CSV 입력 경로
+
+`bootstrap_value_quality_data.py`는 수동 입력용으로 남아 있습니다. 기존 지표 CSV만 넣으면 검증되지 않은 입력으로 저장되므로 자동매매 후보에 포함되지 않습니다. 검증 여부·재무기간·출처 등 수정본의 검증 메타데이터가 필요하며, 현재 운영 절차에서는 자동 수집을 우선 사용합니다. 후보 편입을 위해 검증 표시만 임의로 바꾸지 않습니다.
 
 ---
 
@@ -401,7 +554,8 @@ kiwoom\Scripts\activate
 
 python -c "import struct; print('bitness=', struct.calcsize('P') * 8)"
 python -c "from PyQt5.QAxContainer import QAxWidget; print('QAx OK')"
-python -c "import sqlite3; c=sqlite3.connect('market_history.db'); print(c.execute('select count(*) from stock_master where active=1').fetchone()); print(c.execute('select count(*) from daily_price').fetchone()); c.close()"
+python -c "import sqlite3; c=sqlite3.connect('file:market_history.db?mode=ro',uri=True); print(c.execute('select count(*) from stock_master where active=1').fetchone()); print(c.execute('select count(*) from daily_price').fetchone()); c.close()"
+python collect_value_fundamentals.py --stats
 ```
 
 목표:
@@ -410,7 +564,7 @@ python -c "import sqlite3; c=sqlite3.connect('market_history.db'); print(c.execu
 bitness= 32
 QAx OK
 stock_master 활성 종목 > 0
-daily_price 행 수 > 0
+daily_price 행 수 > 0 (이것만으로 필요한 180봉 충족을 의미하지 않음)
 ```
 
 ---
@@ -620,42 +774,64 @@ Kiwoom 틱
 
 ## 19. 운영 시 권장 프로세스
 
-### CMD 1 — Kiwoom 자동매매
+먼저 프로젝트 루트의 CMD에서 수집을 완료하고 결과를 확인합니다.
 
 ```cmd
-cd C:\경로\SystemTrading
+update_market_data.bat
+```
+
+이후 세 프로세스를 각각 유지합니다.
+
+### CMD 1 — Kiwoom 자동매매
+
+현재 매매 실행 배치 파일 또는:
+
+```cmd
+cd /d C:\경로\SystemTrading
 set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
-set "SYSTEMTRADING_MOMENTUM_LIVE=1"
+set "SYSTEMTRADING_PAPER_TICK_CSV=%CD%\ticks\breakout.csv"
 py -3.9-32 main.py
 ```
+
+모멘텀 신규매수 변수는 13절에 따라 별도로 선택합니다. 위 예시는 변수를 설정하지 않으므로 이미 전달된 환경값을 사용합니다.
 
 ### CMD 2 — FastAPI
 
 ```cmd
-cd C:\경로\SystemTrading
+cd /d C:\경로\SystemTrading
 webenv\Scripts\activate
 set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
 python run_web_api.py
 ```
 
+현재 웹 배치 파일을 사용한다면 웹 환경이 준비된 이 CMD에서 실행합니다.
+
 ### CMD 3 — React
 
 ```cmd
-cd C:\경로\SystemTrading\web_frontend
+cd /d C:\경로\SystemTrading\web_frontend
 npm run dev
 ```
 
-역할:
+| 프로세스 | 역할 |
+|---|---|
+| CMD 1 | 거래·실시간 처리 및 DB 기록 |
+| CMD 2 | 모니터링 조회·MA 설정 API |
+| CMD 3 | 사용자 대시보드 |
 
-```text
-CMD 1 = 거래/실시간 데이터 생산
-CMD 2 = SQLite 모니터링 조회 및 MA 설정 저장 API
-CMD 3 = 사용자 화면
-```
+수집 배치는 세 프로세스를 자동 실행하지 않습니다. 매일 환경을 다시 만들거나 패키지를 재설치할 필요는 없습니다.
 
 ---
 
 ## 20. 검증 기록
+
+### 2026-10-13 실행 절차 갱신
+
+- 기존 marketdata Python 3.12.13 / 64bit 실행 경로를 사용자 PC에서 확인했습니다.
+- KRX 점검과 재무 20종목 시험 수집의 실제 사용자 로그를 확인했습니다. 전체 수집 및 변경 후 전체 전략 초기화 성공까지 확인한 것은 아닙니다.
+- README는 현재 GitHub main의 내용을 기준으로 실행 절차를 수정했습니다. 데이터 수집 수정본과 배치 파일은 별도로 설치되어 있어야 합니다.
+- `update_market_data.bat`는 정적 검토만 수행했으며 Windows 실제 실행은 아직 확인하지 않았습니다.
+
 
 ### 2026-10-08~09 패치 검증
 
@@ -818,10 +994,36 @@ python bootstrap_market_history.py
 다음 확인:
 
 ```text
-value_quality.db 재무 데이터 존재 여부
-CSV 입력 여부
+value_quality.db의 total / validated / fresh / qualified
+수집 결과의 제외 사유
+시가총액 기준일 및 재무기간 최신성
 현재 필터 충족 여부
+수집 후 main.py 재시작 여부
 ```
+
+### 터미널 python이 선택한 VS Code 인터프리터와 다름
+
+```cmd
+python -c "import sys; print(sys.executable)"
+call "%USERPROFILE%\anaconda3\condabin\conda.bat" activate marketdata
+python -c "import sys; print(sys.executable)"
+```
+
+위 명령은 CMD 기준입니다. 인터프리터 선택과 기존 터미널 환경을 구분하고 실제 경로를 확인합니다.
+
+### KRX 조회 실패 또는 DataFrame 컬럼 KeyError
+
+marketdata 환경의 pykrx 요구 버전과 `.env`의 `KRX_ID`, `KRX_PW`를 확인한 뒤:
+
+```cmd
+python collect_value_fundamentals.py --check-market
+```
+
+DART 인증키만으로 KRX 로그인을 대체할 수 없습니다. 인증 정보를 포함한 로그는 공유하지 마세요.
+
+### DART_STATUS:020
+
+요청 제한 오류입니다. 수집을 계속 재실행하지 말고 OpenDART 이용현황과 인증키의 요청 한도를 확인합니다. 종목 수가 곧 요청 횟수는 아닙니다.
 
 ### 웹 화면의 가격이 움직이지 않음
 
@@ -869,9 +1071,12 @@ CSV 입력 여부
 - [ ] Kiwoom OpenAPI 설치/버전처리 완료
 - [ ] Python 3.9 32bit 확인
 - [ ] QAxContainer import 확인
-- [ ] marketdata 64bit 확인
-- [ ] market_history.db 구축
-- [ ] ValueQuality 사용 시 재무 데이터 적재
+- [ ] marketdata Python 실행 경로·64bit·pykrx 요구 버전 확인
+- [ ] KRX 로그인 및 DART 인증키 설정
+- [ ] `collect_value_fundamentals.py --check-market` 성공
+- [ ] `update_market_data.bat`를 프로젝트 루트에 배치
+- [ ] market_history.db 구축 및 필요한 종목의 180봉 이력 확인
+- [ ] ValueQuality 재무 수집 후 fresh/qualified 및 제외 사유 확인
 - [ ] Telegram 환경변수 설정
 - [ ] main.py 초기화 성공
 - [ ] `VirtualStrategyEngine` 캐시 복원 로그 확인
@@ -894,3 +1099,4 @@ This project is licensed under the GNU General Public License v3.0 only (GPL-3.0
 See [LICENSE](./LICENSE) for details.
 
 Third-party open-source dependencies and licenses are documented in [THIRD_PARTY.md](./THIRD_PARTY.md).
+

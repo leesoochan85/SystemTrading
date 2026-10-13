@@ -101,6 +101,8 @@ class Kiwoom(QAxWidget):
         else:
             print("로그인 실패")
 
+        print(f"로그인실패: err_code={err_code}")
+
         self.login_event_loop.exit()
 
     def comm_connect(self):

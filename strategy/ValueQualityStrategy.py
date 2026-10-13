@@ -21,6 +21,8 @@ from util.value_quality_data import (
     ensure_value_position_state,
     get_db_path as get_value_db_path,
     load_value_candidates,
+    fundamental_is_fresh,
+    get_fundamental_status,
     save_value_position_state,
 )
 
@@ -149,6 +151,8 @@ class ValueQualityStrategy(QThread):
         self,
         shared_universe_df=None,
     ):
+        status = get_fundamental_status(self.value_db_path)
+        print(f"[ValueQuality] 재무 DB: 전체 {status['total']} / 검증 {status['validated']} / 최신 {status['fresh']}")
         candidates = load_value_candidates(
             per_min=self.PER_MIN,
             per_max=self.PER_MAX,
@@ -341,6 +345,8 @@ class ValueQualityStrategy(QThread):
 
     def _is_qualified_candidate(self, code):
         info = self.universe.get(code, {})
+        if not fundamental_is_fresh(info):
+            return False
 
         try:
             per_ttm = float(info.get("per_ttm"))

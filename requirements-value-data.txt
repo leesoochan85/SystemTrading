@@ -1,0 +1,5 @@
+# Install in a Python>=3.10 64bit data environment, not the Kiwoom environment.
+requests>=2.31,<3
+pandas>=1.5,<3
+pykrx==1.2.9
+python-dotenv>=1,<2

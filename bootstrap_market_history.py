@@ -16,6 +16,7 @@ import struct
 
 from util.market_history import (
     DEFAULT_LOOKBACK_CALENDAR_DAYS,
+    DEFAULT_REQUIRED_HISTORY_ROWS,
     DEFAULT_INCREMENTAL_OVERLAP_CALENDAR_DAYS,
     bootstrap_market_history,
     get_db_path,
@@ -29,6 +30,12 @@ def main():
         type=int,
         default=DEFAULT_LOOKBACK_CALENDAR_DAYS,
         help="달력일 기준 과거 조회 범위",
+    )
+    parser.add_argument(
+        "--min-history-rows",
+        type=int,
+        default=DEFAULT_REQUIRED_HISTORY_ROWS,
+        help="과거 보충 목표 일봉 수 (기본 180거래일)",
     )
     parser.add_argument(
         "--overlap-days",
@@ -58,6 +65,7 @@ def main():
         lookback_calendar_days=args.lookback_days,
         request_sleep=args.sleep,
         incremental_overlap_calendar_days=args.overlap_days,
+        required_history_rows=args.min_history_rows,
     )
     print("[초기 일봉 구축 완료]", result)
 

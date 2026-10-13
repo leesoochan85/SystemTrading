@@ -50,3 +50,9 @@ __pycache__/
 
 __pycache__/
 *.pyc
+
+# Financial collection cache, diagnostics and API credentials
+data/value_cache/
+data/value_reports/
+.env
+.venv-data/

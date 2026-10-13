@@ -41,7 +41,7 @@ def sanitize_telegram_message(message):
     Other recognized filesystem paths become [경로 숨김]. This is path
     redaction, not filtering of credentials or other personal information.
     """
-    text = str(message)
+    text = re.sub(r"(https?://api\.telegram\.org/bot)[^/\s?]+", r"\1[토큰 숨김]", str(message))
     text = _TRACEBACK_FILE.sub(
         lambda match: (
             match.group(1)
@@ -78,13 +78,13 @@ def send_message(message, token=Telegram_bot_TOKEN, chat_id=Telegram_chat_ID):
         result = response.json()
 
         if not response.ok or not result.get("ok", False):
-            print(f"[Telegram failed] {result}")
+            print(f"[Telegram failed] HTTP {response.status_code}")
             return None
 
         return result
 
     except Exception as e:
-        print(f"[Telegram error] {e}")
+        print(f"[Telegram error] {type(e).__name__}")
         return None
 
 
@@ -143,41 +143,34 @@ def send_error(message, *, event_key, error_identity=None, token=Telegram_bot_TO
     return send_message(outgoing, token=token, chat_id=chat_id)
 
 
-def get_updates(offset=None, token=Telegram_bot_TOKEN):
-    """
-    Telegram 채팅방에서 새 메시지를 가져온다.
+class TelegramAPIError(RuntimeError):
+    """API failure without credential URLs or raw server response bodies."""
 
-    주의:
-    - StrategyManager의 QTimer 안에서 실행되므로 long polling을 사용하지 않는다.
-    - timeout=0으로 즉시 결과만 받아 매매 루프 지연을 최소화한다.
+
+def get_updates(offset=None, token=Telegram_bot_TOKEN, *,
+                request_timeout=(3, 5), raise_errors=False):
+    """Fetch commands. StrategyManager calls this in its reception worker.
+
+    Telegram timeout=0 is server-side short polling; request_timeout controls
+    HTTP connect/read waiting. Do not call synchronously in a Qt timer.
     """
     if not token:
         return []
-
     target_url = f"https://api.telegram.org/bot{token}/getUpdates"
-
-    params = {
-        "timeout": 0,
-        "allowed_updates": json.dumps(["message"]),
-    }
-
+    params = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
     if offset is not None:
         params["offset"] = offset
-
     try:
-        response = requests.get(
-            target_url,
-            params=params,
-            timeout=1,
-        )
+        response = requests.get(target_url, params=params, timeout=request_timeout)
         result = response.json()
-
         if not response.ok or not result.get("ok", False):
-            print(f"[Telegram getUpdates failed] {result}")
-            return []
-
-        return result.get("result", [])
-
-    except Exception as e:
-        print(f"[Telegram getUpdates error] {e}")
+            raise TelegramAPIError(f"HTTP {response.status_code}")
+        updates = result.get("result", [])
+        if not isinstance(updates, list):
+            raise TelegramAPIError("Invalid updates response")
+        return updates
+    except Exception as exc:
+        if raise_errors:
+            raise
+        print(f"[Telegram getUpdates error] {type(exc).__name__}")
         return []

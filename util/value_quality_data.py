@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
+import math
 from pathlib import Path
 import sqlite3
 from typing import Dict, Optional
@@ -8,6 +9,9 @@ from typing import Dict, Optional
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "value_quality.db"
 SQLITE_BUSY_TIMEOUT_MS = 15_000
+MAX_QUOTE_AGE_DAYS = 7
+MAX_FINANCIAL_AGE_DAYS = 240
+MAX_ANNUAL_AGE_DAYS = 550
 
 
 def _connect(db_path: Path = DB_PATH):
@@ -58,6 +62,19 @@ def init_value_quality_tables(
             )
         """)
 
+        columns = {row[1] for row in con.execute("PRAGMA table_info(value_fundamental_snapshot)")}
+        for name, definition in (
+            ("validated", "INTEGER NOT NULL DEFAULT 0"),
+            ("financial_period_end", "TEXT"),
+            ("annual_period_end", "TEXT"),
+            ("validation_note", "TEXT"),
+        ):
+            if name not in columns:
+                con.execute(f"ALTER TABLE value_fundamental_snapshot ADD COLUMN {name} {definition}")
+        con.execute("""CREATE TABLE IF NOT EXISTS value_collection_status (
+            code TEXT PRIMARY KEY, checked_at TEXT NOT NULL, reason TEXT NOT NULL
+        )""")
+
         con.execute("""
             CREATE TABLE IF NOT EXISTS value_position_state (
                 code TEXT PRIMARY KEY,
@@ -101,6 +118,57 @@ def init_value_quality_tables(
         """)
 
 
+def fundamental_is_fresh(info, today=None):
+    """Date freshness and complete finite metrics; not strategy thresholds."""
+    today = today or datetime.now().date()
+    if info.get("validated") != 1 or not info.get("source_note"):
+        return False
+    try:
+        for name in ("per_ttm", "pbr", "gross_margin_pct", "asset_turnover"):
+            if not math.isfinite(float(info.get(name))):
+                return False
+        if float(info["per_ttm"]) <= 0 or float(info["pbr"]) <= 0:
+            return False
+        dates = {}
+        for field, max_age in (("as_of_date", MAX_QUOTE_AGE_DAYS),
+                               ("financial_period_end", MAX_FINANCIAL_AGE_DAYS),
+                               ("annual_period_end", MAX_ANNUAL_AGE_DAYS)):
+            value = str(info.get(field) or "")
+            if len(value) != 8 or not value.isdigit():
+                return False
+            day = datetime.strptime(value, "%Y%m%d").date()
+            if not 0 <= (today - day).days <= max_age:
+                return False
+            dates[field] = day
+        if not dates["annual_period_end"] <= dates["financial_period_end"] <= dates["as_of_date"]:
+            return False
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
+def mark_fundamental_invalid(code, reason, db_path=DB_PATH):
+    """Keep previous values for audit but stop using failed refresh rows."""
+    init_value_quality_tables(db_path)
+    code = str(code).strip().zfill(6)
+    with _connect(db_path) as con:
+        con.execute("UPDATE value_fundamental_snapshot SET validated=0, validation_note=? WHERE code=?",
+                    (str(reason), code))
+        con.execute("""INSERT INTO value_collection_status VALUES (?,?,?)
+            ON CONFLICT(code) DO UPDATE SET checked_at=excluded.checked_at, reason=excluded.reason""",
+            (code, datetime.now().strftime("%Y%m%d%H%M%S"), str(reason)))
+
+
+def get_fundamental_status(db_path=DB_PATH):
+    init_value_quality_tables(db_path)
+    with _connect(db_path) as con:
+        rows = [dict(r) for r in con.execute("SELECT * FROM value_fundamental_snapshot")]
+        reasons = [dict(r) for r in con.execute("SELECT reason, COUNT(*) count FROM value_collection_status GROUP BY reason")]
+    return {"total": len(rows), "validated": sum(r["validated"] == 1 for r in rows),
+            "fresh": sum(fundamental_is_fresh(r) for r in rows),
+            "qualified": len(load_value_candidates(db_path=db_path)), "reasons": reasons}
+
+
 def upsert_fundamental_snapshot(
     code: str,
     code_name: str,
@@ -112,12 +180,22 @@ def upsert_fundamental_snapshot(
     latest_annual_year: Optional[str] = None,
     source_note: Optional[str] = None,
     db_path: Path = DB_PATH,
+    *, validated: bool = False,
+    financial_period_end: Optional[str] = None,
+    annual_period_end: Optional[str] = None,
+    validation_note: Optional[str] = None,
 ):
     init_value_quality_tables(db_path)
 
     now_text = datetime.now().strftime("%Y%m%d%H%M%S")
     code = str(code).strip().zfill(6)
 
+    info = dict(as_of_date=as_of_date, per_ttm=per_ttm, pbr=pbr,
+                gross_margin_pct=gross_margin_pct, asset_turnover=asset_turnover,
+                validated=int(validated), financial_period_end=financial_period_end,
+                annual_period_end=annual_period_end, source_note=source_note)
+    if validated and not fundamental_is_fresh(info):
+        raise ValueError("검증된 재무 데이터의 지표/기준일이 유효하지 않습니다.")
     with _connect(db_path) as con:
         con.execute("""
             INSERT INTO value_fundamental_snapshot (
@@ -125,9 +203,10 @@ def upsert_fundamental_snapshot(
                 per_ttm, pbr,
                 gross_margin_pct, asset_turnover,
                 latest_annual_year,
-                source_note, updated_at
+                source_note, updated_at, validated, financial_period_end,
+                annual_period_end, validation_note
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(code) DO UPDATE SET
                 code_name = excluded.code_name,
                 as_of_date = excluded.as_of_date,
@@ -137,7 +216,11 @@ def upsert_fundamental_snapshot(
                 asset_turnover = excluded.asset_turnover,
                 latest_annual_year = excluded.latest_annual_year,
                 source_note = excluded.source_note,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                validated = excluded.validated,
+                financial_period_end = excluded.financial_period_end,
+                annual_period_end = excluded.annual_period_end,
+                validation_note = excluded.validation_note
         """, (
             code,
             str(code_name or code),
@@ -148,8 +231,12 @@ def upsert_fundamental_snapshot(
             asset_turnover,
             latest_annual_year,
             source_note,
-            now_text,
+            now_text, int(validated), financial_period_end,
+            annual_period_end, validation_note,
         ))
+        con.execute("""INSERT INTO value_collection_status VALUES (?,?,?)
+            ON CONFLICT(code) DO UPDATE SET checked_at=excluded.checked_at, reason=excluded.reason""",
+            (code, now_text, "OK" if validated else "UNVERIFIED_IMPORT"))
 
 
 def load_value_candidates(
@@ -176,7 +263,8 @@ def load_value_candidates(
             SELECT *
             FROM value_fundamental_snapshot
             WHERE
-                per_ttm > ?
+                validated = 1
+                AND per_ttm > ?
                 AND per_ttm <= ?
                 AND pbr > ?
                 AND pbr <= ?
@@ -203,7 +291,7 @@ def load_value_candidates(
 
     return {
         str(row["code"]).zfill(6): dict(row)
-        for row in rows
+        for row in rows if fundamental_is_fresh(dict(row))
     }
 
 

@@ -82,9 +82,14 @@ def main():
                     row.get("source_note")
                     or None
                 ),
+                validated=str(row.get("validated", "0")).strip() == "1",
+                financial_period_end=row.get("financial_period_end") or None,
+                annual_period_end=row.get("annual_period_end") or None,
+                validation_note="CSV import",
             )
             count += 1
 
+    print("[ValueQuality] 검증 메타데이터 없는 CSV는 기록만 저장하며 신규매수 후보에서 제외됩니다.")
     print(
         f"[ValueQuality] fundamental "
         f"{count}건 저장 완료"

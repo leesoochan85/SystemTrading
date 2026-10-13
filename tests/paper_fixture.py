@@ -51,6 +51,10 @@ def qt_stubs():
     for name in ("QThread", "QObject", "QTimer"):
         if not hasattr(core, name):
             setattr(core, name, type(name, (), {}))
+    if not hasattr(core, "QCoreApplication"):
+        core.QCoreApplication = type("QCoreApplication", (), {
+            "instance": staticmethod(lambda: None),
+        })
     notifier = sys.modules.setdefault("util.notifier", types.ModuleType("util.notifier"))
     notifier.send_message = lambda *args, **kwargs: None
     notifier.send_error = lambda *args, **kwargs: None

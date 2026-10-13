@@ -28,7 +28,8 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = PROJECT_ROOT / "market_history.db"
 MIN_HISTORY_DAYS = 65
-DEFAULT_LOOKBACK_CALENDAR_DAYS = 180
+DEFAULT_LOOKBACK_CALENDAR_DAYS = 400
+DEFAULT_REQUIRED_HISTORY_ROWS = 180
 DEFAULT_INCREMENTAL_OVERLAP_CALENDAR_DAYS = 10
 EXCLUDED_COMPANY_NAME_KEYWORDS = ("스팩", "리츠")
 SQLITE_BUSY_TIMEOUT_MS = 15_000
@@ -323,18 +324,21 @@ def bootstrap_market_history(
     request_sleep: float = 0.35,
     codes: Iterable[str] | None = None,
     incremental_overlap_calendar_days: int = DEFAULT_INCREMENTAL_OVERLAP_CALENDAR_DAYS,
+    required_history_rows: int = DEFAULT_REQUIRED_HISTORY_ROWS,
 ) -> dict:
     """현재 전략 유니버스의 과거 일봉을 종목별 기간 조회로 적재한다.
 
     동작 방식
     ---------
-    - 65거래일 미만: 최근 lookback_calendar_days 전체 구간을 조회해 초기 구축한다.
-    - 65거래일 이상: 마지막 저장일 직전 며칠부터 어제까지 다시 조회해 누락분만 보충한다.
+    - required_history_rows 미만: 최신 날짜까지 있어도 과거 조회 범위를 다시 수집한다.
+    - 충분한 이력: 마지막 저장일 직전 며칠부터 어제까지 누락분만 보충한다.
       기존 날짜는 (code, date) PRIMARY KEY + INSERT OR REPLACE로 안전하게 덮어쓴다.
 
     따라서 Kiwoom 프로그램이 장마감까지 실행된 날은 당일 일봉이 DB에 이어지고,
     실행되지 못한 날은 다음 수집기 실행 시 pykrx가 빠진 구간을 보충한다.
     """
+    if required_history_rows < 1 or lookback_calendar_days < 1:
+        raise ValueError("required_history_rows와 lookback_calendar_days는 양수여야 합니다.")
     end_date = datetime.now().date() - timedelta(days=1)
     start_date = end_date - timedelta(days=lookback_calendar_days)
     start_text = start_date.strftime("%Y%m%d")
@@ -363,11 +367,15 @@ def bootstrap_market_history(
     up_to_date_codes = 0
     initial_build_codes = 0
     incremental_codes = 0
+    backfill_codes = 0
     inserted_rows = 0
     failed_codes = []
     empty_codes = []
 
-    history_counts = get_code_history_counts(target_codes, db_path=db_path)
+    completed_before = (end_date + timedelta(days=1)).strftime("%Y%m%d")
+    history_counts = get_code_history_counts(
+        target_codes, db_path=db_path, before_date=completed_before
+    )
     latest_dates = get_code_latest_dates(target_codes, db_path=db_path)
 
     overlap_days = max(1, int(incremental_overlap_calendar_days))
@@ -376,39 +384,30 @@ def bootstrap_market_history(
         stored_count = int(history_counts.get(code, 0) or 0)
         latest_date_text = latest_dates.get(code)
 
-        # 최신 일봉까지 이미 있으면 이력 길이와 관계없이 외부 요청을 건너뛴다.
-        # 신규상장 종목처럼 65거래일 미만인 종목도 DB에는 그대로 유지하고
-        # Kiwoom 장마감 저장 또는 다음 증분 수집을 통해 자연스럽게 일봉을 쌓는다.
-        if latest_date_text and latest_date_text >= end_text:
+        # A/B needs 180 completed bars. Recent dates alone do not prove
+        # sufficient history; refill the requested past range when short.
+        needs_backfill = stored_count < required_history_rows
+        if latest_date_text and latest_date_text >= end_text and not needs_backfill:
             up_to_date_codes += 1
-            eligibility = (
-                "전략대상" if stored_count >= MIN_HISTORY_DAYS
-                else f"이력축적중({stored_count}/{MIN_HISTORY_DAYS})"
-            )
             print(
-                f"[{idx}/{len(target_codes)}] {code}: "
-                f"최신 {latest_date_text} / {stored_count}거래일 / {eligibility} - 건너뜀"
+                f"[{idx}/{len(target_codes)}] {code}: 최신 {latest_date_text} / "
+                f"{stored_count}거래일 / 목표 {required_history_rows}봉 충족 - 건너뜀"
             )
             continue
 
-        # 데이터가 한 건도 없을 때만 180일 전체 초기 구축을 수행한다.
-        # 1거래일이라도 이미 있으면 65일 미만이어도 마지막 저장일 주변만 증분 보충한다.
         if not latest_date_text:
             fetch_start_text = start_text
-            mode_text = f"초기 구축 ({stored_count}거래일 보유)"
+            mode_text = f"초기 구축 ({stored_count}/{required_history_rows}봉)"
             initial_build_codes += 1
+        elif needs_backfill:
+            fetch_start_text = start_text
+            mode_text = f"과거 이력 보충 ({stored_count}/{required_history_rows}봉)"
+            backfill_codes += 1
         else:
             latest_date = datetime.strptime(latest_date_text, "%Y%m%d").date()
             fetch_start_date = latest_date - timedelta(days=overlap_days)
             fetch_start_text = fetch_start_date.strftime("%Y%m%d")
-            eligibility = (
-                "전략대상" if stored_count >= MIN_HISTORY_DAYS
-                else f"이력축적중({stored_count}/{MIN_HISTORY_DAYS})"
-            )
-            mode_text = (
-                f"증분 보충 (기존 {stored_count}거래일 / "
-                f"최신 {latest_date_text} / {eligibility})"
-            )
+            mode_text = f"증분 보충 (기존 {stored_count}봉 / 최신 {latest_date_text})"
             incremental_codes += 1
 
         print(
@@ -454,20 +453,19 @@ def bootstrap_market_history(
         time.sleep(request_sleep)
 
     status = get_history_status(db_path=db_path)
-    missing_codes = get_missing_history_codes(
-        target_codes,
-        minimum_rows=MIN_HISTORY_DAYS,
-        db_path=db_path,
+    completed_counts = get_code_history_counts(
+        target_codes, db_path=db_path, before_date=completed_before
     )
+    missing_codes = [code for code in target_codes
+                     if completed_counts.get(code, 0) < required_history_rows]
 
-    # 전체시장에는 신규상장 등으로 구조적으로 65거래일을 채울 수 없는 종목이
-    # 항상 존재할 수 있다. 따라서 bootstrap 자체를 실패시키지 않는다.
-    # 이 종목들은 DB에 계속 누적하고, 65거래일을 채운 날부터 전략 계산에 자동 편입한다.
+    # Newly listed stocks may not have enough actual trading days. Keep
+    # their real history and report the shortage without padding or deleting.
     if missing_codes:
         preview = ", ".join(missing_codes[:10])
         print(
-            f"[이력 축적 중] {MIN_HISTORY_DAYS}거래일 미만 {len(missing_codes)}종목 - "
-            f"현재는 전략 대상에서 제외됩니다. 예: {preview}"
+            f"[이력 축적 중] 목표 {required_history_rows}봉 미만 {len(missing_codes)}종목 - "
+            f"목표 이력 부족 (다른 전략의 자격은 별도 판단). 예: {preview}"
         )
 
     return {
@@ -477,6 +475,8 @@ def bootstrap_market_history(
         "up_to_date_codes": up_to_date_codes,
         "initial_build_codes": initial_build_codes,
         "incremental_codes": incremental_codes,
+        "backfill_codes": backfill_codes,
+        "required_history_rows": required_history_rows,
         "inserted_rows": inserted_rows,
         "eligible_code_count": len(target_codes) - len(missing_codes),
         "insufficient_history_count": len(missing_codes),
@@ -507,16 +507,19 @@ def get_history_status(db_path: Path = DB_PATH) -> dict:
     }
 
 
-def get_code_history_counts(codes: Iterable[str], db_path: Path = DB_PATH) -> Dict[str, int]:
+def get_code_history_counts(codes: Iterable[str], db_path: Path = DB_PATH,
+                            before_date: str | None = None) -> Dict[str, int]:
     normalized = list(dict.fromkeys(str(code).strip().upper().zfill(6) for code in codes))
     if not normalized:
         return {}
 
     placeholders = ",".join("?" for _ in normalized)
+    date_filter = " AND date < ?" if before_date is not None else ""
+    params = normalized + ([before_date] if before_date is not None else [])
     with _connect(db_path) as con:
         rows = con.execute(
-            f"SELECT code, COUNT(*) FROM daily_price WHERE code IN ({placeholders}) GROUP BY code",
-            normalized,
+            f"SELECT code, COUNT(*) FROM daily_price WHERE code IN ({placeholders}){date_filter} GROUP BY code",
+            params,
         ).fetchall()
 
     counts = {str(code): int(count) for code, count in rows}

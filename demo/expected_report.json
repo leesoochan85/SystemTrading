@@ -1,5 +1,5 @@
 {
-  "scope": "C_ONLY_TICK_REPLAY",
+  "scope": "MOMENTUM_ONLY_TICK_REPLAY",
   "paper_only": true,
   "input_tick_count": 5,
   "unknown_code_tick_count": 0,

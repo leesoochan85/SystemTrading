@@ -1,4 +1,4 @@
-"""Broker execution adapter for momentum; A/B/C remain independent paper accounts."""
+"""Broker execution adapter for momentum; the momentum paper account remains independent."""
 from __future__ import annotations
 import json
 import math
@@ -59,7 +59,7 @@ class LiveMomentumStore:
 
 class LiveMomentumContractionStrategy(MomentumContractionStrategy):
     paper_only = False
-    legacy_virtual = False  # C is evaluated by PaperComparisonEngine, not the old index engine.
+    legacy_virtual = False  # Momentum paper trading is evaluated by MomentumPaperEngine, not the old index engine.
 
     def __init__(self, kiwoom, config_path=None, market_db_path=None, clock=None, live_db_path=None, allow_new_buys=False):
         args = {} if clock is None else {"clock": clock}

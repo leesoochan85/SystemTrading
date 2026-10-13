@@ -16,8 +16,8 @@ from strategy.MomentumContractionStrategy import MomentumContractionStrategy
 from strategy.StrategyManager import StrategyManager
 from util.breakout_atr import ma_profit_exit_signal, load_atr_metrics, new_atr_state_from_value
 from util.market_history import load_breakout_metrics
-from util.paper_strategy_engine import PaperComparisonEngine
-from util.paper_trading import PROFILES, MOMENTUM, BASELINE, FILTERED
+from util.paper_strategy_engine import MomentumPaperEngine
+from util.paper_trading import PROFILES, MOMENTUM
 from util.strategy_settings import get_ma_settings_status, save_ma_settings
 from util.virtual_strategy_engine import VirtualStrategyEngine
 
@@ -91,7 +91,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.high.breakout_metrics["000001"].update(load_atr_metrics(["000001"], self.path, "20260930")["000001"])
         self.high._ensure_daily_metrics = Mock()
         self.high.is_init_success = True
-        self.engine = PaperComparisonEngine([self.high, self.momentum], Path(self.directory.name) / "paper.db")
+        self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "paper.db")
         self.momentum.check_and_get_price_data()
         self.momentum.on_realtime_registered()
 
@@ -102,12 +102,12 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.engine.on_realtime_tick("000001", {"체결시간": time, "현재가": price, "저가": low,
             "누적거래량": self.cumulative_volume, "거래량": quantity})
 
-    def test_dropped_opening_trade_blocks_c_but_a_keeps_its_rules(self):
+    def test_dropped_opening_trade_blocks_momentum_entry(self):
         self.tick("090000", 16200)
         self.cumulative_volume += 100  # A missing execution, potentially the OR high.
         self.tick("090500", 16600)
         self.assertNotIn((MOMENTUM, "000001"), self.engine.broker.positions)
-        self.assertIn((BASELINE, "000001"), self.engine.broker.positions)
+        self.assertFalse(self.engine.broker.positions)
         self.assertEqual(self.momentum.runtime["000001"]["reason"], "OPENING_VOLUME_GAP")
 
     def test_rejected_stale_opening_tick_cannot_be_hidden_by_engine_guard(self):
@@ -125,7 +125,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         from io import StringIO
         ticks = Path(self.directory.name) / "recorded.csv"
         with patch.dict(os.environ, {"SYSTEMTRADING_PAPER_TICK_CSV": str(ticks)}):
-            self.engine = PaperComparisonEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
+            self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
         self.tick("090000", 16200)
         self.tick("090459", 16400)
         self.tick("090500", 16600)
@@ -142,7 +142,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         ticks = Path(self.directory.name) / "wrong.csv"
         ticks.write_text("preserve this file", encoding="utf-8")
         with patch.dict(os.environ, {"SYSTEMTRADING_PAPER_TICK_CSV": str(ticks)}):
-            self.engine = PaperComparisonEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
+            self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
         self.assertIsNone(self.engine.tick_recorder)
         self.tick("090000", 16200)
         self.tick("090500", 16600)
@@ -153,7 +153,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         import csv
         ticks = Path(self.directory.name) / "new_candidate.csv"
         with patch.dict(os.environ, {"SYSTEMTRADING_PAPER_TICK_CSV": str(ticks)}):
-            self.engine = PaperComparisonEngine([self.momentum], Path(self.directory.name) / "capture.db")
+            self.engine = MomentumPaperEngine([self.momentum], Path(self.directory.name) / "capture.db")
         metric = self.momentum.metrics["000001"]
         self.momentum.metrics = {}
         self.momentum.ensure_daily_metrics = Mock(side_effect=lambda now: self.momentum.metrics.update({"000001": metric}))
@@ -164,11 +164,11 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["trade_time"], "090000")
 
-    def test_actual_strategies_share_stream_but_have_independent_accounts(self):
+    def test_only_momentum_account_trades_on_shared_stream(self):
         self.assertTrue(self.momentum.metrics["000001"]["eligible"])
         self.tick("090000", 16200)
         self.tick("090100", 16550)
-        self.assertEqual(set(p for p, _ in self.engine.broker.positions), {BASELINE, FILTERED})
+        self.assertFalse(self.engine.broker.positions)
         self.tick("090500", 16600)
         self.assertEqual(set(p for p, _ in self.engine.broker.positions), set(PROFILES))
         c = self.engine.broker.positions[(MOMENTUM, "000001")]
@@ -178,7 +178,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.assertFalse(self.kiwoom.send_order.called)
         self.engine.flush_snapshot_if_due(force=True)
         with closing(sqlite3.connect(self.engine.broker.db_path)) as con:
-            self.assertEqual(con.execute("SELECT COUNT(*) FROM paper_equity").fetchone()[0], 3)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM paper_equity").fetchone()[0], 1)
 
     def test_holdings_remain_managed_without_a_current_candidate_or_db(self):
         self.tick("090000", 16200)
@@ -188,17 +188,17 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.momentum.exit_context = Mock(side_effect=AssertionError("fixed stop must work without MA data"))
         self.tick("090600", 16000, low=15900)
         self.assertNotIn((MOMENTUM, "000001"), self.engine.broker.positions)
-        self.assertIn("000001", self.engine.get_open_codes())  # A/B still held.
+        self.assertFalse(self.engine.get_open_codes())
         with closing(sqlite3.connect(self.engine.broker.db_path)) as con:
             reason, price = con.execute("SELECT reason_code,price FROM paper_trade WHERE strategy_name=? AND event_type='SELL'", (MOMENTUM,)).fetchone()
         self.assertEqual((reason, price), ("DAY_LOW_STOP", 15992))
 
-    def test_late_start_only_blocks_c_new_entries(self):
+    def test_late_start_blocks_momentum_new_entries(self):
         self.now = datetime(2026, 9, 30, 9, 1)
         self.momentum.on_realtime_registered()
         self.tick("090500", 16600)
         self.assertNotIn((MOMENTUM, "000001"), self.engine.broker.positions)
-        self.assertIn((BASELINE, "000001"), self.engine.broker.positions)
+        self.assertFalse(self.engine.broker.positions)
         self.assertEqual(self.momentum.runtime["000001"]["reason"], "OPENING_RANGE_MISSING")
 
     def test_missing_stale_or_out_of_order_trade_time_cannot_fill_paper_accounts(self):
@@ -275,7 +275,7 @@ class PaperApiTest(unittest.TestCase):
             from web_api import database
             missing = Path(directory) / "missing.db"
             with patch.object(database, "PAPER_DB", missing):
-                url = "/api/strategies/MomentumContractionStrategy/paper-comparison"
+                url = "/api/strategies/MomentumContractionStrategy/paper-account"
                 self.assertEqual(client.get(url).status_code, 200)
                 self.assertFalse(client.get(url).json()["ready"])
                 self.assertEqual(client.get(url + "?candidate_limit=201").status_code, 422)

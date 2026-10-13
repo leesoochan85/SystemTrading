@@ -5,7 +5,7 @@ import time
 
 from util.db_helper import save_strategy_signal
 from util.time_helper import check_transaction_open
-from util.paper_strategy_engine import PaperComparisonEngine
+from util.paper_strategy_engine import MomentumPaperEngine
 from util.virtual_trading import (
     bulk_update_virtual_positions,
     close_virtual_position,
@@ -40,7 +40,7 @@ class VirtualStrategyEngine:
         self.position_cache = {}
         self.dirty_position_keys = set()
         self.last_snapshot_at = 0.0
-        self.paper_engine = PaperComparisonEngine(strategies)
+        self.paper_engine = MomentumPaperEngine(strategies)
 
         self.reentry_guard_date = None
         self.entered_today_keys = set()

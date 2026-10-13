@@ -5,10 +5,6 @@ from typing import Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from util.strategy_settings import (
-    SettingsConflictError, get_ma_settings_status, save_ma_settings,
-)
 
 from .database import (
     DatabaseNotReadyError,
@@ -31,7 +27,7 @@ from .database import (
     get_virtual_strategy_index_history,
     get_virtual_event_summary,
     get_virtual_events,
-    get_paper_comparison,
+    get_paper_account,
 )
 from .strategies import (
     get_all_strategy_configs,
@@ -149,13 +145,14 @@ def strategies():
     return {"items": _strategy_summaries(datetime.now().strftime("%Y%m%d"))}
 
 
-@app.get("/api/strategies/{strategy_name}/paper-comparison")
-def paper_comparison(strategy_name: str, candidate_limit: int = Query(100, ge=1, le=200),
+@app.get("/api/strategies/{strategy_name}/paper-comparison", include_in_schema=False)
+@app.get("/api/strategies/{strategy_name}/paper-account")
+def paper_account(strategy_name: str, candidate_limit: int = Query(100, ge=1, le=200),
                      trade_limit: int = Query(100, ge=1, le=200)):
     config = _require_strategy(strategy_name)
-    if not config.get("supports_paper_comparison"):
-        raise HTTPException(status_code=404, detail="가상 계좌 비교를 지원하지 않는 전략입니다")
-    return get_paper_comparison(candidate_limit, trade_limit)
+    if not config.get("supports_paper_account"):
+        raise HTTPException(status_code=404, detail="가상 계좌를 지원하지 않는 전략입니다")
+    return get_paper_account(candidate_limit, trade_limit)
 
 
 @app.get("/api/strategies/{strategy_name}")
@@ -165,42 +162,12 @@ def strategy_detail(strategy_name: str):
 
     return {
         **config,
-        **({"ma_settings": get_ma_settings_status()} if strategy_name == "MomentumContractionStrategy" else {}),
         "virtual_performance": get_virtual_performance(strategy_name),
         "virtual_positions": get_virtual_positions(strategy_name),
         "today_virtual_events": get_virtual_event_summary(
             strategy_name, event_date=today
         ),
     }
-
-
-class MaSettingsUpdate(BaseModel):
-    ma_period: int = Field(ge=2, le=60)
-    exit_ratio: float = Field(ge=0.80, lt=1.0, allow_inf_nan=False)
-    expected_revision: int = Field(ge=0)
-
-
-def _require_breakout(strategy_name: str):
-    _require_strategy(strategy_name)
-    if strategy_name != "MomentumContractionStrategy":
-        raise HTTPException(status_code=404, detail="이 전략에는 A/B 비교 MA 청산 설정이 없습니다")
-
-
-@app.get("/api/strategies/{strategy_name}/ma-settings")
-def ma_settings_detail(strategy_name: str):
-    _require_breakout(strategy_name)
-    return get_ma_settings_status()
-
-
-@app.put("/api/strategies/{strategy_name}/ma-settings")
-def update_ma_settings(strategy_name: str, values: MaSettingsUpdate):
-    _require_breakout(strategy_name)
-    try:
-        return save_ma_settings(values.ma_period, values.exit_ratio, values.expected_revision)
-    except SettingsConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/strategies/{strategy_name}/positions")
@@ -381,8 +348,6 @@ def strategy_equity_history(
         ),
     }
 
-
-
 @app.get("/api/virtual/events")
 def virtual_events(
     strategy_name: str,
@@ -416,8 +381,6 @@ def virtual_trades(
         "limit": limit,
         "offset": offset,
     }
-
-
 
 @app.get("/api/strategies/{strategy_name}/virtual-index-history")
 def strategy_virtual_index_history(

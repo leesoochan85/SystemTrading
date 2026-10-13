@@ -953,7 +953,7 @@ def get_virtual_performance(strategy_name: str) -> dict[str, Any]:
     완료 거래/승률/평균수익률 계산에 포함한다.
     """
     if strategy_name == "MomentumContractionStrategy":
-        review = get_paper_comparison(candidate_limit=1, trade_limit=1)
+        review = get_paper_account(candidate_limit=1, trade_limit=1)
         return next((p["performance"] for p in review["accounts"] if p["strategy_name"] == strategy_name), {})
     positions = get_virtual_positions(strategy_name)
 
@@ -1032,8 +1032,8 @@ def get_virtual_performance(strategy_name: str) -> dict[str, Any]:
     }
 
 
-def get_paper_comparison(candidate_limit=100, trade_limit=100):
-    """Read-only coherent A/B/C account view. Does not create a paper DB."""
+def get_paper_account(candidate_limit=100, trade_limit=100):
+    """Read-only momentum account view; archived profiles are excluded. Does not create a paper DB."""
     from util.paper_trading import MOMENTUM
     empty = {"ready": False, "accounts": [], "watchlist": [], "stats": {}, "settings": None,
              "positions": [], "trades": [], "equity_history": [], "as_of": None,
@@ -1042,9 +1042,9 @@ def get_paper_comparison(candidate_limit=100, trade_limit=100):
         return empty
     with _connect_readonly(PAPER_DB) as con:
         con.execute("BEGIN")
-        accounts = _rows_to_dicts(con.execute("SELECT * FROM paper_account ORDER BY strategy_name"))
-        positions = _rows_to_dicts(con.execute("SELECT * FROM paper_position ORDER BY strategy_name,code"))
-        equity = _rows_to_dicts(con.execute("SELECT * FROM paper_equity ORDER BY snapshot_date,strategy_name"))
+        accounts = _rows_to_dicts(con.execute("SELECT * FROM paper_account WHERE strategy_name=?", (MOMENTUM,)))
+        positions = _rows_to_dicts(con.execute("SELECT * FROM paper_position WHERE strategy_name=? ORDER BY code", (MOMENTUM,)))
+        equity = _rows_to_dicts(con.execute("SELECT * FROM paper_equity WHERE strategy_name=? ORDER BY snapshot_date", (MOMENTUM,)))
         status = con.execute("SELECT * FROM paper_run_status ORDER BY snapshot_date DESC LIMIT 1").fetchone()
         watchlist = []
         if status:
@@ -1056,8 +1056,9 @@ def get_paper_comparison(candidate_limit=100, trade_limit=100):
                    SUM(CASE WHEN event_type='BUY' THEN quantity ELSE -quantity END) AS remaining,
                    SUM(CASE WHEN event_type='SELL' THEN net_pnl ELSE 0 END) AS pnl,
                    SUM(CASE WHEN event_type='BUY' THEN price*quantity+fee ELSE 0 END) AS invested
-            FROM paper_trade GROUP BY strategy_name,position_id HAVING remaining=0 AND invested>0
-        """))
+            FROM paper_trade WHERE strategy_name=?
+            GROUP BY strategy_name,position_id HAVING remaining=0 AND invested>0
+        """, (MOMENTUM,)))
     for position in positions:
         position["state"] = _safe_json_loads(position.pop("state_json"))
         position["remaining_ratio"] = position["quantity"] / position["initial_quantity"]
@@ -1085,9 +1086,13 @@ def get_paper_comparison(candidate_limit=100, trade_limit=100):
                            "best_return_pct": max(returns) if done else 0,
                            "worst_return_pct": min(returns) if done else 0,
                            "profit_factor": profit / loss if loss else None})
-    return {**empty, "ready": True, "accounts": accounts, "positions": [p for p in positions if p["strategy_name"] == MOMENTUM],
+    return {**empty, "ready": bool(accounts), "accounts": accounts, "positions": [p for p in positions if p["strategy_name"] == MOMENTUM],
             "trades": trades, "watchlist": watchlist, "equity_history": equity,
             "stats": _safe_json_loads(status["stats_json"]) if status else {},
             "settings": _safe_json_loads(status["settings_json"]) if status else None,
             "watchlist_date": status["snapshot_date"] if status else None,
             "as_of": max((a["updated_at"] for a in accounts), default=None)}
+
+
+# Compatibility for callers using the former comparison API.
+get_paper_comparison = get_paper_account

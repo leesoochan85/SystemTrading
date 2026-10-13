@@ -1,4 +1,4 @@
-"""Replay C's real paper engine from recorded executions; no Qt/login/orders.
+"""Replay the momentum paper engine from recorded executions; no Qt/login/orders.
 
 CSV must contain individual executions, not one-minute OHLC bars. Both local
 receipt and exchange trade time are retained so stale/out-of-order rejection is
@@ -19,7 +19,7 @@ import sys
 
 from strategy.MomentumContractionStrategy import MomentumContractionStrategy
 from util.momentum_breakout import load_config
-from util.paper_strategy_engine import PaperComparisonEngine
+from util.paper_strategy_engine import MomentumPaperEngine
 from util.paper_trading import MOMENTUM
 from util.paper_tick_recorder import COLUMNS
 
@@ -92,7 +92,7 @@ def replay(ticks_path, market_db_path, paper_db_path, config_path=None):
     # Exclusive reservation prevents an accidental overwrite/race with another run.
     fd = os.open(str(paper_db_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     os.close(fd)
-    engine = PaperComparisonEngine([strategy], paper_db_path, record_ticks=False, enable_baseline=False)
+    engine = MomentumPaperEngine([strategy], paper_db_path, record_ticks=False)
     current[0] = first[0]
     strategy.check_and_get_price_data()  # Persist first-day candidate diagnostics.
     registration, unknown = first[1], 0
@@ -117,7 +117,7 @@ def replay(ticks_path, market_db_path, paper_db_path, config_path=None):
         con.row_factory = sqlite3.Row
         trades = [dict(r) for r in con.execute("SELECT * FROM paper_trade WHERE strategy_name=? ORDER BY trade_id", (MOMENTUM,))]
     account = broker.accounts[MOMENTUM]
-    return {"scope": "C_ONLY_TICK_REPLAY", "paper_only": True,
+    return {"scope": "MOMENTUM_ONLY_TICK_REPLAY", "paper_only": True,
         "input_tick_count": count, "unknown_code_tick_count": unknown,
         "paper_db": str(paper_db_path), "initial_cash": account["initial_cash"],
         "cash": account["cash"], "equity": broker.equity(MOMENTUM),

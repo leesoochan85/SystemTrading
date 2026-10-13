@@ -54,7 +54,7 @@ class MomentumReplayTest(unittest.TestCase):
             "--market-db", str(self.market), "--paper-db", str(self.paper)],
             cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, check=True)
         report = json.loads(result.stdout)
-        self.assertEqual(report["scope"], "C_ONLY_TICK_REPLAY")
+        self.assertEqual(report["scope"], "MOMENTUM_ONLY_TICK_REPLAY")
         self.assertTrue(report["paper_only"])
         self.assertEqual([t["reason_code"] for t in report["trades"]],
             ["CONTRACTION_BREAKOUT", "TIME_PARTIAL_EXIT", "MA_CLOSE_EXIT"])

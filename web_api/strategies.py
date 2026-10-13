@@ -6,9 +6,9 @@ STRATEGIES = {
         "strategy_name": "MomentumContractionStrategy",
         "display_name": "모멘텀 수축 돌파",
         "paper_only": False,
-        "supports_paper_comparison": True,
+        "supports_paper_account": True,
         "live_execution": "SYSTEMTRADING_MOMENTUM_LIVE=1일 때 신규매수 활성; 기존 실보유 매도관리는 계속 수행",
-        "description": "모멘텀 실주문은 매매 프로세스의 명시적 활성 설정으로 실행하며, A/B/C 가상 계좌 비교도 유지합니다.",
+        "description": "모멘텀 실주문은 매매 프로세스의 명시적 활성 설정으로 실행하며, 모멘텀 가상 계좌 하나로 성과를 기록합니다.",
         "buy_conditions": [
             "기본 설정: 전일 종가 / 최근 126거래일 최저가 순위 상위 2%",
             "저자 공식 ADR(20) > 3.5%, 20일 평균 거래대금 20억원 이상",

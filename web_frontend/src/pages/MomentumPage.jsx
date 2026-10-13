@@ -1,13 +1,10 @@
 import StrategySourceLink from "../components/StrategySourceLink";
 import usePolling from "../hooks/usePolling";
 import { Link } from "react-router-dom";
-import MaSettingsPanel from "../components/MaSettingsPanel";
-import { getStrategy, getPaperComparison } from "../api/tradingApi";
+import { getPaperAccount } from "../api/tradingApi";
 
 const PROFILES = [
-  ["HighBreakoutBaselinePaper", "A · 기존 신고가", "#5b8def"],
-  ["HighBreakoutFilteredPaper", "B · 신고가 + 후보 필터", "#e4aa51"],
-  ["MomentumContractionStrategy", "C · 모멘텀 수축 돌파", "#51c4a0"],
+  ["MomentumContractionStrategy", "모멘텀 수축 돌파", "#51c4a0"],
 ];
 const money = (v) => v == null ? "—" : `${Number(v).toLocaleString("ko-KR", { maximumFractionDigits: 0 })}원`;
 const percent = (v) => v == null ? "—" : `${Number(v).toFixed(2)}%`;
@@ -31,7 +28,7 @@ const REASONS = {
   DAY_LOW_STOP: "초기 / 손익분기 손절", TIME_PARTIAL_EXIT: "거래일 경과 부분 매도", MA_CLOSE_EXIT: "확정 종가 MA 이탈",
 };
 
-function ComparisonChart({ items }) {
+function MomentumChart({ items }) {
   const dates = [...new Set(items.map((x) => x.snapshot_date))].sort();
   if (!dates.length) return <div className="chart-empty">장중 실행 후 가상 계좌 성과가 기록됩니다.</div>;
   const values = items.map((x) => x.cumulative_return_pct);
@@ -41,7 +38,7 @@ function ComparisonChart({ items }) {
   const y = (value) => 30 + (max - value) / (max - min) * 220;
   return <>
     <div className="paper-legend">{PROFILES.map(([key, label, color]) => <span key={key} style={{ color }}>{label}</span>)}</div>
-    <svg className="daily-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="동일 초기 자금 A B C 가상 계좌 누적 수익률">
+    <svg className="daily-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="모멘텀 가상 계좌 누적 수익률">
       <line x1="60" x2="940" y1={y(0)} y2={y(0)} className="chart-zero-line" />
       {[min, 0, max].map((v) => <text key={v} x="50" y={y(v) + 4} textAnchor="end" className="chart-axis-label">{percent(v)}</text>)}
       {PROFILES.map(([key, label, color]) => {
@@ -55,44 +52,35 @@ function ComparisonChart({ items }) {
   </>;
 }
 
-async function loadMomentum() {
-  const [comparison, detail] = await Promise.all([
-    getPaperComparison(), getStrategy("MomentumContractionStrategy"),
-  ]);
-  return { ...comparison, ma_settings: detail.ma_settings };
-}
-
 export default function MomentumPage() {
-  const { data, error, setData } = usePolling(loadMomentum);
-  const maSettings = data?.ma_settings;
-  const c = data?.accounts?.find((a) => a.strategy_name === "MomentumContractionStrategy");
+  const { data, error } = usePolling(getPaperAccount);
+  const account = data?.accounts?.find((a) => a.strategy_name === "MomentumContractionStrategy");
   const rules = data?.settings?.strategy;
-  const costs = c?.costs;
+  const costs = account?.costs;
   return <main className="page-shell">
     <Link className="back" to="/">← 전체 전략</Link>
-    <header className="detail-head"><div><span className="eyebrow">가상 계좌 · A/B/C 비교</span><h1>모멘텀 수축 돌파</h1><StrategySourceLink name="MomentumContractionStrategy" /><p>같은 초기 자금·보유 한도·거래 비용을 적용한 세 계좌를 비교합니다.</p></div></header>
+    <header className="detail-head"><div><span className="eyebrow">모멘텀 가상 계좌</span><h1>모멘텀 수축 돌파</h1><StrategySourceLink name="MomentumContractionStrategy" /><p>가상 현금과 거래 비용을 반영해 모멘텀 수축 돌파 전략의 성과를 확인합니다.</p></div></header>
     {error && <div className="error-box">{error}</div>}
     {!data?.ready && <div className="metric-note">매매 프로그램을 실행하면 가상 계좌와 후보가 준비됩니다.</div>}
     <section className="summary-strip">
-      <div><span>C 계좌 평가액</span><strong>{money(c?.equity)}</strong></div>
-      <div><span>사용 가능 현금</span><strong>{money(c?.cash)}</strong></div>
-      <div><span>비용 차감 수익률</span><strong>{percent(c?.cumulative_return_pct)}</strong></div>
-      <div><span>관측 MDD</span><strong>{percent(c?.max_drawdown_pct)}</strong></div>
-      <div><span>누적 수수료·세금</span><strong>{money(c?.total_fees)}</strong></div>
-      <div><span>현재 보유</span><strong>{c?.open_position_count ?? "—"}종목</strong></div>
+      <div><span>가상 계좌 평가액</span><strong>{money(account?.equity)}</strong></div>
+      <div><span>사용 가능 현금</span><strong>{money(account?.cash)}</strong></div>
+      <div><span>비용 차감 수익률</span><strong>{percent(account?.cumulative_return_pct)}</strong></div>
+      <div><span>관측 MDD</span><strong>{percent(account?.max_drawdown_pct)}</strong></div>
+      <div><span>누적 수수료·세금</span><strong>{money(account?.total_fees)}</strong></div>
+      <div><span>현재 보유</span><strong>{account?.open_position_count ?? "—"}종목</strong></div>
     </section>
-    <section className="panel"><div className="panel-title"><h2>가상 계좌 성과 비교</h2><span>{timeLabel(data?.as_of)}</span></div>
-      <ComparisonChart items={data?.equity_history || []} />
+    <section className="panel"><div className="panel-title"><h2>가상 계좌 성과</h2><span>{timeLabel(data?.as_of)}</span></div>
+      <MomentumChart items={data?.equity_history || []} />
       <div className="table-wrap"><table><thead><tr><th>계좌</th><th>평가액</th><th>수익률</th><th>MDD</th><th>완료 거래</th><th>승률</th><th>이익합 / 손실합</th></tr></thead><tbody>
         {PROFILES.map(([key, label]) => {
           const a = data?.accounts?.find((row) => row.strategy_name === key);
           return <tr key={key}><td>{label}</td><td>{money(a?.equity)}</td><td>{percent(a?.cumulative_return_pct)}</td><td>{percent(a?.max_drawdown_pct)}</td><td>{a?.performance?.completed_trade_count ?? "—"}</td><td>{percent(a?.performance?.win_rate_pct)}</td><td>{a?.performance?.profit_factor == null ? "—" : a.performance.profit_factor.toFixed(2)}</td></tr>;
         })}
       </tbody></table></div>
-      <p className="metric-note">A/B는 기존 ATR·장 마감 전 예상 MA 청산을 사용하고, C는 당일 저가 손절·부분 매도·확정 종가 MA 청산을 사용합니다. 완료 거래는 잔량까지 전부 청산된 진입 건입니다. MDD는 5초 간격으로 기록한 평가액 기준입니다.</p>
+      <p className="metric-note">모멘텀 가상 계좌는 당일 저가 손절·부분 매도·확정 종가 MA 청산을 사용합니다. 완료 거래는 잔량까지 전부 청산된 진입 건입니다. MDD는 5초 간격으로 기록한 평가액 기준입니다.</p>
     </section>
-    {maSettings && <MaSettingsPanel name="MomentumContractionStrategy" status={maSettings} onSaved={(status) => setData((current) => ({ ...current, ma_settings: status }))} />}
-    <section className="panel"><div className="panel-title"><h2>적용 조건</h2><span>C는 가상 계좌 · 실제 주문 모드는 매매 프로세스에서 설정</span></div>
+    <section className="panel"><div className="panel-title"><h2>적용 조건</h2><span>모멘텀 가상 계좌 · 실제 주문 모드는 매매 프로세스에서 설정</span></div>
       {rules && <p>{rules.momentum_mode === "video_low126" ? "126거래일 최저가 대비 상승" : "21·63·126거래일 수익률"} 상위 {rules.top_percent}% · ADR(20) &gt; {rules.min_adr_pct}% · 첫 {rules.opening_range_minutes}분 고가 돌파 · ATR {rules.stop_atr_multiple}배 이내 손절 · {rules.partial_after_sessions}거래일 후 약 {(rules.partial_ratio * 100).toFixed(1)}% 부분 매도 · MA{rules.trailing_ma_period} 확정 종가 청산</p>}
       {rules && <p className="metric-note">횡보 {rules.consolidation_days}일, 최근 {rules.recent_range_days}일 TR 비율 {rules.max_tr_ratio}, 선행 상승 {rules.min_prior_move_pct}%와 저점 블록 비교는 자동 판정을 위한 실험값입니다.</p>}
       {costs && <p className="metric-note">비용 가정: 매수 {costPercent(costs.buy_fee_rate)} · 매도 수수료 {costPercent(costs.sell_fee_rate)} · 매도 세금 {costPercent(costs.sell_tax_rate)} · 체결 슬리피지 {costs.slippage_bps}bp. 실제 계좌 비용·현행 세율을 보장하는 값이 아닙니다.</p>}
@@ -103,12 +91,12 @@ export default function MomentumPage() {
         {(data?.watchlist || []).map((r) => <tr key={r.code}><td><b>{r.code_name}</b><small>{r.code}</small></td><td>{r.momentum_rank}</td><td>{percent(r.metric?.adr20_pct)}</td><td>{r.metric?.tr_ratio?.toFixed(2) ?? "—"}</td><td>{money(r.metric?.base_high)}</td><td>{money(r.opening_high)}</td><td>{money(r.current_price)}</td><td>{REASONS[r.last_reason] || r.last_reason || "대기"}</td></tr>)}
       </tbody></table></div>
     </section>
-    <section className="panel"><div className="panel-title"><h2>C 계좌 현재 보유</h2><span>{data?.positions?.length || 0}종목</span></div>
+    <section className="panel"><div className="panel-title"><h2>가상 계좌 현재 보유</h2><span>{data?.positions?.length || 0}종목</span></div>
       <div className="table-wrap"><table><thead><tr><th>종목</th><th>진입가</th><th>현재가</th><th>잔량</th><th>손절선</th><th>부분 매도</th><th>진입 시간</th></tr></thead><tbody>
         {(data?.positions || []).map((p) => <tr key={p.position_id}><td><b>{p.code_name}</b><small>{p.code}</small></td><td>{money(p.entry_price)}</td><td>{money(p.current_price)}</td><td>{p.quantity}주</td><td>{money(p.state?.stop_price)}</td><td>{p.state?.partial_done ? "체결 완료" : "미체결"}</td><td>{timeLabel(p.entry_at)}</td></tr>)}
       </tbody></table></div>
     </section>
-    <section className="panel"><div className="panel-title"><h2>C 계좌 가상 체결</h2><span>최근 {data?.trades?.length || 0}건</span></div>
+    <section className="panel"><div className="panel-title"><h2>가상 체결</h2><span>최근 {data?.trades?.length || 0}건</span></div>
       <div className="table-wrap"><table><thead><tr><th>종목</th><th>구분</th><th>수량</th><th>체결가</th><th>수수료·세금</th><th>순손익</th><th>사유</th><th>시간</th></tr></thead><tbody>
         {(data?.trades || []).map((t) => <tr key={t.trade_id}><td>{t.code_name}</td><td>{t.event_type}</td><td>{t.quantity}주</td><td>{money(t.price)}</td><td>{money(t.fee)}</td><td>{t.event_type === "BUY" ? "—" : money(t.net_pnl)}</td><td>{REASONS[t.reason_code] || t.reason_code}</td><td>{timeLabel(t.event_at)}</td></tr>)}
       </tbody></table></div>

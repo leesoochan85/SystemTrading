@@ -66,7 +66,7 @@ class MomentumContractionStrategy:
         return sorted(code for code, metric in self.metrics.items() if metric["eligible"])
 
     def set_universe_real_time(self, register_market=True, codes_override=None, force_refresh=False):
-        # StrategyManager performs shared registration, including A/B candidates.
+        # StrategyManager performs shared registration, including active candidates and holdings.
         # This method also supports standalone paper startup.
         if not register_market:
             return

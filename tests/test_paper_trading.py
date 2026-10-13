@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from paper_fixture import config
-from util.paper_trading import PaperBroker, PROFILES, BASELINE, MOMENTUM
+from util.paper_trading import PaperBroker, PROFILES, MOMENTUM
 from web_api import database
 
 
@@ -25,15 +25,14 @@ class PaperLedgerTest(unittest.TestCase):
         return self.broker.buy(profile, code, "Fixture", 10000, 9500,
             {"stop_price": 9500, "partial_done": False}, "ENTRY", {}, self.now)
 
-    def test_identical_accounts_integer_lots_costs_and_cash_limit(self):
+    def test_single_account_integer_lots_costs_and_cash_limit(self):
         for profile in PROFILES:
             position, error = self.buy(profile=profile)
             self.assertIsNone(error)
             self.assertEqual(position["quantity"], 93)  # 50,000 risk / 535.815 modeled loss
             self.assertEqual(position["entry_price"], 10005)
             self.assertAlmostEqual(self.broker.accounts[profile]["cash"], 10000000 - 93 * 10005 * 1.00035)
-        self.assertEqual(len(self.broker.positions), 3)
-        self.assertEqual(self.broker.positions[(MOMENTUM, "000001")]["quantity"], self.broker.positions[(BASELINE, "000001")]["quantity"])
+        self.assertEqual(len(self.broker.positions), 1)
 
     def test_partial_fill_restart_cash_reconciliation_and_reentry_guard(self):
         position, _ = self.buy()

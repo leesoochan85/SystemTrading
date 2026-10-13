@@ -51,7 +51,7 @@ from util.value_quality_data import (
 
 class StrategyManager(QObject):
     """
-    우량주/모멘텀 운영 전략과 A/B/C 가상 비교를 관리한다.
+    우량주/모멘텀 운영 전략과 단일 모멘텀 가상 계좌를 관리한다.
 
     핵심 자금 정책
     -------------
@@ -385,7 +385,7 @@ class StrategyManager(QObject):
                 "event-driven 전략의 실시간 등록 가능 종목이 없습니다."
             )
 
-        # Operational strategies and A/B/C paper accounts share one tick stream.
+        # Operational strategies and the momentum paper account share one tick stream.
         fid_names = ("체결시간", "현재가", "시가", "고가", "저가", "누적거래량", "거래량", "(최우선)매수호가", "(최우선)매도호가")
         self.kiwoom.set_stock_realtime_fid_names(fid_names)
         fids = ";".join(get_fid(name) for name in fid_names)

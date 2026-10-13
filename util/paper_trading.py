@@ -1,4 +1,4 @@
-"""Independent, cash-backed paper accounts. Never calls Kiwoom or SendOrder.
+"""Single cash-backed momentum paper account. Never calls Kiwoom or SendOrder.
 
 Entries/exits use the observed tick plus configured slippage, not an ideal
 breakout/stop price. Cash, integer lots, fees, partial state and fills commit
@@ -16,10 +16,11 @@ import sqlite3
 from util.position_sizing import stop_risk_quantity
 
 
+# Legacy identifiers are retained for archived DB records only.
 BASELINE = "HighBreakoutBaselinePaper"
 FILTERED = "HighBreakoutFilteredPaper"
 MOMENTUM = "MomentumContractionStrategy"
-PROFILES = (BASELINE, FILTERED, MOMENTUM)
+PROFILES = (MOMENTUM,)
 
 
 class PaperBroker:
@@ -110,7 +111,7 @@ class PaperBroker:
                     if json.loads(row["config_json"]) != self.config:
                         raise ValueError("가상 계좌 설정이 이전 실행과 다릅니다. 별도 실험 폴더/DB를 사용하세요.")
                     self.accounts[profile] = dict(row)
-            for row in con.execute("SELECT * FROM paper_position"):
+            for row in con.execute("SELECT * FROM paper_position WHERE strategy_name=?", (MOMENTUM,)):
                 position = dict(row)
                 position["state"] = json.loads(position.pop("state_json"))
                 self.positions[(position["strategy_name"], position["code"])] = position
@@ -122,7 +123,7 @@ class PaperBroker:
             return
         with self._connect() as con:
             self.entered_today = {(r[0], r[1]) for r in con.execute(
-                "SELECT DISTINCT strategy_name,code FROM paper_trade WHERE event_type='BUY' AND substr(event_at,1,8)=?", (day,))}
+                "SELECT DISTINCT strategy_name,code FROM paper_trade WHERE strategy_name=? AND event_type='BUY' AND substr(event_at,1,8)=?", (MOMENTUM, day))}
         self.guard_date = day
 
     def equity(self, profile):
@@ -141,6 +142,8 @@ class PaperBroker:
         return float(max(1, math.floor(observed * (1 - self.costs["slippage_bps"] / 10000))))
 
     def buy(self, profile, code, code_name, observed, stop, state, reason, data, now, max_stop_distance=None):
+        if profile not in PROFILES:
+            return None, "INACTIVE_PAPER_ACCOUNT"
         self._refresh_guard(now)
         code = str(code).zfill(6)
         key = (profile, code)
@@ -168,9 +171,6 @@ class PaperBroker:
         amount = qty * price + fee
         stamp = now.strftime("%Y%m%d%H%M%S")
         filled_state = dict(state, stop_price=float(stop), entry_price=price)
-        # ATR entry state must use the modeled fill, not the pre-slippage tick.
-        if profile != MOMENTUM:
-            filled_state["initial_stop"] = float(stop)
         with self._connect() as con, con:
             con.execute("BEGIN IMMEDIATE")
             stored = con.execute("SELECT cash FROM paper_account WHERE strategy_name=?", (profile,)).fetchone()

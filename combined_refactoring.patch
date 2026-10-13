@@ -1,0 +1,3928 @@
+diff --git a/README.md b/README.md
+index 082ce80..c7c6973 100644
+--- a/README.md
++++ b/README.md
+@@ -10,6 +10,7 @@
+ 실제 주문 계좌가 실계좌인지 모의계좌인지는 Kiwoom 로그인과 계좌 선택에 따릅니다. 가상계좌 성과는 실제 계좌 체결·수익을 뜻하지 않습니다.
+ 기존 신고가·눌림목 보유와 미체결은 패치가 매도하거나 취소하지 않으므로 별도로 관리해야 합니다.
+ 
++- [A/B 잔여 코드·웹 조회·우량주 리포트 정리](docs/2026-10-13_combined_refactoring.md)
+ - [모멘텀 가상계좌 단일화](docs/2026-10-13_momentum_single_account.md)
+ - [이번 작업 기록](docs/2026-10-09_README.md)
+ - [전략 정리 패치 안내](docs/2026-10-08_strategy_cleanup.md)
+@@ -18,6 +19,15 @@
+ - [미사용 코드 정리와 리팩토링 내역](docs/2026-10-13_code_refactoring.md)
+ - [DB·주문·잔고 관리 모듈 분리](docs/2026-10-13_persistence_account_refactoring.md)
+ 
++### 단일 모멘텀 계좌·웹 조회·우량주 리포트 정리 (2026-10-13)
++
++- `web_api/database.py`의 기존 조회 함수는 유지하며 가상 조회를 `virtual_queries.py`, 모멘텀 현금 계좌 조회를 `paper_queries.py`에 위임합니다. `query_context.py`가 조회 전용 SQLite 연결과 종료를 담당합니다.
++- `StrategyManager`의 우량주 리포트 처리와 메시지 구성은 `strategy/value_report_service.py`로 이동했습니다. 기존 30분 확인·한 번에 1건 전송·중복 방지·전송 결과 기록 기준은 유지합니다.
++- A/B 전용 `paper_breakout_baseline.py`, `strategy_settings.py`와 미사용 신고가 지표·청산 함수를 제거했습니다. 필요한 Wilder ATR 계산은 `util/atr.py`로 분리하고 모멘텀 import를 갱신했습니다.
++- 가상 계좌 생성과 모멘텀 화면은 단일 계좌 기준으로 정리했습니다. 과거 A/B DB 기록과 호환 API는 보존합니다.
++- 실제/가상 매매 조건, DB 구조, 실행 BAT와 웹 API 응답은 유지합니다.
++- 검증: Python 테스트 175개 통과. 변경 전 조회 함수 서명 21개와 응답 사례 12개 일치, 리포트 성공/실패·주기·중복 처리 확인.
++
+ ### DB·주문·잔고 관리 분리 (2026-10-13, 후속 작업)
+ 
+ - `util/db_helper.py`의 28개 함수는 기존 이름·인자를 유지하면서 스키마, 포지션, 주문/체결, 성과 저장 모듈로 위임합니다. DB 경로 설정도 유지합니다.
+@@ -526,7 +536,7 @@ API 조회에서 제외하므로 과거 기록으로 보존되며 추가 가상
+ 
+ API는 `/api/strategies/MomentumContractionStrategy/paper-account`를 사용합니다.
+ 기존 `/paper-comparison` 경로는 호환용으로 같은 단일 계좌 결과만 반환합니다.
+-과거 A/B 규칙·설정 유틸리티는 기존 테스트와 기록 호환을 위해 남지만 운영 엔진은 호출하지 않습니다.
++A/B 전용 규칙·설정 유틸리티와 관련 폐기 기능 테스트는 제거했습니다. 과거 DB 식별자는 기록 보존 검증용 테스트에만 남습니다. 모멘텀의 공용 ATR은 `util/atr.py`에서 계산합니다.
+ 
+ ---
+ 
+diff --git a/docs/2026-10-13_combined_refactoring.md b/docs/2026-10-13_combined_refactoring.md
+new file mode 100644
+index 0000000..829b6e7
+--- /dev/null
++++ b/docs/2026-10-13_combined_refactoring.md
+@@ -0,0 +1,80 @@
++# 2026-10-13 단일 모멘텀 계좌·웹 조회·우량주 리포트 통합 리팩토링
++
++기준 소스: GitHub `leesoochan85/SystemTrading` main,
++커밋 `09a694aad2372f62231c26112b1f68902b8c76a2` (2026-10-13 확인).
++이 기준에는 A/B 운영 중단과 C 단일화가 이미 포함되어 있다.
++
++앞서 제공한 `refactor_web_reports.patch`를 적용하지 않은 상태에서 이번
++`combined_refactoring.patch` 하나만 적용한다. 이전 리팩토링 패치를 별도로 적용하지 않는다.
++
++## 적용 후 바뀌는 것
++
++| 영역 | 변경 |
++|---|---|
++| A/B 전용 규칙 | `util/paper_breakout_baseline.py`, `util/strategy_settings.py` 삭제 |
++| 과거 신고가 보조 함수 | 운영 호출이 없는 신고가 지표·과거 종가 합계·ATR 추적 청산·장마감 전 예상 MA 청산 제거 |
++| 공용 ATR | 필요한 Wilder ATR 계산·과거 지표 조회를 `util/atr.py`로 이동하고 모멘텀 import 갱신 |
++| 계좌 생성 | 단일 원소 PROFILES 반복을 제거하고 기존 모멘텀 식별자로 한 계좌만 생성·복원 |
++| 후보 갱신 | 효과가 없는 과거 baseline force 호출·인자 제거 |
++| 모멘텀 화면 | 단일 계좌 라벨·성과 행·그래프를 직접 표시; PROFILES 배열 반복 제거 |
++| 웹 조회 | `database.py`는 기존 공개 함수를 유지하며 `virtual_queries.py`, `paper_queries.py`로 위임 |
++| 조회 연결 | `query_context.py`로 조회 전용 연결·종료·JSON 변환 분리 |
++| 우량주 리포트 | `value_report_service.py`로 조회 주기·중복 확인·메시지·전송 기록 분리 |
++| 테스트 | 폐기된 A/B 기능 테스트 7개 제거, 현재 모멘텀의 공용 ATR 검증 7개로 교체; 계좌 이력 보존·현재 매매 검증 유지 |
++| 문서 | README와 이 통합 변경 문서 갱신 |
++
++## 유지되는 것
++
++- 모멘텀 매수·매도 조건, 위험 예산·보유 한도·비용 설정 및 실제 주문 활성화 방식.
++- `MomentumContractionStrategy` 내부 계좌 식별자와 DB 스키마.
++- 기존 모멘텀 현금·보유수량·손절선·부분매도·거래·수익률·MDD 이력.
++- 과거 A/B DB 행: 삭제·합산·초기화하지 않으며 추가 거래/갱신/조회에서 제외.
++- A/B 과거 기록이 보존되고 신규 주문되지 않는지 확인하는 회귀 테스트.
++- 기존 `/paper-account` 조회와 `/paper-comparison` 호환 경로.
++- 기존 `strategy_settings.db`와 과거 상태 DB 파일: 코드 정리 과정에서 삭제하지 않음.
++- 공개 웹 조회 함수 21개와 조회 응답 형식, 기간 필터·페이지 조회·성과 계산.
++- 우량주 리포트의 30분 검사·한 번에 최대 1건 전송·성공 결과 기록·콘솔 오류 제한.
++- 기존 리포트 조회 커서 전진 정책. 리포트 전송 대기열을 새로 만든 변경은 아님.
++- 실행 BAT와 사용 중인 DB 경로.
++
++A/B 문자열은 과거 기록을 다루는 테스트와 역사 문서에 남을 수 있다.
++과거 기록 검증용 식별자는 현재 운영 프로필을 뜻하지 않는다.
++Wilder ATR은 이름과 파일 위치를 바꾸었으며 수학적 계산과 결정일 이전 봉 사용 기준은 유지했다.
++일봉 수집기의 기본 180봉 목표도 유지한다.
++
++## 검증
++
++- 기준 main 테스트: 164개 통과.
++- 통합 수정본 Python unittest: 175개 통과.
++- 기존 공개 조회 함수 서명 21개·조회 결과 사례 12개 일치.
++- 공용 ATR 검증 7개를 변경 전 계산 코드에도 적용하여 동일한 기대 결과 확인.
++- 기존 C 부분매도·손절·잔고·재진입 차단과 기존 A/B 행 보존 검증 유지.
++- 리포트 검증 시나리오 6개를 기존 Manager 코드에도 적용하여 같은 기대 결과 확인.
++- 프론트엔드 프로덕션 빌드 성공 및 폴링 테스트 4개 통과.
++- Python 컴파일·3.9 문법 검사와 정확한 기준 소스에 대한 패치 적용 검증.
++
++이 환경에서는 실제 Windows Kiwoom ActiveX 로그인·장중 주문·Telegram 전송을 실행하지 않았다.
++사용자 PC에서 테스트 후 기존 BAT로 재시작한다.
++
++## 적용
++
++매매 프로그램과 웹 API를 종료하고 프로젝트 루트에서 실행한다.
++
++```cmd
++git apply --check combined_refactoring.patch
++git apply combined_refactoring.patch
++run_tests.bat
++cd web_frontend
++npm run build
++npm test
++```
++
++기존 DB를 유지한다. 이후 기존 BAT와 프론트엔드 실행 방법으로 재시작하고
++브라우저를 새로고침한다. DB 초기화·재무/일봉 재수집은 이 패치를 적용하는 데 필요하지 않다.
++패치 검사 실패 시 강제 초기화하지 말고 사용자 PC의 변경과 기준 소스를 비교한다.
++원격 GitHub에는 push하지 않았다.
++
++## 다음 후보
++
++실거래 모멘텀의 상태 저장소 분리, Manager 장마감 일봉 저장/갱신 분리,
++우량주 전략의 후보 준비와 주문 상태 관리 분리는 별도 후속 작업으로 남긴다.
+diff --git a/strategy/StrategyManager.py b/strategy/StrategyManager.py
+index 3a4d94f..a9c2a0a 100644
+--- a/strategy/StrategyManager.py
++++ b/strategy/StrategyManager.py
+@@ -15,6 +15,7 @@ from util.telegram_poller import TelegramCommandPoller
+ from util.status_message import StatusMessageBuilder
+ from strategy.order_coordinator import OrderCoordinator
+ from strategy.account_state import AccountStateSynchronizer
++from strategy.value_report_service import ValueReportService
+ from util.market_history import (
+     build_realtime_daily_bars,
+     get_db_path as get_market_history_db_path,
+@@ -41,7 +42,6 @@ from util.virtual_trading import (
+ )
+ 
+ from util.value_quality_data import (
+-    get_last_sent_value_report_at,
+     get_last_scanned_hankyung_report_id,
+     is_value_report_sent,
+     save_last_scanned_hankyung_report_id,
+@@ -158,8 +158,6 @@ class StrategyManager(QObject):
+ 
+         self.last_value_report_check_at = 0
+         self.value_report_check_interval = 1800  # 30분
+-        self.value_report_lookback_days = 30
+-        self.value_report_max_pages = 10
+         self.last_value_report_error_log_at = 0
+         self.value_report_error_log_interval = 3600
+ 
+@@ -708,7 +706,6 @@ class StrategyManager(QObject):
+             if failed:
+                 return False
+ 
+-            self.virtual_strategy_engine.paper_engine.get_candidate_codes(force=True)
+             self.register_shared_event_realtime(
+                 active,
+                 force_refresh=True,
+@@ -928,208 +925,24 @@ class StrategyManager(QObject):
+     def build_status_message(self):
+         return StatusMessageBuilder(self).build()
+ 
+-    def get_value_quality_holding_codes(self):
+-        codes = []
+-
+-        for raw_code, balance_info in self.kiwoom.balance.items():
+-            code = str(raw_code).strip().zfill(6)
+-            quantity = int(
+-                balance_info.get("보유수량", 0)
+-                or 0
+-            )
+-
+-            if quantity <= 0:
+-                continue
+-
+-            if (
+-                get_position_strategy(code)
+-                != "ValueQualityStrategy"
+-            ):
+-                continue
+-
+-            codes.append(code)
+-
+-        return sorted(set(codes))
+-
+-    def send_one_value_quality_report_if_needed(
+-        self,
+-        force=False,
+-    ):
+-        """
+-        기존 무관한 경제뉴스 대신,
+-        현재 ValueQualityStrategy로 실제 보유 중인 종목의
+-        한경 컨센서스 기업 리포트만 Telegram으로 전송한다.
+-
+-        - 30분마다 확인
+-        - 마지막 확인 리포트 ID 이후의 공개 상세페이지만 검사
+-        - 한 번에 최대 1건 전송
+-        - value_quality.db에서 중복 전송 방지
+-        """
+-        now = time.time()
+-
+-        if (
+-            not force
+-            and now - self.last_value_report_check_at
+-            < self.value_report_check_interval
+-        ):
+-            return
+-
+-        self.last_value_report_check_at = now
+-
+-        holding_codes = (
+-            self.get_value_quality_holding_codes()
++    def _value_reports(self):
++        return ValueReportService(
++            self,
++            position_strategy_lookup=get_position_strategy,
++            scan_reports=scan_new_hankyung_reports,
++            read_cursor=get_last_scanned_hankyung_report_id,
++            write_cursor=save_last_scanned_hankyung_report_id,
++            is_sent=is_value_report_sent,
++            record_sent=save_sent_value_report,
++            send_message=send_message,
++            clock=time.time,
+         )
+ 
+-        if not holding_codes:
+-            return
+-
+-        try:
+-            last_scanned_report_id = (
+-                get_last_scanned_hankyung_report_id()
+-            )
+-
+-            scan_result = scan_new_hankyung_reports(
+-                target_codes=holding_codes,
+-                last_scanned_report_id=last_scanned_report_id,
+-                max_scan_count=120,
+-                consecutive_miss_limit=15,
+-            )
+-
+-            reports = scan_result["reports"]
+-            new_last_scanned_id = int(
+-                scan_result["last_scanned_report_id"]
+-            )
+-
+-            # 새 리포트 상세페이지가 확인된 범위까지만 high-water mark 전진.
+-            # 전송할 보유종목 리포트가 없어도 다음 검사에서 같은 전체 시장
+-            # 리포트를 반복 조회하지 않는다.
+-            if (
+-                last_scanned_report_id is None
+-                or new_last_scanned_id
+-                > int(last_scanned_report_id)
+-            ):
+-                save_last_scanned_hankyung_report_id(
+-                    new_last_scanned_id
+-                )
+-
+-            target = None
+-
+-            # 오래된 것부터 처리해야 새 리포트가 여러 개 있을 때
+-            # 30분마다 순서대로 하나씩 전달된다.
+-            for report in reports:
+-                report_key = report.get(
+-                    "report_key"
+-                )
+-                code = str(
+-                    report.get("code", "")
+-                ).zfill(6)
+-
+-                if (
+-                    not report_key
+-                    or code not in holding_codes
+-                ):
+-                    continue
+-
+-                if is_value_report_sent(
+-                    report_key
+-                ):
+-                    continue
+-
+-                target = report
+-                break
+-
+-            if target is None:
+-                return
+-
+-            code = str(
+-                target.get("code", "")
+-            ).zfill(6)
+-
+-            title = (
+-                target.get("title")
+-                or "기업 리포트"
+-            )
+-            broker = (
+-                target.get("broker")
+-                or "-"
+-            )
+-            analyst = (
+-                target.get("analyst")
+-                or "-"
+-            )
+-            report_date = (
+-                target.get("report_date")
+-                or "-"
+-            )
+-            opinion = (
+-                target.get("opinion")
+-                or "-"
+-            )
+-            target_price = (
+-                target.get("target_price")
+-            )
+-            url = target["url"]
+-
+-            code_name = self.get_code_name(code)
+-
+-            if target_price not in (
+-                None,
+-                "",
+-                0,
+-                "0",
+-            ):
+-                target_price_text = str(
+-                    target_price
+-                )
+-            else:
+-                target_price_text = "-"
+-
+-            message = (
+-                "[저평가 우량주 리포트]\n\n"
+-                f"{code_name}({code})\n"
+-                f"{title}\n"
+-                f"발행기관: {broker}\n"
+-                f"작성자: {analyst}\n"
+-                f"발표일: {report_date}\n"
+-                f"투자의견: {opinion}\n"
+-                f"목표주가: {target_price_text}\n\n"
+-                f"{url}"
+-            )
+-
+-            result = send_message(message)
+-
+-            if result is not None:
+-                save_sent_value_report(
+-                    report_key=target[
+-                        "report_key"
+-                    ],
+-                    code=code,
+-                    title=title,
+-                    broker=broker,
+-                    report_date=report_date,
+-                    url=url,
+-                )
+-
+-                print(
+-                    "[StrategyManager] "
+-                    "저평가 우량주 리포트 전송 완료: "
+-                    f"{code_name} / {title}"
+-                )
++    def get_value_quality_holding_codes(self):
++        return self._value_reports().get_holding_codes()
+ 
+-        except Exception as exc:
+-            # 사이트/API 변경이나 일시적인 네트워크 오류가
+-            # 자동매매 자체를 멈추게 해서는 안 된다.
+-            if (
+-                now - self.last_value_report_error_log_at
+-                >= self.value_report_error_log_interval
+-            ):
+-                print(
+-                    "[StrategyManager] "
+-                    "한경 컨센서스 리포트 조회 실패 - "
+-                    "매매는 계속 진행합니다: "
+-                    f"{exc}"
+-                )
+-                self.last_value_report_error_log_at = now
++    def send_one_value_quality_report_if_needed(self, force=False):
++        return self._value_reports().send_if_due(force=force)
+ 
+     # ------------------------------------------------------------------
+     # 주기 실행
+diff --git a/strategy/value_report_service.py b/strategy/value_report_service.py
+new file mode 100644
+index 0000000..fc50fee
+--- /dev/null
++++ b/strategy/value_report_service.py
+@@ -0,0 +1,230 @@
++"""ValueQuality holding report delivery, independent of Qt and order execution."""
++
++def format_report_message(target, code_name):
++    code = str(target.get("code", "")).zfill(6)
++    title = (
++        target.get("title")
++        or "기업 리포트"
++    )
++    broker = (
++        target.get("broker")
++        or "-"
++    )
++    analyst = (
++        target.get("analyst")
++        or "-"
++    )
++    report_date = (
++        target.get("report_date")
++        or "-"
++    )
++    opinion = (
++        target.get("opinion")
++        or "-"
++    )
++    target_price = (
++        target.get("target_price")
++    )
++    url = target["url"]
++
++    if target_price not in (
++        None,
++        "",
++        0,
++        "0",
++    ):
++        target_price_text = str(
++            target_price
++        )
++    else:
++        target_price_text = "-"
++
++    message = (
++        "[저평가 우량주 리포트]\n\n"
++        f"{code_name}({code})\n"
++        f"{title}\n"
++        f"발행기관: {broker}\n"
++        f"작성자: {analyst}\n"
++        f"발표일: {report_date}\n"
++        f"투자의견: {opinion}\n"
++        f"목표주가: {target_price_text}\n\n"
++        f"{url}"
++    )
++
++    return message
++
++
++class ValueReportService:
++    """Coordinate one report at a time while retaining manager-owned timing state."""
++
++    def __init__(self, manager, *, position_strategy_lookup, scan_reports, read_cursor,
++                 write_cursor, is_sent, record_sent, send_message, clock):
++        self.manager = manager
++        self.position_strategy_lookup = position_strategy_lookup
++        self.scan_reports = scan_reports
++        self.read_cursor = read_cursor
++        self.write_cursor = write_cursor
++        self.is_sent = is_sent
++        self.record_sent = record_sent
++        self.send_message = send_message
++        self.clock = clock
++
++    def get_holding_codes(self):
++        codes = []
++
++        for raw_code, balance_info in self.manager.kiwoom.balance.items():
++            code = str(raw_code).strip().zfill(6)
++            quantity = int(
++                balance_info.get("보유수량", 0)
++                or 0
++            )
++
++            if quantity <= 0:
++                continue
++
++            if (
++                self.position_strategy_lookup(code)
++                != "ValueQualityStrategy"
++            ):
++                continue
++
++            codes.append(code)
++
++        return sorted(set(codes))
++
++
++    def send_if_due(
++        self,
++        force=False,
++    ):
++        """
++        기존 무관한 경제뉴스 대신,
++        현재 ValueQualityStrategy로 실제 보유 중인 종목의
++        한경 컨센서스 기업 리포트만 Telegram으로 전송한다.
++
++        - 30분마다 확인
++        - 마지막 확인 리포트 ID 이후의 공개 상세페이지만 검사
++        - 한 번에 최대 1건 전송
++        - value_quality.db에서 중복 전송 방지
++        """
++        now = self.clock()
++
++        if (
++            not force
++            and now - self.manager.last_value_report_check_at
++            < self.manager.value_report_check_interval
++        ):
++            return
++
++        self.manager.last_value_report_check_at = now
++
++        holding_codes = (
++            self.manager.get_value_quality_holding_codes()
++        )
++
++        if not holding_codes:
++            return
++
++        try:
++            last_scanned_report_id = (
++                self.read_cursor()
++            )
++
++            scan_result = self.scan_reports(
++                target_codes=holding_codes,
++                last_scanned_report_id=last_scanned_report_id,
++                max_scan_count=120,
++                consecutive_miss_limit=15,
++            )
++
++            reports = scan_result["reports"]
++            new_last_scanned_id = int(
++                scan_result["last_scanned_report_id"]
++            )
++
++            # 새 리포트 상세페이지가 확인된 범위까지만 high-water mark 전진.
++            # 전송할 보유종목 리포트가 없어도 다음 검사에서 같은 전체 시장
++            # 리포트를 반복 조회하지 않는다.
++            if (
++                last_scanned_report_id is None
++                or new_last_scanned_id
++                > int(last_scanned_report_id)
++            ):
++                self.write_cursor(
++                    new_last_scanned_id
++                )
++
++            target = None
++
++            # 오래된 것부터 처리해야 새 리포트가 여러 개 있을 때
++            # 30분마다 순서대로 하나씩 전달된다.
++            for report in reports:
++                report_key = report.get(
++                    "report_key"
++                )
++                code = str(
++                    report.get("code", "")
++                ).zfill(6)
++
++                if (
++                    not report_key
++                    or code not in holding_codes
++                ):
++                    continue
++
++                if self.is_sent(
++                    report_key
++                ):
++                    continue
++
++                target = report
++                break
++
++            if target is None:
++                return
++
++            code = str(
++                target.get("code", "")
++            ).zfill(6)
++
++            title = target.get("title") or "기업 리포트"
++            broker = target.get("broker") or "-"
++            report_date = target.get("report_date") or "-"
++            url = target["url"]
++            code_name = self.manager.get_code_name(code)
++            message = format_report_message(target, code_name)
++
++            result = self.send_message(message)
++
++            if result is not None:
++                self.record_sent(
++                    report_key=target[
++                        "report_key"
++                    ],
++                    code=code,
++                    title=title,
++                    broker=broker,
++                    report_date=report_date,
++                    url=url,
++                )
++
++                print(
++                    "[StrategyManager] "
++                    "저평가 우량주 리포트 전송 완료: "
++                    f"{code_name} / {title}"
++                )
++
++        except Exception as exc:
++            # 사이트/API 변경이나 일시적인 네트워크 오류가
++            # 자동매매 자체를 멈추게 해서는 안 된다.
++            if (
++                now - self.manager.last_value_report_error_log_at
++                >= self.manager.value_report_error_log_interval
++            ):
++                print(
++                    "[StrategyManager] "
++                    "한경 컨센서스 리포트 조회 실패 - "
++                    "매매는 계속 진행합니다: "
++                    f"{exc}"
++                )
++                self.manager.last_value_report_error_log_at = now
+diff --git a/tests/fixtures/web_query_contract.json b/tests/fixtures/web_query_contract.json
+new file mode 100644
+index 0000000..061a4c9
+--- /dev/null
++++ b/tests/fixtures/web_query_contract.json
+@@ -0,0 +1,365 @@
++{
++  "source_commit": "09a694aad2372f62231c26112b1f68902b8c76a2",
++  "signatures": {
++    "get_db_status": "() -> 'dict[str, Any]'",
++    "get_latest_account_equity": "() -> 'dict[str, Any] | None'",
++    "get_strategy_positions": "(strategy_name: 'str') -> 'list[dict[str, Any]]'",
++    "get_position_snapshot_status": "() -> 'dict[str, Any]'",
++    "get_all_position_counts": "() -> 'dict[str, int]'",
++    "get_strategy_trades": "(strategy_name: 'str', limit: 'int' = 200, offset: 'int' = 0) -> 'list[dict[str, Any]]'",
++    "get_strategy_signals": "(strategy_name: 'str', signal_type: 'str | None' = None, signal_date: 'str | None' = None, order_result: 'str | None' = None, limit: 'int' = 200, offset: 'int' = 0) -> 'list[dict[str, Any]]'",
++    "get_signal_summary": "(strategy_name: 'str', signal_date: 'str | None' = None) -> 'dict[str, int]'",
++    "get_latest_strategy_equity": "(strategy_name: 'str') -> 'dict[str, Any] | None'",
++    "get_strategy_equity_history": "(strategy_name: 'str', date_from: 'str | None' = None, date_to: 'str | None' = None, limit: 'int' = 2000) -> 'list[dict[str, Any]]'",
++    "get_strategy_performance": "(strategy_name: 'str') -> 'dict[str, Any]'",
++    "get_latest_strategy_daily_summary": "(strategy_name: 'str') -> 'dict[str, Any] | None'",
++    "get_virtual_positions": "(strategy_name: 'str | None' = None) -> 'list[dict[str, Any]]'",
++    "get_virtual_trades": "(strategy_name: 'str | None' = None, limit: 'int' = 500, offset: 'int' = 0) -> 'list[dict[str, Any]]'",
++    "get_virtual_event_summary": "(strategy_name: 'str', event_date: 'str | None' = None) -> 'dict[str, int]'",
++    "get_virtual_events": "(strategy_name: 'str', limit: 'int' = 100) -> 'list[dict[str, Any]]'",
++    "get_virtual_daily_performance": "(strategy_name: 'str', date_from: 'str | None' = None, date_to: 'str | None' = None) -> 'dict[str, Any]'",
++    "get_virtual_strategy_index_history": "(strategy_name: 'str', date_from: 'str | None' = None, date_to: 'str | None' = None) -> 'dict[str, Any]'",
++    "get_virtual_performance": "(strategy_name: 'str') -> 'dict[str, Any]'",
++    "get_paper_account": "(candidate_limit=100, trade_limit=100)",
++    "get_paper_comparison": "(candidate_limit=100, trade_limit=100)"
++  },
++  "responses": {
++    "positions": [
++      {
++        "strategy_name": "ValueQualityStrategy",
++        "code": "000001",
++        "code_name": "부분보유",
++        "entry_price": 100.0,
++        "entry_at": "20261012090000",
++        "remaining_ratio": 0.7,
++        "current_price": 120.0,
++        "unrealized_return_pct": 20.0,
++        "buy_reason_code": "ENTRY",
++        "buy_reason": "진입",
++        "updated_at": "20261013100000",
++        "state": {
++          "stop": 90
++        }
++      }
++    ],
++    "all_positions": [
++      {
++        "strategy_name": "ValueQualityStrategy",
++        "code": "000001",
++        "code_name": "부분보유",
++        "entry_price": 100.0,
++        "entry_at": "20261012090000",
++        "remaining_ratio": 0.7,
++        "current_price": 120.0,
++        "unrealized_return_pct": 20.0,
++        "buy_reason_code": "ENTRY",
++        "buy_reason": "진입",
++        "updated_at": "20261013100000",
++        "state": {
++          "stop": 90
++        }
++      },
++      {
++        "strategy_name": "OtherStrategy",
++        "code": "000003",
++        "code_name": "다른전략",
++        "entry_price": 300.0,
++        "entry_at": "20261012090000",
++        "remaining_ratio": 1.0,
++        "current_price": 300.0,
++        "unrealized_return_pct": 0.0,
++        "buy_reason_code": "ENTRY",
++        "buy_reason": "진입",
++        "updated_at": "20261012090000",
++        "state": {}
++      }
++    ],
++    "trades": [
++      {
++        "trade_id": 2,
++        "strategy_name": "ValueQualityStrategy",
++        "code": "000002",
++        "code_name": "완료거래",
++        "entry_price": 200.0,
++        "entry_at": "20261012090000",
++        "exit_price": 180.0,
++        "exit_at": "20261013100000",
++        "exit_ratio": 1.0,
++        "return_pct": -10.0,
++        "weighted_return_pct": -10.0,
++        "buy_reason_code": "ENTRY",
++        "buy_reason": "진입",
++        "sell_reason_code": "STOP",
++        "sell_reason": "전량청산",
++        "created_at": "20261013100000"
++      },
++      {
++        "trade_id": 1,
++        "strategy_name": "ValueQualityStrategy",
++        "code": "000001",
++        "code_name": "부분보유",
++        "entry_price": 100.0,
++        "entry_at": "20261012090000",
++        "exit_price": 110.0,
++        "exit_at": "20261013100000",
++        "exit_ratio": 0.3,
++        "return_pct": 10.0,
++        "weighted_return_pct": 3.0,
++        "buy_reason_code": "ENTRY",
++        "buy_reason": "진입",
++        "sell_reason_code": "PARTIAL",
++        "sell_reason": "부분청산",
++        "created_at": "20261013100000"
++      }
++    ],
++    "paged_trades": [
++      {
++        "trade_id": 1,
++        "strategy_name": "ValueQualityStrategy",
++        "code": "000001",
++        "code_name": "부분보유",
++        "entry_price": 100.0,
++        "entry_at": "20261012090000",
++        "exit_price": 110.0,
++        "exit_at": "20261013100000",
++        "exit_ratio": 0.3,
++        "return_pct": 10.0,
++        "weighted_return_pct": 3.0,
++        "buy_reason_code": "ENTRY",
++        "buy_reason": "진입",
++        "sell_reason_code": "PARTIAL",
++        "sell_reason": "부분청산",
++        "created_at": "20261013100000"
++      }
++    ],
++    "events": [
++      {
++        "event_id": "SELL|2",
++        "strategy_name": "ValueQualityStrategy",
++        "event_type": "SELL",
++        "code": "000002",
++        "code_name": "완료거래",
++        "price": 180.0,
++        "reason_code": "STOP",
++        "reason": "전량청산",
++        "event_at": "20261013100000",
++        "position_status": "SELL",
++        "return_pct": -10.0,
++        "ratio": 1.0
++      },
++      {
++        "event_id": "SELL|1",
++        "strategy_name": "ValueQualityStrategy",
++        "event_type": "SELL",
++        "code": "000001",
++        "code_name": "부분보유",
++        "price": 110.0,
++        "reason_code": "PARTIAL",
++        "reason": "부분청산",
++        "event_at": "20261013100000",
++        "position_status": "SELL",
++        "return_pct": 10.0,
++        "ratio": 0.3
++      },
++      {
++        "event_id": "BUY|ValueQualityStrategy|000001|20261012090000",
++        "strategy_name": "ValueQualityStrategy",
++        "event_type": "BUY",
++        "code": "000001",
++        "code_name": "부분보유",
++        "price": 100.0,
++        "reason_code": "ENTRY",
++        "reason": "진입",
++        "event_at": "20261012090000",
++        "position_status": "OPEN",
++        "return_pct": null,
++        "ratio": 1.0
++      },
++      {
++        "event_id": "BUY|ValueQualityStrategy|000002|20261012090000",
++        "strategy_name": "ValueQualityStrategy",
++        "event_type": "BUY",
++        "code": "000002",
++        "code_name": "완료거래",
++        "price": 200.0,
++        "reason_code": "ENTRY",
++        "reason": "진입",
++        "event_at": "20261012090000",
++        "position_status": "CLOSED_OR_PARTIAL",
++        "return_pct": null,
++        "ratio": 1.0
++      }
++    ],
++    "event_summary": {
++      "buy": 0,
++      "sell": 2,
++      "total": 2
++    },
++    "daily": {
++      "items": [
++        {
++          "date": "20261013",
++          "sell_event_count": 2,
++          "exited_ratio": 1.3,
++          "weighted_return_sum": -7.0,
++          "daily_return_pct": -5.384615384615384
++        }
++      ],
++      "active_day_count": 1,
++      "best_daily_return_pct": -5.384615384615384,
++      "worst_daily_return_pct": -5.384615384615384,
++      "average_daily_return_pct": -5.384615384615384,
++      "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN"
++    },
++    "daily_filtered": {
++      "items": [
++        {
++          "date": "20261013",
++          "sell_event_count": 2,
++          "exited_ratio": 1.3,
++          "weighted_return_sum": -7.0,
++          "daily_return_pct": -5.384615384615384
++        }
++      ],
++      "active_day_count": 1,
++      "best_daily_return_pct": -5.384615384615384,
++      "worst_daily_return_pct": -5.384615384615384,
++      "average_daily_return_pct": -5.384615384615384,
++      "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN"
++    },
++    "index": {
++      "items": [
++        {
++          "snapshot_date": "20261012",
++          "strategy_name": "ValueQualityStrategy",
++          "open_position_count": 2,
++          "deployed_units": 2.0,
++          "realized_cost_units": 0.0,
++          "realized_value_units": 0.0,
++          "open_cost_units": 2.0,
++          "open_value_units": 2.0,
++          "total_value_units": 2.0,
++          "strategy_index": 100.0,
++          "cumulative_return_pct": 0.0,
++          "daily_return_pct": 0.0,
++          "peak_index": 100.0,
++          "drawdown_pct": 0.0,
++          "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
++          "updated_at": "20261012090000"
++        },
++        {
++          "snapshot_date": "20261013",
++          "strategy_name": "ValueQualityStrategy",
++          "open_position_count": 1,
++          "deployed_units": 2.0,
++          "realized_cost_units": 1.3,
++          "realized_value_units": 1.23,
++          "open_cost_units": 0.7,
++          "open_value_units": 0.84,
++          "total_value_units": 2.07,
++          "strategy_index": 103.49999999999999,
++          "cumulative_return_pct": 3.499999999999986,
++          "daily_return_pct": 3.499999999999992,
++          "peak_index": 103.49999999999999,
++          "drawdown_pct": 0.0,
++          "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
++          "updated_at": "20261013100000"
++        }
++      ],
++      "latest": {
++        "snapshot_date": "20261013",
++        "strategy_name": "ValueQualityStrategy",
++        "open_position_count": 1,
++        "deployed_units": 2.0,
++        "realized_cost_units": 1.3,
++        "realized_value_units": 1.23,
++        "open_cost_units": 0.7,
++        "open_value_units": 0.84,
++        "total_value_units": 2.07,
++        "strategy_index": 103.49999999999999,
++        "cumulative_return_pct": 3.499999999999986,
++        "daily_return_pct": 3.499999999999992,
++        "peak_index": 103.49999999999999,
++        "drawdown_pct": 0.0,
++        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
++        "updated_at": "20261013100000"
++      },
++      "best_daily_return_pct": 3.499999999999992,
++      "worst_daily_return_pct": 0.0,
++      "max_drawdown_pct": 0.0,
++      "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX"
++    },
++    "index_filtered": {
++      "items": [
++        {
++          "snapshot_date": "20261013",
++          "strategy_name": "ValueQualityStrategy",
++          "open_position_count": 1,
++          "deployed_units": 2.0,
++          "realized_cost_units": 1.3,
++          "realized_value_units": 1.23,
++          "open_cost_units": 0.7,
++          "open_value_units": 0.84,
++          "total_value_units": 2.07,
++          "strategy_index": 103.49999999999999,
++          "cumulative_return_pct": 3.499999999999986,
++          "daily_return_pct": 3.499999999999992,
++          "peak_index": 103.49999999999999,
++          "drawdown_pct": 0.0,
++          "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
++          "updated_at": "20261013100000"
++        }
++      ],
++      "latest": {
++        "snapshot_date": "20261013",
++        "strategy_name": "ValueQualityStrategy",
++        "open_position_count": 1,
++        "deployed_units": 2.0,
++        "realized_cost_units": 1.3,
++        "realized_value_units": 1.23,
++        "open_cost_units": 0.7,
++        "open_value_units": 0.84,
++        "total_value_units": 2.07,
++        "strategy_index": 103.49999999999999,
++        "cumulative_return_pct": 3.499999999999986,
++        "daily_return_pct": 3.499999999999992,
++        "peak_index": 103.49999999999999,
++        "drawdown_pct": 0.0,
++        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
++        "updated_at": "20261013100000"
++      },
++      "best_daily_return_pct": 3.499999999999992,
++      "worst_daily_return_pct": 3.499999999999992,
++      "max_drawdown_pct": 0.0,
++      "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX"
++    },
++    "performance": {
++      "open_position_count": 1,
++      "completed_trade_count": 1,
++      "winning_trade_count": 0,
++      "win_rate_pct": 0.0,
++      "average_return_pct": -10.0,
++      "best_return_pct": -10.0,
++      "worst_return_pct": -10.0,
++      "sell_event_count": 2,
++      "realized_weighted_return_pct": -7.0,
++      "closed_leg_count": 2,
++      "winning_leg_count": 0,
++      "weighted_realized_return_pct": -7.0
++    },
++    "missing_strategy": {
++      "open_position_count": 0,
++      "completed_trade_count": 0,
++      "winning_trade_count": 0,
++      "win_rate_pct": 0.0,
++      "average_return_pct": 0.0,
++      "best_return_pct": 0.0,
++      "worst_return_pct": 0.0,
++      "sell_event_count": 0,
++      "realized_weighted_return_pct": 0.0,
++      "closed_leg_count": 0,
++      "winning_leg_count": 0,
++      "weighted_realized_return_pct": 0.0
++    }
++  }
++}
+diff --git a/tests/test_atr.py b/tests/test_atr.py
+new file mode 100644
+index 0000000..33fa579
+--- /dev/null
++++ b/tests/test_atr.py
+@@ -0,0 +1,67 @@
++"""Shared ATR invariants used by current momentum entry and stop checks."""
++from contextlib import closing, redirect_stdout
++from io import StringIO
++from pathlib import Path
++import sqlite3
++import tempfile
++import unittest
++
++from util.atr import iter_atr_bars, load_atr_metrics
++
++
++class AtrTest(unittest.TestCase):
++    def setUp(self):
++        directory = tempfile.TemporaryDirectory()
++        self.addCleanup(directory.cleanup)
++        self.path = Path(directory.name) / 'market.db'
++        self.rows = [('20260101', 11, 9, 10), ('20260102', 13, 11, 12),
++                     ('20260103', 13, 10, 11), ('20260104', 12, 10, 11),
++                     ('20260105', 15, 12, 14)]
++
++    def create_db(self, stocks):
++        with closing(sqlite3.connect(self.path)) as con, con:
++            con.execute('CREATE TABLE daily_price (code TEXT, date TEXT, high REAL, low REAL, close REAL)')
++            for code, rows in stocks.items():
++                con.executemany('INSERT INTO daily_price VALUES (?,?,?,?,?)', [(code, *row) for row in rows])
++
++    def test_wilder_atr_includes_overnight_gap(self):
++        bars = list(iter_atr_bars(self.rows, period=3))
++        self.assertAlmostEqual(bars[0]['atr'], 8 / 3)
++        self.assertAlmostEqual(bars[1]['atr'], 28 / 9)
++
++    def test_cutoff_excludes_current_and_future_bars_without_changing_db(self):
++        self.create_db({'000001': self.rows + [('20260106', 1000, 900, 950)]})
++        original = self.path.read_bytes()
++        metric = load_atr_metrics(['1'], self.path, '20260105', period=3)['000001']
++        self.assertEqual(metric['atr_date'], '20260104')
++        self.assertAlmostEqual(metric['atr14'], 8 / 3)
++        self.assertEqual(self.path.read_bytes(), original)
++
++    def test_14_period_seed_requires_15_completed_bars(self):
++        rows = [(f'202601{i:02d}', 11, 9, 10) for i in range(1, 16)]
++        self.assertEqual(list(iter_atr_bars(rows[:14])), [])
++        self.assertEqual(list(iter_atr_bars(rows)), [{'date': '20260115', 'close': 10.0, 'atr': 2.0}])
++
++    def test_invalid_ohlc_and_non_increasing_dates_are_rejected(self):
++        for rows in [[('20260101', float('nan'), 9, 10)],
++                     [('20260101', 11, 0, 10)], [('20260101', 11, 9, 12)],
++                     [self.rows[1], self.rows[0]], [self.rows[0], self.rows[0]]]:
++            with self.subTest(rows=rows), self.assertRaises(ValueError):
++                list(iter_atr_bars(rows, period=3))
++
++    def test_invalid_symbol_does_not_remove_valid_symbols(self):
++        self.create_db({'000001': [('20260101', 11, 9, 12)], '000002': self.rows})
++        with redirect_stdout(StringIO()):
++            metrics = load_atr_metrics(['000001', '000002'], self.path, '20260106', period=3)
++        self.assertEqual(set(metrics), {'000002'})
++        self.assertAlmostEqual(metrics['000002']['atr14'], 28 / 9)
++
++    def test_selected_symbols_only_are_returned(self):
++        self.create_db({'000001': self.rows, '000002': self.rows})
++        self.assertEqual(set(load_atr_metrics(['2'], self.path, '20260106', period=3)), {'000002'})
++        self.assertEqual(load_atr_metrics([], self.path, '20260106', period=3), {})
++
++    def test_missing_database_is_never_created(self):
++        with self.assertRaises(sqlite3.OperationalError):
++            load_atr_metrics(['000001'], self.path, '20260106')
++        self.assertFalse(self.path.exists())
+diff --git a/tests/test_breakout_atr.py b/tests/test_breakout_atr.py
+deleted file mode 100644
+index 96b2650..0000000
+--- a/tests/test_breakout_atr.py
++++ /dev/null
+@@ -1,135 +0,0 @@
+-import sqlite3
+-import sys
+-import tempfile
+-import types
+-import unittest
+-from contextlib import closing
+-from datetime import datetime
+-from pathlib import Path
+-
+-# 테스트 환경에는 32bit Kiwoom용 PyQt5가 없으므로 QThread 인터페이스만 대체한다.
+-if "PyQt5.QtCore" not in sys.modules:
+-    pyqt5 = types.ModuleType("PyQt5")
+-    qtcore = types.ModuleType("PyQt5.QtCore")
+-
+-    class QThread:
+-        pass
+-
+-    qtcore.QThread = QThread
+-    pyqt5.QtCore = qtcore
+-    sys.modules["PyQt5"] = pyqt5
+-    sys.modules["PyQt5.QtCore"] = qtcore
+-
+-if "util.notifier" not in sys.modules:
+-    notifier = types.ModuleType("util.notifier")
+-    notifier.send_message = lambda *args, **kwargs: None
+-    notifier.send_error = lambda *args, **kwargs: None
+-    sys.modules["util.notifier"] = notifier
+-
+-from util.breakout_atr import (
+-    advance_atr_state,
+-    atr_exit_signal,
+-    iter_atr_bars,
+-    new_atr_state,
+-    new_atr_state_from_value,
+-)
+-from util.market_history import load_breakout_metrics
+-from util.paper_breakout_baseline import PaperBreakoutBaseline
+-
+-
+-class BreakoutAtrTest(unittest.TestCase):
+-    def test_180_day_breakout_buy_boundaries(self):
+-        strategy = PaperBreakoutBaseline(types.SimpleNamespace(), auto_init=False)
+-        self.assertEqual(strategy.BREAKOUT_WINDOW, 180)
+-        strategy.metrics_date = datetime.now().strftime("%Y%m%d")
+-        strategy.breakout_metrics = {
+-            "000001": {
+-                "breakout_price": 100,
+-                "prev_high": 94,
+-                "atr14": 2,
+-                "atr_date": "20260101",
+-                "volume_ma20": 10,
+-                "trading_value_ma20": 2_000_000_000,
+-            }
+-        }
+-
+-        def signal(price, previous_high=94):
+-            strategy.breakout_metrics["000001"]["prev_high"] = previous_high
+-            return strategy._get_buy_signal(
+-                "000001", {"현재가": price, "누적거래량": 10}
+-            )
+-
+-        self.assertIsNone(signal(95))
+-        self.assertIsNotNone(signal(100, previous_high=99))
+-        self.assertIsNotNone(signal(101, previous_high=99))
+-        self.assertIsNotNone(signal(120, previous_high=99))
+-        self.assertIsNone(signal(94))
+-        self.assertIsNone(signal(96, previous_high=97))
+-        self.assertIsNone(signal(100, previous_high=100))
+-
+-    def test_wilder_atr_includes_overnight_gap(self):
+-        rows = [
+-            ("20260101", 11, 9, 10),
+-            ("20260102", 13, 11, 12),  # TR 3: 전일 종가 10 -> 고가 13
+-            ("20260103", 13, 10, 11),  # TR 3
+-            ("20260104", 12, 10, 11),  # TR 2, 초기 ATR = 8/3
+-            ("20260105", 15, 12, 14),  # TR 4, Wilder ATR = (8/3*2+4)/3
+-        ]
+-        bars = list(iter_atr_bars(rows, period=3))
+-        self.assertAlmostEqual(bars[0]["atr"], 8 / 3)
+-        self.assertAlmostEqual(bars[1]["atr"], 28 / 9)
+-
+-    def test_atr_stop_never_moves_down(self):
+-        bars = [
+-            {"date": "20260109", "close": 98.0, "atr": 2.0},
+-            {"date": "20260110", "close": 101.0, "atr": 2.0},
+-            {"date": "20260111", "close": 110.0, "atr": 3.0},
+-        ]
+-        state = new_atr_state(100, "20260110100000", bars, initial_multiple=2)
+-        self.assertEqual(state["stop_price"], 96)
+-
+-        raised = advance_atr_state(state, 100, bars, trailing_multiple=3)
+-        self.assertEqual(raised["stop_price"], 101)  # max(96, 110 - 3*3)
+-
+-        wider_atr = bars + [{"date": "20260112", "close": 108.0, "atr": 10.0}]
+-        unchanged = advance_atr_state(raised, 100, wider_atr, trailing_multiple=3)
+-        self.assertEqual(unchanged["stop_price"], 101)
+-        self.assertEqual(atr_exit_signal(101, unchanged)["reason_code"], "ATR_TRAILING_STOP")
+-
+-    def test_existing_position_can_migrate_from_latest_atr(self):
+-        state = new_atr_state_from_value(
+-            100, "20250102100000", 4, "20260110", initial_multiple=2
+-        )
+-        self.assertEqual(state["initial_stop"], 92)
+-        self.assertEqual(state["last_bar_date"], "20260110")
+-
+-    def test_breakout_metrics_exclude_cutoff_date(self):
+-        with tempfile.TemporaryDirectory() as directory:
+-            db_path = Path(directory) / "market.db"
+-            with closing(sqlite3.connect(db_path)) as con, con:
+-                con.execute(
+-                    "CREATE TABLE daily_price ("
+-                    "code TEXT, date TEXT, open INTEGER, high INTEGER, low INTEGER, "
+-                    "close INTEGER, volume INTEGER)"
+-                )
+-                con.executemany(
+-                    "INSERT INTO daily_price VALUES (?, ?, ?, ?, ?, ?, ?)",
+-                    [
+-                        ("000001", "20260101", 90, 100, 85, 95, 10),
+-                        ("000001", "20260102", 95, 105, 90, 100, 20),
+-                        ("000001", "20260103", 100, 103, 95, 101, 30),
+-                        # 장중/당일 행이 존재하더라도 cutoff에서 제외되어야 한다.
+-                        ("000001", "20260104", 101, 999, 100, 998, 999),
+-                    ],
+-                )
+-            metrics = load_breakout_metrics(
+-                ["000001"], breakout_window=3, volume_window=2, ma_window=2,
+-                db_path=db_path, before_date="20260104",
+-            )
+-            self.assertEqual(metrics["000001"]["breakout_price"], 105)
+-            self.assertEqual(metrics["000001"]["prev_high"], 103)
+-            self.assertEqual(metrics["000001"]["history_last_date"], "20260103")
+-
+-
+-if __name__ == "__main__":
+-    unittest.main()
+diff --git a/tests/test_momentum_single_account.py b/tests/test_momentum_single_account.py
+index 6564ec3..1eb5101 100644
+--- a/tests/test_momentum_single_account.py
++++ b/tests/test_momentum_single_account.py
+@@ -8,10 +8,15 @@ import unittest
+ from unittest.mock import patch
+ 
+ from paper_fixture import config
+-from util.paper_trading import PaperBroker, MOMENTUM, BASELINE, FILTERED
++from util.paper_trading import PaperBroker, MOMENTUM
+ from web_api import database
+ 
+ 
++# Old DB identifiers belong only to archived-data fixtures.
++BASELINE = "HighBreakoutBaselinePaper"
++FILTERED = "HighBreakoutFilteredPaper"
++
++
+ class MomentumSingleAccountTest(unittest.TestCase):
+     def setUp(self):
+         directory = tempfile.TemporaryDirectory()
+diff --git a/tests/test_paper_trading.py b/tests/test_paper_trading.py
+index 2f9d587..826baf2 100644
+--- a/tests/test_paper_trading.py
++++ b/tests/test_paper_trading.py
+@@ -8,7 +8,7 @@ import unittest
+ from unittest.mock import patch
+ 
+ from paper_fixture import config
+-from util.paper_trading import PaperBroker, PROFILES, MOMENTUM
++from util.paper_trading import PaperBroker, MOMENTUM
+ from web_api import database
+ 
+ 
+@@ -26,12 +26,11 @@ class PaperLedgerTest(unittest.TestCase):
+             {"stop_price": 9500, "partial_done": False}, "ENTRY", {}, self.now)
+ 
+     def test_single_account_integer_lots_costs_and_cash_limit(self):
+-        for profile in PROFILES:
+-            position, error = self.buy(profile=profile)
+-            self.assertIsNone(error)
+-            self.assertEqual(position["quantity"], 93)  # 50,000 risk / 535.815 modeled loss
+-            self.assertEqual(position["entry_price"], 10005)
+-            self.assertAlmostEqual(self.broker.accounts[profile]["cash"], 10000000 - 93 * 10005 * 1.00035)
++        position, error = self.buy(profile=MOMENTUM)
++        self.assertIsNone(error)
++        self.assertEqual(position["quantity"], 93)  # 50,000 risk / 535.815 modeled loss
++        self.assertEqual(position["entry_price"], 10005)
++        self.assertAlmostEqual(self.broker.accounts[MOMENTUM]["cash"], 10000000 - 93 * 10005 * 1.00035)
+         self.assertEqual(len(self.broker.positions), 1)
+ 
+     def test_partial_fill_restart_cash_reconciliation_and_reentry_guard(self):
+diff --git a/tests/test_strategy_cleanup.py b/tests/test_strategy_cleanup.py
+index 543cb33..02d38ac 100644
+--- a/tests/test_strategy_cleanup.py
++++ b/tests/test_strategy_cleanup.py
+@@ -3,6 +3,8 @@ from datetime import datetime
+ from pathlib import Path
+ from types import SimpleNamespace
+ import tempfile
++import sqlite3
++from contextlib import closing
+ import unittest
+ from unittest.mock import Mock, patch
+ from paper_fixture import history, market_db, qt_stubs
+@@ -67,14 +69,14 @@ class StrategyCleanupTest(unittest.TestCase):
+     def test_removed_comparison_ma_endpoints_cannot_change_settings(self):
+         from fastapi.testclient import TestClient
+         from web_api.main import app
+-        from util.strategy_settings import get_ma_settings_status, save_ma_settings
+         with tempfile.TemporaryDirectory() as directory:
+             db = Path(directory) / "settings.db"
+-            save_ma_settings(10, 0.95, 0, db, now=datetime(2026, 9, 30, 12))
++            with closing(sqlite3.connect(db)) as con, con:
++                con.execute("CREATE TABLE legacy_ma_settings (revision INTEGER, period INTEGER)")
++                con.execute("INSERT INTO legacy_ma_settings VALUES (1, 10)")
+             original = db.read_bytes()
+             client = TestClient(app)
+             url = "/api/strategies/MomentumContractionStrategy/ma-settings"
+             self.assertEqual(client.get(url).status_code, 404)
+             self.assertEqual(client.put(url, json={"ma_period": 20, "exit_ratio": 0.95, "expected_revision": 1}).status_code, 404)
+             self.assertEqual(db.read_bytes(), original)
+-            self.assertEqual(get_ma_settings_status(db)["saved"]["revision"], 1)
+diff --git a/tests/test_strategy_integration.py b/tests/test_strategy_integration.py
+index 41dc260..ce0afa6 100644
+--- a/tests/test_strategy_integration.py
++++ b/tests/test_strategy_integration.py
+@@ -11,14 +11,10 @@ from unittest.mock import Mock, patch
+ from paper_fixture import history, market_db, qt_stubs
+ qt_stubs()
+ 
+-from util.paper_breakout_baseline import PaperBreakoutBaseline
+ from strategy.MomentumContractionStrategy import MomentumContractionStrategy
+ from strategy.StrategyManager import StrategyManager
+-from util.breakout_atr import ma_profit_exit_signal, load_atr_metrics, new_atr_state_from_value
+-from util.market_history import load_breakout_metrics
+ from util.paper_strategy_engine import MomentumPaperEngine
+-from util.paper_trading import PROFILES, MOMENTUM
+-from util.strategy_settings import get_ma_settings_status, save_ma_settings
++from util.paper_trading import MOMENTUM
+ from util.virtual_strategy_engine import VirtualStrategyEngine
+ 
+ 
+@@ -83,15 +79,7 @@ class StrategyIntegrationTest(unittest.TestCase):
+         self.momentum = MomentumContractionStrategy(self.kiwoom, market_db_path=self.path, clock=lambda: self.now)
+         self.momentum.check_and_get_universe()
+         self.momentum.is_init_success = True
+-        self.high = PaperBreakoutBaseline(self.kiwoom, auto_init=False)
+-        self.high.market_history_db_path = self.path
+-        self.high.ma_settings_db_path = Path(self.directory.name) / "settings.db"
+-        self.high.universe = self.momentum.universe
+-        self.high.breakout_metrics = load_breakout_metrics(["000001"], breakout_window=180, db_path=self.path, before_date="20260930")
+-        self.high.breakout_metrics["000001"].update(load_atr_metrics(["000001"], self.path, "20260930")["000001"])
+-        self.high._ensure_daily_metrics = Mock()
+-        self.high.is_init_success = True
+-        self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "paper.db")
++        self.engine = MomentumPaperEngine([self.momentum], Path(self.directory.name) / "paper.db")
+         self.momentum.check_and_get_price_data()
+         self.momentum.on_realtime_registered()
+ 
+@@ -125,7 +113,7 @@ class StrategyIntegrationTest(unittest.TestCase):
+         from io import StringIO
+         ticks = Path(self.directory.name) / "recorded.csv"
+         with patch.dict(os.environ, {"SYSTEMTRADING_PAPER_TICK_CSV": str(ticks)}):
+-            self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
++            self.engine = MomentumPaperEngine([self.momentum], Path(self.directory.name) / "capture.db")
+         self.tick("090000", 16200)
+         self.tick("090459", 16400)
+         self.tick("090500", 16600)
+@@ -142,7 +130,7 @@ class StrategyIntegrationTest(unittest.TestCase):
+         ticks = Path(self.directory.name) / "wrong.csv"
+         ticks.write_text("preserve this file", encoding="utf-8")
+         with patch.dict(os.environ, {"SYSTEMTRADING_PAPER_TICK_CSV": str(ticks)}):
+-            self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
++            self.engine = MomentumPaperEngine([self.momentum], Path(self.directory.name) / "capture.db")
+         self.assertIsNone(self.engine.tick_recorder)
+         self.tick("090000", 16200)
+         self.tick("090500", 16600)
+@@ -170,7 +158,7 @@ class StrategyIntegrationTest(unittest.TestCase):
+         self.tick("090100", 16550)
+         self.assertFalse(self.engine.broker.positions)
+         self.tick("090500", 16600)
+-        self.assertEqual(set(p for p, _ in self.engine.broker.positions), set(PROFILES))
++        self.assertEqual(set(p for p, _ in self.engine.broker.positions), {MOMENTUM})
+         c = self.engine.broker.positions[(MOMENTUM, "000001")]
+         self.assertEqual(c["state"]["initial_stop"], 16100)
+         self.assertEqual(c["entry_price"], 16609)
+@@ -218,15 +206,14 @@ class StrategyIntegrationTest(unittest.TestCase):
+         self.assertEqual(context["ma_date"], "20260929")
+         self.assertEqual(context["close"], 16200)
+ 
+-    def test_manager_rejects_every_paper_profile_before_order_checks(self):
++    def test_manager_rejects_paper_momentum_before_order_checks(self):
+         manager = StrategyManager.__new__(StrategyManager)
+         manager.strategies = [self.momentum]
+         manager.last_buy_rejections = {}
+         manager.kiwoom = self.kiwoom
+         manager.get_event_driven_order_block_reason = Mock(side_effect=AssertionError("guard should precede live flow"))
+-        for profile in PROFILES:
+-            self.assertIsNone(manager.request_buy_order(profile, "000001", "Fixture", 17000, "test", "2004"))
+-            self.assertIn("가상 전용", manager.last_buy_rejections["000001"])
++        self.assertIsNone(manager.request_buy_order(MOMENTUM, "000001", "Fixture", 17000, "test", "2004"))
++        self.assertIn("가상 전용", manager.last_buy_rejections["000001"])
+         self.kiwoom.send_order.assert_not_called()
+ 
+     def test_legacy_virtual_processing_survives_paper_failure(self):
+@@ -240,30 +227,6 @@ class StrategyIntegrationTest(unittest.TestCase):
+             virtual.on_realtime_tick("000001", {"현재가": 16600})
+         virtual._process_strategy.assert_called_once()
+ 
+-    def test_ma_settings_apply_next_trading_day_and_not_holiday(self):
+-        save_ma_settings(20, 0.95, 0, self.high.ma_settings_db_path, now=datetime(2026, 9, 30, 12))
+-        self.high._ensure_ma_settings(datetime(2026, 9, 30, 13))
+-        self.assertEqual(self.high.active_ma_settings["revision"], 0)
+-        self.high._ensure_ma_settings(datetime(2026, 10, 5, 9))
+-        self.assertEqual(get_ma_settings_status(self.high.ma_settings_db_path)["applied"]["applied_date"], "20260930")
+-        self.high._ensure_ma_settings(datetime(2026, 10, 6, 9))
+-        self.assertEqual(self.high.active_ma_settings["ma_period"], 20)
+-        self.assertEqual(self.high.active_ma_settings["revision"], 1)
+-
+-    def test_legacy_ma_freezes_first_tick_is_profit_only_and_atr_has_priority(self):
+-        state = new_atr_state_from_value(100, "20260923100000", 5, "20260922")
+-        signal, frozen = ma_profit_exit_signal(110, 100, state, 440, now=datetime(2026, 9, 30, 15, 19))
+-        self.assertIsNone(signal)
+-        self.assertAlmostEqual(frozen["ma_profit_stop"], 106.7)
+-        signal, again = ma_profit_exit_signal(105, 100, frozen, 400, now=datetime(2026, 9, 30, 15, 19, 30))
+-        self.assertEqual(signal["reason_code"], "MA_PROFIT_EXIT")
+-        self.assertEqual(again["ma_profit_stop"], 106.7)
+-        self.assertIsNone(ma_profit_exit_signal(99, 100, frozen, 440, now=datetime(2026, 9, 30, 15, 19, 45))[0])
+-        self.assertIsNone(ma_profit_exit_signal(105, 100, frozen, 440, now=datetime(2026, 9, 30, 15, 20))[0])
+-        self.high._atr_history = Mock(return_value=[])
+-        self.high._ensure_ma_settings = Mock(side_effect=AssertionError("ATR priority"))
+-        signal, _ = self.high.evaluate_sell_signal("000001", 89, 100, state["entry_at"], state, now=datetime(2026, 9, 30, 15, 19))
+-        self.assertEqual(signal["reason_code"], "ATR_INITIAL_STOP")
+ 
+ 
+ class PaperApiTest(unittest.TestCase):
+diff --git a/tests/test_value_report_service.py b/tests/test_value_report_service.py
+new file mode 100644
+index 0000000..220988a
+--- /dev/null
++++ b/tests/test_value_report_service.py
+@@ -0,0 +1,99 @@
++"""Report delivery behavior without HTTP, Telegram or broker orders."""
++from contextlib import redirect_stdout
++from io import StringIO
++from types import SimpleNamespace
++import unittest
++from unittest.mock import Mock, patch
++
++from paper_fixture import qt_stubs
++qt_stubs()
++from strategy.StrategyManager import StrategyManager
++from strategy.value_report_service import ValueReportService, format_report_message
++
++
++class ValueReportServiceTest(unittest.TestCase):
++    def setUp(self):
++        self.manager = StrategyManager.__new__(StrategyManager)
++        self.manager.kiwoom = SimpleNamespace(balance={
++            '1': {'보유수량': 3}, '000002': {'보유수량': 0},
++            '000003': {'보유수량': 2}}, send_order=Mock())
++        self.manager.get_code_name = Mock(return_value='테스트종목')
++        self.manager.last_value_report_check_at = 0
++        self.manager.value_report_check_interval = 1800
++        self.manager.last_value_report_error_log_at = 0
++        self.manager.value_report_error_log_interval = 3600
++        self.clock = Mock(return_value=4000)
++        self.lookup = Mock(side_effect=lambda code: 'ValueQualityStrategy' if code in ('000001', '000002') else 'MomentumContractionStrategy')
++        self.scan = Mock(return_value={'reports': [self.report(11), self.report(12)], 'last_scanned_report_id': 12})
++        self.cursor = Mock(return_value=10)
++        self.write = Mock()
++        self.sent = Mock(return_value=False)
++        self.record = Mock()
++        self.notify = Mock(return_value={'ok': True})
++        self.service = ValueReportService(self.manager, position_strategy_lookup=self.lookup,
++            scan_reports=self.scan, read_cursor=self.cursor, write_cursor=self.write,
++            is_sent=self.sent, record_sent=self.record, send_message=self.notify, clock=self.clock)
++        self.manager._value_reports = Mock(return_value=self.service)
++
++    @staticmethod
++    def report(number):
++        return {'report_key': str(number), 'code': '1', 'title': '성장 전망', 'broker': '기관',
++                'analyst': '작성자', 'report_date': '2026-10-13', 'opinion': 'BUY',
++                'target_price': 15000, 'url': 'https://example.test/report/' + str(number)}
++
++    def test_filter_interval_one_report_and_record_after_success_are_preserved(self):
++        self.assertEqual(self.manager.get_value_quality_holding_codes(), ['000001'])
++        order = Mock()
++        for name, callback in [('cursor', self.cursor), ('scan', self.scan), ('write', self.write),
++                               ('notify', self.notify), ('record', self.record)]:
++            order.attach_mock(callback, name)
++        self.manager.send_one_value_quality_report_if_needed()
++        self.scan.assert_called_once_with(target_codes=['000001'], last_scanned_report_id=10,
++            max_scan_count=120, consecutive_miss_limit=15)
++        self.write.assert_called_once_with(12)
++        self.notify.assert_called_once_with('[저평가 우량주 리포트]\n\n테스트종목(000001)\n성장 전망\n발행기관: 기관\n작성자: 작성자\n발표일: 2026-10-13\n투자의견: BUY\n목표주가: 15000\n\nhttps://example.test/report/11')
++        self.assertEqual(self.record.call_args.kwargs['report_key'], '11')
++        self.assertLess([c[0] for c in order.mock_calls].index('notify'), [c[0] for c in order.mock_calls].index('record'))
++        self.clock.return_value = 4100
++        self.manager.send_one_value_quality_report_if_needed()
++        self.assertEqual(self.scan.call_count, 1)
++        self.manager.kiwoom.send_order.assert_not_called()
++
++    def test_force_bypasses_interval_and_already_sent_report_is_skipped(self):
++        self.manager.last_value_report_check_at = 3999
++        self.sent.side_effect = lambda key: key == '11'
++        self.manager.send_one_value_quality_report_if_needed(force=True)
++        self.assertEqual(self.record.call_args.kwargs['report_key'], '12')
++        self.assertEqual(self.notify.call_count, 1)
++
++    def test_failed_notification_does_not_mark_report_sent(self):
++        self.notify.return_value = None
++        self.manager.send_one_value_quality_report_if_needed()
++        self.notify.assert_called_once()
++        self.record.assert_not_called()
++        self.write.assert_called_once_with(12)
++
++    def test_no_holdings_skip_network_and_no_target_still_advances_scan_cursor(self):
++        self.manager.kiwoom.balance = {}
++        self.manager.send_one_value_quality_report_if_needed()
++        self.scan.assert_not_called()
++        self.manager.kiwoom.balance = {'1': {'보유수량': 3}}
++        self.scan.return_value = {'reports': [], 'last_scanned_report_id': 20}
++        self.manager.send_one_value_quality_report_if_needed(force=True)
++        self.write.assert_called_once_with(20)
++        self.notify.assert_not_called()
++
++    def test_scan_failure_does_not_escape_and_error_console_is_throttled(self):
++        self.scan.side_effect = RuntimeError('fixture failure')
++        console = StringIO()
++        with redirect_stdout(console):
++            self.manager.send_one_value_quality_report_if_needed(force=True)
++            self.clock.return_value = 4100
++            self.manager.send_one_value_quality_report_if_needed(force=True)
++        self.assertEqual(console.getvalue().count('fixture failure'), 1)
++        self.assertEqual(self.manager.last_value_report_error_log_at, 4000)
++        self.record.assert_not_called()
++
++    def test_message_defaults_match_existing_format(self):
++        self.assertEqual(format_report_message({'code': '1', 'target_price': '0', 'url': 'link'}, '테스트종목'),
++            '[저평가 우량주 리포트]\n\n테스트종목(000001)\n기업 리포트\n발행기관: -\n작성자: -\n발표일: -\n투자의견: -\n목표주가: -\n\nlink')
+diff --git a/tests/test_web_query_refactor.py b/tests/test_web_query_refactor.py
+new file mode 100644
+index 0000000..d099b67
+--- /dev/null
++++ b/tests/test_web_query_refactor.py
+@@ -0,0 +1,88 @@
++"""Pinned API contracts and independent read-only database configuration."""
++from contextlib import closing
++from datetime import datetime
++from pathlib import Path
++import inspect
++import json
++import sqlite3
++import os
++import subprocess
++import sys
++import tempfile
++import unittest
++from unittest.mock import patch
++
++from web_api import database, virtual_queries
++from web_api.query_context import ReadOnlyDatabase, VirtualQueryContext
++from web_query_fixture import seed_history, responses, STRATEGY
++
++
++class QueryRefactorTest(unittest.TestCase):
++    def setUp(self):
++        directory = tempfile.TemporaryDirectory()
++        self.addCleanup(directory.cleanup)
++        self.path = Path(directory.name) / 'history.db'
++        seed_history(self.path)
++        self.contract = json.loads((Path(__file__).parent / 'fixtures/web_query_contract.json').read_text())
++
++    def test_public_signatures_and_pinned_response_contract_are_unchanged(self):
++        for name, signature in self.contract['signatures'].items():
++            with self.subTest(function=name):
++                self.assertEqual(str(inspect.signature(getattr(database, name))), signature)
++        with closing(sqlite3.connect(self.path)) as con:
++            before = list(con.iterdump())
++        with patch.object(database, 'MONITORING_DB', self.path):
++            self.assertEqual(responses(), self.contract['responses'])
++        with closing(sqlite3.connect(self.path)) as con:
++            self.assertEqual(list(con.iterdump()), before)
++
++    def test_imported_facade_functions_use_current_path_and_clock(self):
++        query = database.get_virtual_event_summary
++        class FixedDatetime(datetime):
++            @classmethod
++            def now(cls): return cls(2026, 10, 13, 12)
++        with patch.object(database, 'MONITORING_DB', self.path), patch.object(database, 'datetime', FixedDatetime):
++            self.assertEqual(query(STRATEGY), self.contract['responses']['event_summary'])
++        missing = self.path.parent / 'missing.db'
++        with patch.object(database, 'MONITORING_DB', missing):
++            self.assertEqual(query(STRATEGY), {'buy': 0, 'sell': 0, 'total': 0})
++            self.assertEqual(database.get_virtual_positions(), [])
++        self.assertFalse(missing.exists())
++
++    def test_explicit_contexts_are_isolated_from_facade_paths(self):
++        context = VirtualQueryContext(ReadOnlyDatabase(self.path), ReadOnlyDatabase(self.path.parent / 'paper.db'))
++        with patch.object(database, 'MONITORING_DB', self.path.parent / 'missing.db'):
++            result = virtual_queries.get_virtual_performance(context, STRATEGY)
++            self.assertEqual(result, self.contract['responses']['performance'])
++            self.assertEqual(database.get_virtual_positions(), [])
++
++    def test_read_only_connection_rejects_writes_and_closes_on_both_exit_paths(self):
++        reader = ReadOnlyDatabase(self.path, busy_timeout_ms=1234)
++        with reader.connect() as con:
++            self.assertEqual(con.execute('PRAGMA busy_timeout').fetchone()[0], 1234)
++            self.assertEqual(con.execute('PRAGMA query_only').fetchone()[0], 1)
++            with self.assertRaises(sqlite3.OperationalError):
++                con.execute('DELETE FROM virtual_position')
++        with self.assertRaises(sqlite3.ProgrammingError):
++            con.execute('SELECT 1')
++        with self.assertRaisesRegex(RuntimeError, 'fixture'):
++            with reader.connect() as failed:
++                raise RuntimeError('fixture')
++        with self.assertRaises(sqlite3.ProgrammingError):
++            failed.execute('SELECT 1')
++        self.assertTrue(reader.table_exists('virtual_position'))
++        self.assertFalse(reader.table_exists('missing_table'))
++        with self.assertRaises(database.DatabaseNotReadyError):
++            with ReadOnlyDatabase(self.path.parent / 'absent.db').connect():
++                pass
++
++    def test_importing_query_and_report_modules_has_no_startup_side_effects(self):
++        root = str(Path(__file__).resolve().parents[1])
++        with tempfile.TemporaryDirectory() as directory:
++            result = subprocess.run([sys.executable, '-c',
++                "import sys; import web_api.database; import strategy.value_report_service; "
++                "assert 'PyQt5' not in sys.modules; assert 'api.Kiwoom' not in sys.modules"],
++                cwd=directory, env={**os.environ, 'PYTHONPATH': root}, capture_output=True, text=True, timeout=10)
++            self.assertEqual(result.returncode, 0, result.stderr)
++            self.assertEqual(result.stdout, '')
++            self.assertEqual(list(Path(directory).iterdir()), [])
+diff --git a/tests/web_query_fixture.py b/tests/web_query_fixture.py
+new file mode 100644
+index 0000000..7207e2c
+--- /dev/null
++++ b/tests/web_query_fixture.py
+@@ -0,0 +1,35 @@
++"""Deterministic mixed open, partial and fully closed virtual history."""
++from pathlib import Path
++from unittest.mock import patch
++from util import virtual_trading as ledger
++from web_api import database
++
++STRATEGY = 'ValueQualityStrategy'
++
++def seed_history(path):
++    with patch.object(ledger, 'MONITORING_DB', Path(path)), patch.object(ledger, '_now', return_value='20261012090000'):
++        ledger.open_virtual_position(STRATEGY, '000001', '부분보유', 100, 'ENTRY', '진입', {'stop': 90})
++        ledger.open_virtual_position(STRATEGY, '000002', '완료거래', 200, 'ENTRY', '진입')
++        ledger.open_virtual_position('OtherStrategy', '000003', '다른전략', 300, 'ENTRY', '진입')
++        ledger.save_virtual_strategy_daily_snapshots([STRATEGY], '20261012')
++    with patch.object(ledger, 'MONITORING_DB', Path(path)), patch.object(ledger, '_now', return_value='20261013100000'):
++        ledger.close_virtual_position(STRATEGY, '000001', 110, 'PARTIAL', '부분청산', exit_ratio=0.3)
++        ledger.close_virtual_position(STRATEGY, '000002', 180, 'STOP', '전량청산')
++        ledger.update_virtual_position(STRATEGY, '000001', 120)
++        ledger.save_virtual_strategy_daily_snapshots([STRATEGY], '20261013')
++
++def responses():
++    return {
++        'positions': database.get_virtual_positions(STRATEGY),
++        'all_positions': database.get_virtual_positions(),
++        'trades': database.get_virtual_trades(STRATEGY),
++        'paged_trades': database.get_virtual_trades(STRATEGY, limit=1, offset=1),
++        'events': database.get_virtual_events(STRATEGY),
++        'event_summary': database.get_virtual_event_summary(STRATEGY, '20261013'),
++        'daily': database.get_virtual_daily_performance(STRATEGY),
++        'daily_filtered': database.get_virtual_daily_performance(STRATEGY, '20261013', '20261013'),
++        'index': database.get_virtual_strategy_index_history(STRATEGY),
++        'index_filtered': database.get_virtual_strategy_index_history(STRATEGY, '20261013', '20261013'),
++        'performance': database.get_virtual_performance(STRATEGY),
++        'missing_strategy': database.get_virtual_performance('MissingStrategy'),
++    }
+diff --git a/util/atr.py b/util/atr.py
+new file mode 100644
+index 0000000..b1918d5
+--- /dev/null
++++ b/util/atr.py
+@@ -0,0 +1,85 @@
++"""모멘텀 전략에서 사용하는 공용 Wilder ATR 계산과 과거 지표 조회.
++
++주문/Qt 의존성이 없어 실주문과 가상매매에서 동일한 계산을 사용한다.
++ATR은 첫 14개 TR의 단순평균으로 시작하고 이후 Wilder 방식으로 평활한다.
++첫 일봉은 전일 종가 제공용이므로 최초 ATR에는 일봉 15개가 필요하다.
++"""
++from __future__ import annotations
++
++from contextlib import closing
++from itertools import groupby
++from pathlib import Path
++import math
++import sqlite3
++
++
++ATR_PERIOD = 14
++
++
++def _positive(value):
++    try:
++        value = float(value)
++    except (TypeError, ValueError):
++        return False
++    return math.isfinite(value) and value > 0
++
++
++def iter_atr_bars(rows, period=ATR_PERIOD):
++    """오름차순 (date, high, low, close) -> 완결일별 Wilder ATR.
++
++    잘못된 OHLC를 건너뛰어 다른 기간을 14일로 오인하지 않고 오류로 처리한다.
++    """
++    if period < 1:
++        raise ValueError("ATR period must be positive")
++    previous_close = None
++    previous_date = None
++    seed = []
++    atr = None
++    for date, high, low, close in rows:
++        date = str(date)
++        if previous_date is not None and date <= previous_date:
++            raise ValueError("ATR dates must be strictly increasing")
++        if not all(_positive(v) for v in (high, low, close)):
++            raise ValueError("ATR requires finite positive OHLC")
++        high, low, close = float(high), float(low), float(close)
++        if not low <= close <= high:
++            raise ValueError("Invalid OHLC range")
++        if previous_close is not None:
++            tr = max(high - low, abs(high - previous_close), abs(low - previous_close))
++            if atr is None:
++                seed.append(tr)
++                if len(seed) == period:
++                    atr = sum(seed) / period
++            else:
++                atr = (atr * (period - 1) + tr) / period
++            if atr is not None:
++                yield {"date": date, "close": close, "atr": atr}
++        previous_close = close
++        previous_date = date
++
++
++def _read_connection(db_path):
++    return sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
++
++
++def load_atr_metrics(codes, db_path, before_date, period=ATR_PERIOD):
++    """모든 이력을 커서로 순회하되 종목별 최신 ATR만 보관한다 (32bit 메모리 제한)."""
++    selected = {str(code).zfill(6) for code in codes}
++    result = {}
++    with closing(_read_connection(db_path)) as con:
++        cursor = con.execute(
++            "SELECT code, date, high, low, close FROM daily_price "
++            "WHERE date < ? ORDER BY code, date", (before_date,),
++        )
++        for code, rows in groupby(cursor, key=lambda row: row[0]):
++            if code not in selected:
++                continue
++            try:
++                last = None
++                for bar in iter_atr_bars((row[1:] for row in rows), period):
++                    last = bar
++                if last and _positive(last["atr"]):
++                    result[code] = {"atr14": last["atr"], "atr_date": last["date"]}
++            except ValueError as exc:
++                print(f"[ATR] 지표 제외 {code}: {exc}")
++    return result
+diff --git a/util/breakout_atr.py b/util/breakout_atr.py
+deleted file mode 100644
+index 89ac14f..0000000
+--- a/util/breakout_atr.py
++++ /dev/null
+@@ -1,228 +0,0 @@
+-"""신고가 돌파 전략용 Wilder ATR(14) 및 단조 증가 청산선.
+-
+-주문/Qt 의존성이 없어 실주문과 가상매매에서 동일한 계산을 사용한다.
+-ATR은 첫 14개 TR의 단순평균으로 시작하고 이후 Wilder 방식으로 평활한다.
+-첫 일봉은 전일 종가 제공용이므로 최초 ATR에는 일봉 15개가 필요하다.
+-"""
+-from __future__ import annotations
+-
+-from contextlib import closing
+-from datetime import datetime
+-from itertools import groupby
+-from pathlib import Path
+-import math
+-import sqlite3
+-
+-
+-ATR_PERIOD = 14
+-INITIAL_ATR_MULTIPLIER = 2.0
+-TRAILING_ATR_MULTIPLIER = 3.0
+-
+-
+-def _positive(value):
+-    try:
+-        value = float(value)
+-    except (TypeError, ValueError):
+-        return False
+-    return math.isfinite(value) and value > 0
+-
+-
+-def iter_atr_bars(rows, period=ATR_PERIOD):
+-    """오름차순 (date, high, low, close) -> 완결일별 Wilder ATR.
+-
+-    잘못된 OHLC를 건너뛰어 다른 기간을 14일로 오인하지 않고 오류로 처리한다.
+-    """
+-    if period < 1:
+-        raise ValueError("ATR period must be positive")
+-    previous_close = None
+-    previous_date = None
+-    seed = []
+-    atr = None
+-    for date, high, low, close in rows:
+-        date = str(date)
+-        if previous_date is not None and date <= previous_date:
+-            raise ValueError("ATR dates must be strictly increasing")
+-        if not all(_positive(v) for v in (high, low, close)):
+-            raise ValueError("ATR requires finite positive OHLC")
+-        high, low, close = float(high), float(low), float(close)
+-        if not low <= close <= high:
+-            raise ValueError("Invalid OHLC range")
+-        if previous_close is not None:
+-            tr = max(high - low, abs(high - previous_close), abs(low - previous_close))
+-            if atr is None:
+-                seed.append(tr)
+-                if len(seed) == period:
+-                    atr = sum(seed) / period
+-            else:
+-                atr = (atr * (period - 1) + tr) / period
+-            if atr is not None:
+-                yield {"date": date, "close": close, "atr": atr}
+-        previous_close = close
+-        previous_date = date
+-
+-
+-def _read_connection(db_path):
+-    return sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)
+-
+-
+-def load_atr_metrics(codes, db_path, before_date, period=ATR_PERIOD):
+-    """모든 이력을 커서로 순회하되 종목별 최신 ATR만 보관한다 (32bit 메모리 제한)."""
+-    selected = {str(code).zfill(6) for code in codes}
+-    result = {}
+-    with closing(_read_connection(db_path)) as con:
+-        cursor = con.execute(
+-            "SELECT code, date, high, low, close FROM daily_price "
+-            "WHERE date < ? ORDER BY code, date", (before_date,),
+-        )
+-        for code, rows in groupby(cursor, key=lambda row: row[0]):
+-            if code not in selected:
+-                continue
+-            try:
+-                last = None
+-                for bar in iter_atr_bars((row[1:] for row in rows), period):
+-                    last = bar
+-                if last and _positive(last["atr"]):
+-                    result[code] = {"atr14": last["atr"], "atr_date": last["date"]}
+-            except ValueError as exc:
+-                print(f"[HighBreakout ATR] 지표 제외 {code}: {exc}")
+-    return result
+-
+-
+-def load_atr_history(code, db_path, before_date, period=ATR_PERIOD, from_date=None):
+-    """보유/진입 종목만 일별 ATR을 읽는다. 재시작 시 누락된 날의 청산선을 재구성한다."""
+-    with closing(_read_connection(db_path)) as con:
+-        rows = con.execute(
+-            "SELECT date, high, low, close FROM daily_price "
+-            "WHERE code = ? AND date < ? ORDER BY date", (str(code).zfill(6), before_date),
+-        )
+-        result = []
+-        preceding = None
+-        for bar in iter_atr_bars(rows, period):
+-            if from_date is not None and bar["date"] < from_date:
+-                preceding = bar
+-                continue
+-            if preceding is not None:
+-                result.append(preceding)
+-                preceding = None
+-            result.append(bar)
+-        if not result and preceding is not None:
+-            result.append(preceding)
+-        return result
+-
+-
+-def new_atr_state(entry_price, entry_at, bars, initial_multiple=INITIAL_ATR_MULTIPLIER):
+-    """진입일 전까지 알려진 ATR을 고정한다. 기존 보유도 실제 진입일을 기준으로 복원한다."""
+-    entry_at = str(entry_at or "")
+-    entry_date = entry_at[:8]
+-    if len(entry_date) != 8 or not entry_date.isdigit() or not _positive(entry_price):
+-        raise ValueError("ATR 상태에 유효한 실제 진입일/매입가가 필요합니다")
+-    before_entry = [bar for bar in bars if bar["date"] < entry_date]
+-    if not before_entry or not _positive(before_entry[-1]["atr"]):
+-        raise ValueError("매수일 이전 ATR 이력이 부족합니다. 과거 일봉을 보충하세요")
+-    return new_atr_state_from_value(
+-        entry_price,
+-        entry_at,
+-        before_entry[-1]["atr"],
+-        before_entry[-1]["date"],
+-        initial_multiple,
+-    )
+-
+-
+-def new_atr_state_from_value(
+-    entry_price,
+-    entry_at,
+-    atr,
+-    atr_date,
+-    initial_multiple=INITIAL_ATR_MULTIPLIER,
+-):
+-    """이관 시 과거 진입 전 봉이 없을 때도 명시적인 ATR 값으로 상태를 만든다."""
+-    entry_at = str(entry_at or "")
+-    if len(entry_at[:8]) != 8 or not entry_at[:8].isdigit():
+-        raise ValueError("ATR 상태에 유효한 실제 진입일이 필요합니다")
+-    if not _positive(entry_price) or not _positive(atr):
+-        raise ValueError("ATR 상태에 유효한 매입가/ATR이 필요합니다")
+-    atr = float(atr)
+-    stop = float(entry_price) - initial_multiple * atr
+-    if stop <= 0:
+-        raise ValueError("ATR 초기 청산선이 0원 이하입니다")
+-    return {
+-        "version": 1,
+-        "entry_at": entry_at,
+-        "entry_price": float(entry_price),
+-        "entry_atr": atr,
+-        "initial_stop": stop,
+-        "stop_price": stop,
+-        "highest_close": 0.0,
+-        "last_bar_date": str(atr_date),
+-    }
+-
+-
+-def advance_atr_state(state, entry_price, bars,
+-                      initial_multiple=INITIAL_ATR_MULTIPLIER,
+-                      trailing_multiple=TRAILING_ATR_MULTIPLIER):
+-    """완결봉으로만 갱신. ATR 확대/재시작/부분체결 평단 변경에도 청산선은 낮추지 않는다."""
+-    updated = dict(state)
+-    if not all(_positive(updated.get(key)) for key in ("entry_atr", "initial_stop", "stop_price")):
+-        raise ValueError("저장된 ATR 청산 상태가 유효하지 않습니다")
+-    if not _positive(entry_price):
+-        raise ValueError("Invalid entry price")
+-    updated["entry_price"] = float(entry_price)
+-    updated["initial_stop"] = max(
+-        float(updated["initial_stop"]), float(entry_price) - initial_multiple * updated["entry_atr"],
+-    )
+-    updated["stop_price"] = max(updated["stop_price"], updated["initial_stop"])
+-    for bar in bars:
+-        if bar["date"] < updated["entry_at"][:8] or bar["date"] <= updated["last_bar_date"]:
+-            continue
+-        if not _positive(bar["atr"]):
+-            continue
+-        updated["highest_close"] = max(updated["highest_close"], bar["close"])
+-        updated["stop_price"] = max(
+-            updated["stop_price"], updated["highest_close"] - trailing_multiple * bar["atr"],
+-        )
+-        updated["last_bar_date"] = bar["date"]
+-    return updated
+-
+-
+-def atr_exit_signal(current_price, state):
+-    if not _positive(current_price) or current_price > state["stop_price"]:
+-        return None
+-    trailing = state["stop_price"] > state["initial_stop"]
+-    reason = "ATR 추적 청산선 도달" if trailing else "ATR 초기 손절선 도달"
+-    return {
+-        "reason_code": "ATR_TRAILING_STOP" if trailing else "ATR_INITIAL_STOP",
+-        "signal_reason": f"{reason}: 현재가 {current_price:,.0f}원 <= 청산선 {state['stop_price']:,.2f}원",
+-        "current_price": current_price,
+-        "condition_data": dict(state),
+-        "market_order": True,
+-    }
+-
+-
+-def ma_profit_exit_signal(current_price, entry_price, state, previous_close_sum,
+-                          ma_period=5, exit_ratio=0.97, now=None):
+-    """Legacy 15:19 MA profit exit. This is an estimated MA, not a close signal."""
+-    now = now or datetime.now()
+-    updated = dict(state)
+-    if not (151900 <= int(now.strftime("%H%M%S")) < 152000):
+-        return None, updated
+-    if previous_close_sum is None or not _positive(current_price) or not _positive(entry_price):
+-        return None, updated
+-    today = now.strftime("%Y%m%d")
+-    if updated.get("ma_profit_date") != today:
+-        reference = float(current_price)
+-        estimated_ma = (float(previous_close_sum) + reference) / ma_period
+-        updated.update(ma_profit_date=today, ma_reference_price=reference,
+-                       ma_profit_period=ma_period, ma_profit_ratio=exit_ratio,
+-                       ma_profit_stop=estimated_ma * exit_ratio)
+-    if current_price <= entry_price or current_price > updated["ma_profit_stop"]:
+-        return None, updated
+-    return {
+-        "reason_code": "MA_PROFIT_EXIT", "market_order": True,
+-        "current_price": float(current_price),
+-        "signal_reason": f"15:19 MA{updated['ma_profit_period']} × {updated['ma_profit_ratio']:.3f} 수익 청산선 도달",
+-        "condition_data": {"entry_price": entry_price,
+-                           "ma_reference_price": updated["ma_reference_price"],
+-                           "ma_period": updated["ma_profit_period"],
+-                           "exit_ratio": updated["ma_profit_ratio"],
+-                           "ma_stop": updated["ma_profit_stop"]},
+-    }, updated
+diff --git a/util/market_history.py b/util/market_history.py
+index d69b484..a6587db 100644
+--- a/util/market_history.py
++++ b/util/market_history.py
+@@ -19,7 +19,6 @@ from contextlib import closing, contextmanager
+ from datetime import datetime, timedelta
+ from pathlib import Path
+ import sqlite3
+-import math
+ import time
+ from typing import Dict, Iterable, Iterator
+ 
+@@ -372,7 +371,7 @@ def bootstrap_market_history(
+         stored_count = int(history_counts.get(code, 0) or 0)
+         latest_date_text = latest_dates.get(code)
+ 
+-        # A/B needs 180 completed bars. Recent dates alone do not prove
++        # Verify the configured history target. Recent dates alone do not prove
+         # sufficient history; refill the requested past range when short.
+         needs_backfill = stored_count < required_history_rows
+         if latest_date_text and latest_date_text >= end_text and not needs_backfill:
+@@ -531,118 +530,6 @@ def get_code_latest_dates(codes: Iterable[str], db_path: Path = DB_PATH) -> Dict
+     return {code: latest.get(code) for code in normalized}
+ 
+ 
+-def load_breakout_metrics(
+-    codes: Iterable[str],
+-    breakout_window: int = 60,
+-    volume_window: int = 20,
+-    ma_window: int = 20,
+-    db_path: Path = DB_PATH,
+-    before_date: str | None = None,
+-) -> Dict[str, dict]:
+-    """종목별 실제 최근 일봉을 기준으로 신고가 계산값을 만든다.
+-
+-    기존 방식처럼 시장 전체의 최근 N개 날짜를 공통 cutoff로 사용하지 않는다.
+-    거래정지·휴지·개별 데이터 공백이 있었던 종목도 그 종목 자체의 최근
+-    거래일 기준으로 필요한 봉 수를 확보한다.
+-
+-    SQLite window function으로 종목별 최신 max_window개 행만 읽기 때문에
+-    daily_price 전체를 pandas에 올리는 것보다 메모리 사용도 제한된다.
+-    """
+-    normalized = {str(code).strip().upper().zfill(6) for code in codes}
+-    if not normalized:
+-        return {}
+-
+-    max_window = max(breakout_window, volume_window, ma_window)
+-    before_date = before_date or datetime.now().strftime("%Y%m%d")
+-
+-    with _connect(db_path) as con:
+-        df = pd.read_sql_query(
+-            """
+-            WITH ranked AS (
+-                SELECT
+-                    code, date, open, high, low, close, volume,
+-                    ROW_NUMBER() OVER (
+-                        PARTITION BY code
+-                        ORDER BY date DESC
+-                    ) AS rn
+-                FROM daily_price
+-                WHERE date < ?
+-            )
+-            SELECT code, date, open, high, low, close, volume
+-            FROM ranked
+-            WHERE rn <= ?
+-            ORDER BY code, date
+-            """,
+-            con,
+-            params=(before_date, max_window),
+-        )
+-
+-    if df.empty:
+-        return {}
+-
+-    # stock_master 전체가 아닌 특정 codes가 전달되는 경우도 안전하게 지원한다.
+-    df = df[df["code"].isin(normalized)]
+-    if df.empty:
+-        return {}
+-
+-    metrics: Dict[str, dict] = {}
+-    for code, group in df.groupby("code", sort=False):
+-        group = group.sort_values("date").copy()
+-
+-        # 각 종목 자체의 실제 최근 거래일 기준으로 필요한 봉 수를 요구한다.
+-        if len(group) < max_window:
+-            continue
+-
+-        for column in ("high", "close", "volume"):
+-            group[column] = pd.to_numeric(group[column], errors="coerce")
+-
+-        group = group.dropna(subset=["high", "close", "volume"])
+-        if len(group) < max_window:
+-            continue
+-
+-        last_breakout = group.tail(breakout_window)
+-        last_volume = group.tail(volume_window)
+-        last_ma = group.tail(ma_window)
+-        last_19 = group.tail(19)
+-
+-        # 최근 20거래일 평균 거래대금.
+-        # 별도 TR/FID를 사용하지 않고 저장된 일봉의 종가 × 거래량으로 계산한다.
+-        trading_value_ma20 = float(
+-            (
+-                last_volume["close"].astype("float64")
+-                * last_volume["volume"].astype("float64")
+-            ).mean()
+-        )
+-
+-        metrics[str(code)] = {
+-            "breakout_price": float(last_breakout["high"].max()),
+-            "prev_high": float(group.iloc[-1]["high"]),
+-            "volume_ma20": float(last_volume["volume"].mean()),
+-            "trading_value_ma20": trading_value_ma20,
+-            "ma20": float(last_ma["close"].mean()),
+-            "ma19_close_sum": float(last_19["close"].sum()),
+-            "ma19_count": int(len(last_19)),
+-            "prev_close": float(group.iloc[-1]["close"]),
+-            "history_last_date": str(group.iloc[-1]["date"]),
+-        }
+-
+-    return metrics
+-
+-
+-def load_completed_close_sum(code, before_date, count, db_path=DB_PATH):
+-    """Latest N completed closes, excluding the decision day; no padded history."""
+-    if not isinstance(count, int) or count < 1:
+-        return None
+-    with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)) as con:
+-        rows = con.execute(
+-            "SELECT date, close FROM daily_price WHERE code=? AND date<? ORDER BY date DESC LIMIT ?",
+-            (str(code).zfill(6), before_date, count),
+-        ).fetchall()
+-    if len(rows) != count or any(not math.isfinite(float(row[1])) or float(row[1]) <= 0 for row in rows):
+-        return None
+-    return {"close_sum": sum(float(row[1]) for row in rows), "latest_date": rows[0][0]}
+-
+-
+ def build_realtime_daily_bars(realtime_map: Dict[str, dict], codes: Iterable[str] | None = None) -> Dict[str, dict]:
+     target_codes = None
+     if codes is not None:
+diff --git a/util/momentum_breakout.py b/util/momentum_breakout.py
+index de75be3..875613a 100644
+--- a/util/momentum_breakout.py
++++ b/util/momentum_breakout.py
+@@ -13,7 +13,7 @@ import json
+ import math
+ import sqlite3
+ 
+-from util.breakout_atr import iter_atr_bars, load_atr_metrics
++from util.atr import iter_atr_bars, load_atr_metrics
+ from util.time_helper import get_market_open_time, is_market_business_day
+ 
+ 
+diff --git a/util/paper_breakout_baseline.py b/util/paper_breakout_baseline.py
+deleted file mode 100644
+index 75216a9..0000000
+--- a/util/paper_breakout_baseline.py
++++ /dev/null
+@@ -1,269 +0,0 @@
+-"""A/B comparison rules only: no broker orders, listeners or Qt dependency."""
+-from datetime import datetime, timedelta
+-import math
+-import time
+-from util.market_history import get_db_path as get_market_history_db_path, load_company_stock_master, load_breakout_metrics, load_completed_close_sum
+-from util.breakout_atr import ATR_PERIOD as DEFAULT_ATR_PERIOD, INITIAL_ATR_MULTIPLIER as DEFAULT_INITIAL_ATR_MULTIPLIER, TRAILING_ATR_MULTIPLIER as DEFAULT_TRAILING_ATR_MULTIPLIER, load_atr_metrics, load_atr_history, new_atr_state, new_atr_state_from_value, advance_atr_state, atr_exit_signal, ma_profit_exit_signal
+-from util.strategy_settings import load_ma_settings_for_date, acknowledge_ma_settings
+-from util.momentum_breakout import previous_market_date
+-from util.time_helper import is_market_business_day
+-
+-class PaperBreakoutBaseline:
+-    strategy_name = "HighBreakoutBaselinePaper"
+-    paper_only = True
+-    BREAKOUT_WINDOW = 180
+-    VOLUME_AVG_WINDOW = 20
+-    MIN_AVG_TRADING_VALUE = 2_000_000_000
+-    ATR_PERIOD = DEFAULT_ATR_PERIOD
+-    INITIAL_ATR_MULTIPLIER = DEFAULT_INITIAL_ATR_MULTIPLIER
+-    TRAILING_ATR_MULTIPLIER = DEFAULT_TRAILING_ATR_MULTIPLIER
+-
+-    def __init__(self, kiwoom=None, auto_init=False, market_db_path=None, clock=datetime.now):
+-        self.kiwoom = kiwoom
+-        self.clock = clock
+-        self.market_history_db_path = market_db_path or get_market_history_db_path()
+-        self.universe = {}
+-        self.breakout_metrics = {}
+-        self.is_init_success = False
+-        self.metrics_date = None
+-        self.atr_history_date = None
+-        self.atr_history_cache = {}
+-        self.last_signal_log_at = {}
+-        self.ma_settings_date = None
+-        self.active_ma_settings = None
+-        self.ma_close_sum_cache = {}
+-        self.ma_settings_db_path = self.market_history_db_path.parent / "strategy_settings.db"
+-        if auto_init:
+-            self.check_and_get_universe()
+-            self.check_and_get_price_data()
+-            self.is_init_success = True
+-
+-    def check_and_get_universe(self, shared_universe_df=None):
+-        master = load_company_stock_master(db_path=self.market_history_db_path, read_only=True)
+-        if master.empty:
+-            raise RuntimeError("A/B 기업주식 마스터 없음: bootstrap_market_history.py 실행 필요")
+-        self.universe = {str(row.code).zfill(6): {"code_name": row.code_name, "market": row.market} for row in master.itertuples(index=False)}
+-
+-    def get_realtime_candidate_codes(self):
+-        return sorted(self.breakout_metrics)
+-
+-    def check_and_get_price_data(self, shared_price_map=None):
+-        """신고가 계산에 필요한 요약 지표만 메모리에 올린다."""
+-        codes = list(self.universe.keys())
+-
+-        now = self.clock()
+-        # 장 종료 후 Manager가 저장한 당일 완결봉은 다음 장 준비에 사용한다.
+-        cutoff = now + timedelta(days=1) if now.hour * 60 + now.minute > 930 else now
+-        before_date = cutoff.strftime("%Y%m%d")
+-        metrics = load_breakout_metrics(
+-            codes,
+-            breakout_window=self.BREAKOUT_WINDOW,
+-            volume_window=self.VOLUME_AVG_WINDOW,
+-            ma_window=20,
+-            db_path=self.market_history_db_path,
+-            before_date=before_date,
+-        )
+-        atr_metrics = load_atr_metrics(
+-            codes, self.market_history_db_path, before_date, self.ATR_PERIOD
+-        )
+-        for code, metric in metrics.items():
+-            atr = atr_metrics.get(code)
+-            if atr and atr["atr_date"] == metric["history_last_date"]:
+-                metric.update(atr)
+-
+-        self.breakout_metrics = metrics
+-        self.metrics_date = before_date
+-        self.atr_history_cache.clear()
+-        missing = [
+-            code
+-            for code in codes
+-            if code not in metrics
+-        ]
+-
+-        print(
+-            "[HighBreakout] 신고가 기준값 준비: "
+-            f"{len(metrics)}/{len(codes)}종목 / "
+-            f"이력부족 {len(missing)}종목"
+-        )
+-
+-        if not metrics:
+-            raise RuntimeError(
+-                "신고가 계산 가능한 종목이 없습니다. "
+-                f"최소 {self.BREAKOUT_WINDOW}거래일을 구축하세요."
+-            )
+-        self._ensure_ma_settings(now)
+-
+-
+-    def _metric(self, code):
+-        return self.breakout_metrics.get(
+-            str(code)
+-            .strip()
+-            .upper()
+-            .zfill(6)
+-        )
+-
+-
+-    def _ensure_daily_metrics(self):
+-        if self.metrics_date != self.clock().strftime("%Y%m%d"):
+-            self.check_and_get_price_data()
+-
+-
+-    def _atr_history(self, code, entry_at):
+-        today = self.clock().strftime("%Y%m%d")
+-        if self.atr_history_date != today:
+-            self.atr_history_cache.clear()
+-            self.atr_history_date = today
+-        key = (code, str(entry_at)[:8])
+-        if key not in self.atr_history_cache:
+-            self.atr_history_cache[key] = load_atr_history(
+-                code, self.market_history_db_path, today, self.ATR_PERIOD,
+-                from_date=str(entry_at)[:8],
+-            )
+-        return self.atr_history_cache[key]
+-
+-
+-    def evaluate_atr_exit(self, code, current_price, entry_price, entry_at, state=None):
+-        """A/B 가상 비교: 완결 일봉으로 청산선을 갱신하고 현재가와 비교한다."""
+-        try:
+-            bars = self._atr_history(code, entry_at)
+-        except Exception:
+-            if not state:
+-                raise
+-            # 일봉 DB가 일시적으로 읽히지 않아도 저장된 청산선은 해제하지 않는다.
+-            bars = []
+-            last = self.last_signal_log_at.get(("atr_history", code), 0)
+-            if time.time() - last >= 60:
+-                print(f"[HighBreakout ATR] {code}: 일봉 조회 실패, 저장된 청산선 유지")
+-                self.last_signal_log_at[("atr_history", code)] = time.time()
+-        if not state:
+-            try:
+-                state = new_atr_state(
+-                    entry_price, entry_at, bars, self.INITIAL_ATR_MULTIPLIER
+-                )
+-            except ValueError:
+-                if not bars:
+-                    raise
+-                latest = bars[-1]
+-                state = new_atr_state_from_value(
+-                    entry_price,
+-                    entry_at,
+-                    latest["atr"],
+-                    latest["date"],
+-                    self.INITIAL_ATR_MULTIPLIER,
+-                )
+-                print(
+-                    f"[HighBreakout ATR] {code}: 진입 전 이력 부족 - "
+-                    "최신 완결 ATR로 기존 보유 상태 이관"
+-                )
+-        if (state["entry_price"] == entry_price
+-                and (not bars or state["last_bar_date"] >= bars[-1]["date"])):
+-            return atr_exit_signal(current_price, state), state
+-        updated = advance_atr_state(
+-            state, entry_price, bars, self.INITIAL_ATR_MULTIPLIER,
+-            self.TRAILING_ATR_MULTIPLIER,
+-        )
+-        return atr_exit_signal(current_price, updated), updated
+-
+-
+-    def _ensure_ma_settings(self, now=None):
+-        now = now or self.clock()
+-        today = now.strftime("%Y%m%d")
+-        if self.ma_settings_date == today:
+-            return
+-        if not is_market_business_day(now):
+-            return
+-        settings = load_ma_settings_for_date(today, db_path=self.ma_settings_db_path)
+-        acknowledge_ma_settings(settings, today, db_path=self.ma_settings_db_path, now=now)
+-        self.active_ma_settings = settings
+-        self.ma_settings_date = today
+-        self.ma_close_sum_cache.clear()
+-        print(f"[HighBreakout] MA 청산 설정 적용: v{settings['revision']} / MA{settings['ma_period']} × {settings['exit_ratio']:.3f} / {today}")
+-
+-
+-    def evaluate_sell_signal(self, code, current_price, entry_price, entry_at, state=None, now=None):
+-        """A/B cash-backed paper accounts only; ATR rules precede MA exit."""
+-        now = now or self.clock()
+-        signal, updated = self.evaluate_atr_exit(code, current_price, entry_price, entry_at, state)
+-        if signal:
+-            return signal, updated
+-        try:
+-            self._ensure_ma_settings(now)
+-            settings = self.active_ma_settings
+-            if settings is None:
+-                return None, updated
+-            today = now.strftime("%Y%m%d")
+-            if not (151900 <= int(now.strftime("%H%M%S")) < 152000):
+-                return None, updated
+-            key = (code, today, settings["ma_period"])
+-            if key not in self.ma_close_sum_cache:
+-                self.ma_close_sum_cache[key] = load_completed_close_sum(
+-                    code, today, settings["ma_period"] - 1, db_path=self.market_history_db_path)
+-            summary = self.ma_close_sum_cache[key]
+-            previous_sum = summary["close_sum"] if summary and summary["latest_date"] == previous_market_date(today) else None
+-            return ma_profit_exit_signal(current_price, entry_price, updated, previous_sum,
+-                                         settings["ma_period"], settings["exit_ratio"], now)
+-        except Exception as exc:
+-            # A settings/MA database failure must never disable an existing ATR stop.
+-            key = ("ma_settings", code)
+-            if time.time() - self.last_signal_log_at.get(key, 0) >= 60:
+-                print(f"[HighBreakout] MA 설정 적용 지연: {exc}")
+-                self.last_signal_log_at[key] = time.time()
+-            return None, updated
+-
+-
+-    def _get_buy_signal(self, code, tick=None):
+-        """순수 전략 매수조건만 판정한다. 주문 가능 여부는 여기서 판단하지 않는다."""
+-        self._ensure_daily_metrics()
+-        metric = self._metric(code)
+-        if not metric:
+-            return None
+-
+-        rt = tick or {}
+-        current_price = int(rt.get("현재가", 0) or 0)
+-        volume = int(rt.get("누적거래량", 0) or 0)
+-        breakout_price = float(metric.get("breakout_price", 0) or 0)
+-        prev_high = float(metric.get("prev_high", 0) or 0)
+-        atr = float(metric.get("atr14", 0) or 0)
+-        volume_ma20 = float(metric.get("volume_ma20", 0) or 0)
+-        trading_value_ma20 = float(metric.get("trading_value_ma20", 0) or 0)
+-
+-        if (
+-            current_price <= 0
+-            or breakout_price <= 0
+-            or volume_ma20 < 0
+-            or trading_value_ma20 <= 0
+-            or prev_high <= 0
+-            or not math.isfinite(atr)
+-            or atr <= 0
+-            or current_price - self.INITIAL_ATR_MULTIPLIER * atr <= 0
+-        ):
+-            return None
+-
+-        if not (
+-            current_price >= breakout_price
+-            and current_price > prev_high
+-            and volume >= volume_ma20
+-            and trading_value_ma20 >= self.MIN_AVG_TRADING_VALUE
+-        ):
+-            return None
+-
+-        return {
+-            "reason_code": "BREAKOUT_ENTRY",
+-            "signal_reason": (
+-                f"직전 {self.BREAKOUT_WINDOW}거래일 최고가 돌파 + 전일 고가 초과 + "
+-                f"누적거래량 20일 평균 이상 + 20일 평균거래대금 20억원 이상"
+-            ),
+-            "current_price": current_price,
+-            "condition_data": {
+-                "current_price": current_price,
+-                "breakout_price": breakout_price,
+-                "prev_high": prev_high,
+-                "high_distance_pct": (current_price / breakout_price - 1) * 100,
+-                "atr14": atr,
+-                "atr_date": metric.get("atr_date"),
+-                "volume": volume,
+-                "volume_ma20": volume_ma20,
+-                "trading_value_ma20": trading_value_ma20,
+-                "min_avg_trading_value": self.MIN_AVG_TRADING_VALUE,
+-            },
+-        }
+diff --git a/util/paper_strategy_engine.py b/util/paper_strategy_engine.py
+index 6c27f39..ae7ad90 100644
+--- a/util/paper_strategy_engine.py
++++ b/util/paper_strategy_engine.py
+@@ -32,7 +32,7 @@ class MomentumPaperEngine:
+                 except (OSError, ValueError) as exc:
+                     print(f"[MomentumPaper] 틱 기록 시작 실패: {exc}")
+ 
+-    def get_candidate_codes(self, force=False):
++    def get_candidate_codes(self):
+         if not self.momentum or not self.momentum.is_init_success:
+             return []
+         return self.momentum.get_realtime_candidate_codes()
+diff --git a/util/paper_trading.py b/util/paper_trading.py
+index 5f2fbf5..3b80307 100644
+--- a/util/paper_trading.py
++++ b/util/paper_trading.py
+@@ -16,12 +16,7 @@ import sqlite3
+ from util.position_sizing import stop_risk_quantity
+ 
+ 
+-# Legacy identifiers are retained for archived DB records only.
+-BASELINE = "HighBreakoutBaselinePaper"
+-FILTERED = "HighBreakoutFilteredPaper"
+ MOMENTUM = "MomentumContractionStrategy"
+-PROFILES = (MOMENTUM,)
+-
+ 
+ class PaperBroker:
+     def __init__(self, db_path, config, now=None):
+@@ -102,15 +97,14 @@ class PaperBroker:
+             config_text = json.dumps(self.config, sort_keys=True, ensure_ascii=False)
+             stamp = now.strftime("%Y%m%d%H%M%S")
+             with con:
+-                for profile in PROFILES:
+-                    con.execute("""INSERT OR IGNORE INTO paper_account
+-                        (strategy_name,initial_cash,cash,total_fees,realized_pnl,peak_equity,config_json,created_at,updated_at)
+-                        VALUES (?,?,?,0,0,?,?,?,?)""", (profile, self.costs["initial_cash"], self.costs["initial_cash"],
+-                            self.costs["initial_cash"], config_text, stamp, stamp))
+-                    row = con.execute("SELECT * FROM paper_account WHERE strategy_name=?", (profile,)).fetchone()
+-                    if json.loads(row["config_json"]) != self.config:
+-                        raise ValueError("가상 계좌 설정이 이전 실행과 다릅니다. 별도 실험 폴더/DB를 사용하세요.")
+-                    self.accounts[profile] = dict(row)
++                con.execute("""INSERT OR IGNORE INTO paper_account
++                    (strategy_name,initial_cash,cash,total_fees,realized_pnl,peak_equity,config_json,created_at,updated_at)
++                    VALUES (?,?,?,0,0,?,?,?,?)""", (MOMENTUM, self.costs["initial_cash"], self.costs["initial_cash"],
++                        self.costs["initial_cash"], config_text, stamp, stamp))
++                row = con.execute("SELECT * FROM paper_account WHERE strategy_name=?", (MOMENTUM,)).fetchone()
++                if json.loads(row["config_json"]) != self.config:
++                    raise ValueError("가상 계좌 설정이 이전 실행과 다릅니다. 별도 실험 폴더/DB를 사용하세요.")
++                self.accounts[MOMENTUM] = dict(row)
+             for row in con.execute("SELECT * FROM paper_position WHERE strategy_name=?", (MOMENTUM,)):
+                 position = dict(row)
+                 position["state"] = json.loads(position.pop("state_json"))
+@@ -142,7 +136,7 @@ class PaperBroker:
+         return float(max(1, math.floor(observed * (1 - self.costs["slippage_bps"] / 10000))))
+ 
+     def buy(self, profile, code, code_name, observed, stop, state, reason, data, now, max_stop_distance=None):
+-        if profile not in PROFILES:
++        if profile != MOMENTUM:
+             return None, "INACTIVE_PAPER_ACCOUNT"
+         self._refresh_guard(now)
+         code = str(code).zfill(6)
+diff --git a/util/strategy_settings.py b/util/strategy_settings.py
+deleted file mode 100644
+index a54ed99..0000000
+--- a/util/strategy_settings.py
++++ /dev/null
+@@ -1,127 +0,0 @@
+-"""A/B 비교 MA 수익청산 설정: 기존 DB revision 유지, 다음 거래일 적용."""
+-from __future__ import annotations
+-
+-import math
+-import os
+-import sqlite3
+-from contextlib import closing
+-from datetime import datetime
+-from pathlib import Path
+-
+-
+-SETTINGS_DB = Path(os.getenv(
+-    "SYSTEMTRADING_ROOT", str(Path(__file__).resolve().parents[1])
+-)) / "strategy_settings.db"
+-DEFAULT_MA_PERIOD = 5
+-DEFAULT_MA_EXIT_RATIO = 0.97
+-
+-
+-class SettingsConflictError(ValueError):
+-    pass
+-
+-
+-def validate_ma_settings(ma_period, exit_ratio):
+-    if isinstance(ma_period, bool) or not isinstance(ma_period, int) or not 2 <= ma_period <= 60:
+-        raise ValueError("MA 기간은 2~60 사이의 정수여야 합니다")
+-    if isinstance(exit_ratio, bool) or not isinstance(exit_ratio, (int, float)):
+-        raise ValueError("MA 기준 비율은 숫자여야 합니다")
+-    if not math.isfinite(float(exit_ratio)) or not 0.80 <= float(exit_ratio) < 1.0:
+-        raise ValueError("MA 기준 비율은 0.80 이상 1.00 미만이어야 합니다")
+-    return int(ma_period), float(exit_ratio)
+-
+-
+-def _connect(db_path):
+-    con = sqlite3.connect(str(db_path), timeout=5)
+-    con.row_factory = sqlite3.Row
+-    con.execute("PRAGMA busy_timeout = 5000")
+-    return con
+-
+-
+-def _init(con):
+-    con.execute("""
+-        CREATE TABLE IF NOT EXISTS ma_settings (
+-            revision INTEGER PRIMARY KEY,
+-            ma_period INTEGER NOT NULL,
+-            exit_ratio REAL NOT NULL,
+-            saved_date TEXT NOT NULL,
+-            saved_at TEXT NOT NULL
+-        )
+-    """)
+-    con.execute("""
+-        CREATE TABLE IF NOT EXISTS ma_settings_applied (
+-            strategy_name TEXT PRIMARY KEY,
+-            revision INTEGER NOT NULL,
+-            ma_period INTEGER NOT NULL,
+-            exit_ratio REAL NOT NULL,
+-            applied_date TEXT NOT NULL,
+-            applied_at TEXT NOT NULL
+-        )
+-    """)
+-
+-
+-def _default():
+-    return {"revision": 0, "ma_period": DEFAULT_MA_PERIOD,
+-            "exit_ratio": DEFAULT_MA_EXIT_RATIO, "saved_date": None, "saved_at": None}
+-
+-
+-def get_ma_settings_status(db_path=SETTINGS_DB):
+-    with closing(_connect(db_path)) as con:
+-        _init(con)
+-        latest = con.execute("SELECT * FROM ma_settings ORDER BY revision DESC LIMIT 1").fetchone()
+-        applied = con.execute(
+-            "SELECT * FROM ma_settings_applied WHERE strategy_name = 'HighBreakoutStrategy'"
+-        ).fetchone()
+-    saved = dict(latest) if latest else _default()
+-    active = dict(applied) if applied else None
+-    return {
+-        "saved": saved,
+-        "applied": active,
+-        "pending": saved["revision"] > (active["revision"] if active else 0),
+-        "effective_policy": "저장한 날짜 이후 첫 거래일에 A/B 비교 엔진이 적용",
+-    }
+-
+-
+-def save_ma_settings(ma_period, exit_ratio, expected_revision, db_path=SETTINGS_DB,
+-                     now=None):
+-    ma_period, exit_ratio = validate_ma_settings(ma_period, exit_ratio)
+-    now = now or datetime.now()
+-    with closing(_connect(db_path)) as con:
+-        with con:
+-            con.execute("BEGIN IMMEDIATE")
+-            _init(con)
+-            row = con.execute("SELECT COALESCE(MAX(revision), 0) FROM ma_settings").fetchone()
+-            current = int(row[0])
+-            if current != expected_revision:
+-                raise SettingsConflictError("설정이 다른 화면에서 변경되었습니다. 새로고침 후 다시 저장하세요")
+-            con.execute(
+-                "INSERT INTO ma_settings VALUES (?, ?, ?, ?, ?)",
+-                (current + 1, ma_period, exit_ratio, now.strftime("%Y%m%d"),
+-                 now.strftime("%Y%m%d%H%M%S")),
+-            )
+-    return get_ma_settings_status(db_path)
+-
+-
+-def load_ma_settings_for_date(trade_date, db_path=SETTINGS_DB):
+-    """저장일보다 늦은 거래일에만 새 버전을 선택한다. 당일 재시작에도 동일."""
+-    with closing(_connect(db_path)) as con:
+-        _init(con)
+-        row = con.execute(
+-            "SELECT * FROM ma_settings WHERE saved_date < ? "
+-            "ORDER BY revision DESC LIMIT 1", (trade_date,),
+-        ).fetchone()
+-    values = dict(row) if row else _default()
+-    period, ratio = validate_ma_settings(values["ma_period"], values["exit_ratio"])
+-    return {**values, "ma_period": period, "exit_ratio": ratio}
+-
+-
+-def acknowledge_ma_settings(settings, trade_date, db_path=SETTINGS_DB, now=None):
+-    """매매 프로그램이 실제 활성화한 버전만 적용 확인으로 기록한다."""
+-    now = now or datetime.now()
+-    with closing(_connect(db_path)) as con:
+-        with con:
+-            _init(con)
+-            con.execute(
+-                "INSERT OR REPLACE INTO ma_settings_applied VALUES (?, ?, ?, ?, ?, ?)",
+-                ("HighBreakoutStrategy", settings["revision"], settings["ma_period"],
+-                 settings["exit_ratio"], trade_date, now.strftime("%Y%m%d%H%M%S")),
+-            )
+diff --git a/web_api/database.py b/web_api/database.py
+index 0b10e3f..7708210 100644
+--- a/web_api/database.py
++++ b/web_api/database.py
+@@ -1,14 +1,18 @@
+ from __future__ import annotations
+ 
+-import json
+ import os
+ import sqlite3
+ from datetime import datetime
+-from contextlib import contextmanager
+ from pathlib import Path
+-from typing import Any, Iterable
++from typing import Any
+ 
+ 
++from . import paper_queries, virtual_queries
++from .query_context import (
++    DatabaseNotReadyError, ReadOnlyDatabase, VirtualQueryContext,
++    rows_to_dicts as _rows_to_dicts, safe_json_loads as _safe_json_loads,
++)
++
+ PROJECT_ROOT = Path(
+     os.getenv(
+         "SYSTEMTRADING_ROOT",
+@@ -23,67 +27,20 @@ POSITION_DB = PROJECT_ROOT / "strategy_position.db"
+ SQLITE_BUSY_TIMEOUT_MS = 5_000
+ 
+ 
+-class DatabaseNotReadyError(RuntimeError):
+-    pass
+-
+-
+-@contextmanager
+ def _connect_readonly(path: Path):
+-    """기존 자동매매 DB를 쓰지 않는 조회 전용 연결."""
+-    path = Path(path).resolve()
+-
+-    if not path.exists():
+-        raise DatabaseNotReadyError(
+-            f"DB 파일을 찾을 수 없습니다: {path}"
+-        )
+-
+-    con = sqlite3.connect(
+-        str(path),
+-        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+-    )
+-    con.row_factory = sqlite3.Row
+-    con.execute(
+-        f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"
+-    )
+-    con.execute("PRAGMA query_only = ON")
+-
+-    try:
+-        yield con
+-    finally:
+-        con.close()
++    return ReadOnlyDatabase(path, SQLITE_BUSY_TIMEOUT_MS).connect()
+ 
+ 
+ def table_exists(path: Path, table_name: str) -> bool:
+-    if not Path(path).exists():
+-        return False
+-
+-    with _connect_readonly(path) as con:
+-        row = con.execute(
+-            """
+-            SELECT 1
+-            FROM sqlite_master
+-            WHERE type = 'table'
+-              AND name = ?
+-            LIMIT 1
+-            """,
+-            (table_name,),
+-        ).fetchone()
++    return ReadOnlyDatabase(path, SQLITE_BUSY_TIMEOUT_MS).table_exists(table_name)
+ 
+-    return row is not None
+ 
+-
+-def _rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+-    return [dict(row) for row in rows]
+-
+-
+-def _safe_json_loads(value):
+-    if value in (None, ""):
+-        return value
+-
+-    try:
+-        return json.loads(value)
+-    except (TypeError, ValueError):
+-        return value
++def _virtual_query_context():
++    return VirtualQueryContext(
++        monitoring=ReadOnlyDatabase(MONITORING_DB, SQLITE_BUSY_TIMEOUT_MS),
++        paper=ReadOnlyDatabase(PAPER_DB, SQLITE_BUSY_TIMEOUT_MS),
++        clock=datetime.now,
++    )
+ 
+ 
+ def get_db_status() -> dict[str, Any]:
+@@ -587,29 +544,10 @@ def get_latest_strategy_daily_summary(
+ 
+ 
+ def get_virtual_positions(strategy_name: str | None = None) -> list[dict[str, Any]]:
+-    if not table_exists(MONITORING_DB, "virtual_position"):
+-        return []
+-    where = ""
+-    params: list[Any] = []
+-    if strategy_name:
+-        where = "WHERE strategy_name = ?"
+-        params.append(strategy_name)
+-    with _connect_readonly(MONITORING_DB) as con:
+-        rows = con.execute(
+-            f"""
+-            SELECT strategy_name, code, code_name, entry_price, entry_at,
+-                   remaining_ratio, current_price, unrealized_return_pct,
+-                   buy_reason_code, buy_reason, state_json, updated_at
+-            FROM virtual_position
+-            {where}
+-            ORDER BY updated_at DESC, code ASC
+-            """,
+-            params,
+-        ).fetchall()
+-    result = _rows_to_dicts(rows)
+-    for item in result:
+-        item["state"] = _safe_json_loads(item.pop("state_json", None)) or {}
+-    return result
++    return virtual_queries.get_virtual_positions(
++        _virtual_query_context(),
++        strategy_name=strategy_name,
++    )
+ 
+ 
+ def get_virtual_trades(
+@@ -617,180 +555,34 @@ def get_virtual_trades(
+     limit: int = 500,
+     offset: int = 0,
+ ) -> list[dict[str, Any]]:
+-    if not table_exists(MONITORING_DB, "virtual_trade"):
+-        return []
+-    where = ""
+-    params: list[Any] = []
+-    if strategy_name:
+-        where = "WHERE strategy_name = ?"
+-        params.append(strategy_name)
+-    params.extend([max(1, min(int(limit), 5000)), max(0, int(offset))])
+-    with _connect_readonly(MONITORING_DB) as con:
+-        rows = con.execute(
+-            f"""
+-            SELECT * FROM virtual_trade
+-            {where}
+-            ORDER BY exit_at DESC, trade_id DESC
+-            LIMIT ? OFFSET ?
+-            """,
+-            params,
+-        ).fetchall()
+-    return _rows_to_dicts(rows)
++    return virtual_queries.get_virtual_trades(
++        _virtual_query_context(),
++        strategy_name=strategy_name,
++        limit=limit,
++        offset=offset,
++    )
+ 
+ 
+ def get_virtual_event_summary(
+     strategy_name: str,
+     event_date: str | None = None,
+ ) -> dict[str, int]:
+-    """가상 체결만 기준으로 하루 BUY/SELL 이벤트 수를 집계한다.
+-
+-    BUY는 같은 전략/종목/진입시각을 한 번만 센다.
+-    SELL은 부분청산을 포함한 실제 가상 청산 이벤트(virtual_trade row)를 센다.
+-    """
+-    event_date = str(event_date or datetime.now().strftime("%Y%m%d"))
+-
+-    from util.paper_trading import MOMENTUM
+-    if strategy_name == MOMENTUM:
+-        if not table_exists(PAPER_DB, "paper_trade"):
+-            return {"buy": 0, "sell": 0, "total": 0}
+-        with _connect_readonly(PAPER_DB) as con:
+-            counts = dict(con.execute("""SELECT event_type,COUNT(*) FROM paper_trade
+-                WHERE strategy_name=? AND substr(event_at,1,8)=? GROUP BY event_type""", (strategy_name, event_date)))
+-        return {"buy": counts.get("BUY", 0), "sell": counts.get("SELL", 0), "total": sum(counts.values())}
+-
+-    if not table_exists(MONITORING_DB, "virtual_position"):
+-        open_buy_count = 0
+-    else:
+-        with _connect_readonly(MONITORING_DB) as con:
+-            row = con.execute(
+-                """
+-                SELECT COUNT(*) AS count
+-                FROM virtual_position
+-                WHERE strategy_name = ?
+-                  AND substr(entry_at, 1, 8) = ?
+-                """,
+-                (strategy_name, event_date),
+-            ).fetchone()
+-        open_buy_count = int(row["count"] or 0)
+-
+-    closed_buy_keys: set[tuple[str, str]] = set()
+-    sell_count = 0
+-
+-    if table_exists(MONITORING_DB, "virtual_trade"):
+-        with _connect_readonly(MONITORING_DB) as con:
+-            rows = con.execute(
+-                """
+-                SELECT code, entry_at, exit_at
+-                FROM virtual_trade
+-                WHERE strategy_name = ?
+-                  AND (
+-                      substr(entry_at, 1, 8) = ?
+-                      OR substr(exit_at, 1, 8) = ?
+-                  )
+-                """,
+-                (strategy_name, event_date, event_date),
+-            ).fetchall()
+-
+-        for row in rows:
+-            if str(row["entry_at"] or "")[:8] == event_date:
+-                closed_buy_keys.add((str(row["code"]), str(row["entry_at"])))
+-            if str(row["exit_at"] or "")[:8] == event_date:
+-                sell_count += 1
+-
+-    # 당일 진입 후 아직 보유 중인 종목 + 당일 진입 후 일부/전부 청산된 진입을 합친다.
+-    # 같은 진입이 position과 trade 양쪽에 존재하는 부분청산 케이스 중복을 제거하기 위해
+-    # open position의 code/entry_at도 key 집합으로 다시 계산한다.
+-    buy_keys = set(closed_buy_keys)
+-    if table_exists(MONITORING_DB, "virtual_position"):
+-        with _connect_readonly(MONITORING_DB) as con:
+-            rows = con.execute(
+-                """
+-                SELECT code, entry_at
+-                FROM virtual_position
+-                WHERE strategy_name = ?
+-                  AND substr(entry_at, 1, 8) = ?
+-                """,
+-                (strategy_name, event_date),
+-            ).fetchall()
+-        buy_keys.update((str(row["code"]), str(row["entry_at"])) for row in rows)
+-
+-    return {
+-        "buy": len(buy_keys),
+-        "sell": int(sell_count),
+-        "total": len(buy_keys) + int(sell_count),
+-    }
++    return virtual_queries.get_virtual_event_summary(
++        _virtual_query_context(),
++        strategy_name=strategy_name,
++        event_date=event_date,
++    )
+ 
+ 
+ def get_virtual_events(
+     strategy_name: str,
+     limit: int = 100,
+ ) -> list[dict[str, Any]]:
+-    """가상 포지션/거래 테이블에서 BUY·SELL 이벤트 타임라인을 구성한다."""
+-    limit = max(1, min(int(limit), 1000))
+-    positions = get_virtual_positions(strategy_name)
+-    trades = get_virtual_trades(strategy_name, limit=5000, offset=0)
+-
+-    events: list[dict[str, Any]] = []
+-    buy_events: dict[tuple[str, str], dict[str, Any]] = {}
+-
+-    for position in positions:
+-        key = (str(position.get("code")), str(position.get("entry_at")))
+-        buy_events[key] = {
+-            "event_id": f"BUY|{strategy_name}|{key[0]}|{key[1]}",
+-            "strategy_name": strategy_name,
+-            "event_type": "BUY",
+-            "code": position.get("code"),
+-            "code_name": position.get("code_name"),
+-            "price": float(position.get("entry_price") or 0),
+-            "reason_code": position.get("buy_reason_code"),
+-            "reason": position.get("buy_reason"),
+-            "event_at": position.get("entry_at"),
+-            "position_status": "OPEN",
+-            "return_pct": None,
+-            "ratio": 1.0,
+-        }
+-
+-    for trade in trades:
+-        key = (str(trade.get("code")), str(trade.get("entry_at")))
+-        buy_events.setdefault(
+-            key,
+-            {
+-                "event_id": f"BUY|{strategy_name}|{key[0]}|{key[1]}",
+-                "strategy_name": strategy_name,
+-                "event_type": "BUY",
+-                "code": trade.get("code"),
+-                "code_name": trade.get("code_name"),
+-                "price": float(trade.get("entry_price") or 0),
+-                "reason_code": trade.get("buy_reason_code"),
+-                "reason": trade.get("buy_reason"),
+-                "event_at": trade.get("entry_at"),
+-                "position_status": "CLOSED_OR_PARTIAL",
+-                "return_pct": None,
+-                "ratio": 1.0,
+-            },
+-        )
+-
+-        events.append(
+-            {
+-                "event_id": f"SELL|{trade.get('trade_id')}",
+-                "strategy_name": strategy_name,
+-                "event_type": "SELL",
+-                "code": trade.get("code"),
+-                "code_name": trade.get("code_name"),
+-                "price": float(trade.get("exit_price") or 0),
+-                "reason_code": trade.get("sell_reason_code"),
+-                "reason": trade.get("sell_reason"),
+-                "event_at": trade.get("exit_at"),
+-                "position_status": "SELL",
+-                "return_pct": float(trade.get("return_pct") or 0),
+-                "ratio": float(trade.get("exit_ratio") or 0),
+-            }
+-        )
+-
+-    events.extend(buy_events.values())
+-    events.sort(key=lambda item: str(item.get("event_at") or ""), reverse=True)
+-    return events[:limit]
+-
++    return virtual_queries.get_virtual_events(
++        _virtual_query_context(),
++        strategy_name=strategy_name,
++        limit=limit,
++    )
+ 
+ 
+ def get_virtual_daily_performance(
+@@ -798,96 +590,12 @@ def get_virtual_daily_performance(
+     date_from: str | None = None,
+     date_to: str | None = None,
+ ) -> dict[str, Any]:
+-    """가상 SELL 이벤트를 날짜별로 집계한다.
+-
+-    daily_return_pct는 해당 날짜에 청산된 SELL leg의 수익률을
+-    실제 청산비중(exit_ratio)으로 가중평균한 값이다.
+-
+-    현재 가상매매는 전략별 독립 현금/NAV를 운용하지 않으므로
+-    이 값은 일간 NAV 수익률이 아니다.
+-    아직 청산되지 않은 포지션의 미실현손익도 포함하지 않는다.
+-    """
+-    empty = {
+-        "items": [],
+-        "active_day_count": 0,
+-        "best_daily_return_pct": 0.0,
+-        "worst_daily_return_pct": 0.0,
+-        "average_daily_return_pct": 0.0,
+-        "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN",
+-    }
+-
+-    if not table_exists(MONITORING_DB, "virtual_trade"):
+-        return empty
+-
+-    where = ["strategy_name = ?"]
+-    params: list[Any] = [strategy_name]
+-
+-    if date_from:
+-        where.append("substr(exit_at, 1, 8) >= ?")
+-        params.append(str(date_from))
+-
+-    if date_to:
+-        where.append("substr(exit_at, 1, 8) <= ?")
+-        params.append(str(date_to))
+-
+-    with _connect_readonly(MONITORING_DB) as con:
+-        rows = con.execute(
+-            f"""
+-            SELECT
+-                substr(exit_at, 1, 8) AS date,
+-                COUNT(*) AS sell_event_count,
+-                COALESCE(SUM(exit_ratio), 0) AS exited_ratio,
+-                COALESCE(SUM(weighted_return_pct), 0)
+-                    AS weighted_return_sum
+-            FROM virtual_trade
+-            WHERE {' AND '.join(where)}
+-            GROUP BY substr(exit_at, 1, 8)
+-            ORDER BY date ASC
+-            """,
+-            params,
+-        ).fetchall()
+-
+-    items = []
+-
+-    for row in rows:
+-        exited_ratio = float(row["exited_ratio"] or 0)
+-        weighted_sum = float(row["weighted_return_sum"] or 0)
+-
+-        daily_return_pct = (
+-            weighted_sum / exited_ratio
+-            if exited_ratio > 0
+-            else 0.0
+-        )
+-
+-        items.append({
+-            "date": str(row["date"]),
+-            "sell_event_count": int(row["sell_event_count"] or 0),
+-            "exited_ratio": exited_ratio,
+-            "weighted_return_sum": weighted_sum,
+-            "daily_return_pct": daily_return_pct,
+-        })
+-
+-    daily_returns = [
+-        float(item["daily_return_pct"])
+-        for item in items
+-    ]
+-
+-    return {
+-        "items": items,
+-        "active_day_count": len(items),
+-        "best_daily_return_pct": (
+-            max(daily_returns) if daily_returns else 0.0
+-        ),
+-        "worst_daily_return_pct": (
+-            min(daily_returns) if daily_returns else 0.0
+-        ),
+-        "average_daily_return_pct": (
+-            sum(daily_returns) / len(daily_returns)
+-            if daily_returns
+-            else 0.0
+-        ),
+-        "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN",
+-    }
++    return virtual_queries.get_virtual_daily_performance(
++        _virtual_query_context(),
++        strategy_name=strategy_name,
++        date_from=date_from,
++        date_to=date_to,
++    )
+ 
+ 
+ def get_virtual_strategy_index_history(
+@@ -895,203 +603,27 @@ def get_virtual_strategy_index_history(
+     date_from: str | None = None,
+     date_to: str | None = None,
+ ) -> dict[str, Any]:
+-    empty = {
+-        "items": [],
+-        "latest": None,
+-        "best_daily_return_pct": 0.0,
+-        "worst_daily_return_pct": 0.0,
+-        "max_drawdown_pct": 0.0,
+-        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
+-    }
+-
+-    if not table_exists(MONITORING_DB, "virtual_strategy_daily_snapshot"):
+-        return empty
+-
+-    where = ["strategy_name = ?"]
+-    params: list[Any] = [strategy_name]
+-
+-    if date_from:
+-        where.append("snapshot_date >= ?")
+-        params.append(str(date_from))
+-    if date_to:
+-        where.append("snapshot_date <= ?")
+-        params.append(str(date_to))
+-
+-    with _connect_readonly(MONITORING_DB) as con:
+-        rows = con.execute(
+-            f"""
+-            SELECT *
+-            FROM virtual_strategy_daily_snapshot
+-            WHERE {' AND '.join(where)}
+-            ORDER BY snapshot_date ASC
+-            """,
+-            params,
+-        ).fetchall()
+-
+-    items = _rows_to_dicts(rows)
+-    if not items:
+-        return empty
+-
+-    daily_returns = [float(item.get("daily_return_pct") or 0) for item in items]
+-    drawdowns = [float(item.get("drawdown_pct") or 0) for item in items]
+-
+-    return {
+-        "items": items,
+-        "latest": items[-1],
+-        "best_daily_return_pct": max(daily_returns),
+-        "worst_daily_return_pct": min(daily_returns),
+-        "max_drawdown_pct": min(drawdowns),
+-        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
+-    }
++    return virtual_queries.get_virtual_strategy_index_history(
++        _virtual_query_context(),
++        strategy_name=strategy_name,
++        date_from=date_from,
++        date_to=date_to,
++    )
+ 
+ 
+ def get_virtual_performance(strategy_name: str) -> dict[str, Any]:
+-    """가상 BUY→완전청산 단위의 전략 성과를 반환한다.
+-
+-    PullbackTrend의 30% 부분매도처럼 한 포지션이 여러 SELL leg로 나뉘는 경우,
+-    동일 code + entry_at을 하나의 거래로 묶고 청산비중 합계가 100%인 경우에만
+-    완료 거래/승률/평균수익률 계산에 포함한다.
+-    """
+-    if strategy_name == "MomentumContractionStrategy":
+-        review = get_paper_account(candidate_limit=1, trade_limit=1)
+-        return next((p["performance"] for p in review["accounts"] if p["strategy_name"] == strategy_name), {})
+-    positions = get_virtual_positions(strategy_name)
+-
+-    empty = {
+-        "open_position_count": len(positions),
+-        "completed_trade_count": 0,
+-        "winning_trade_count": 0,
+-        "win_rate_pct": 0.0,
+-        "average_return_pct": 0.0,
+-        "best_return_pct": 0.0,
+-        "worst_return_pct": 0.0,
+-        "sell_event_count": 0,
+-        "realized_weighted_return_pct": 0.0,
+-        # 구버전 프론트 호환 필드
+-        "closed_leg_count": 0,
+-        "winning_leg_count": 0,
+-        "weighted_realized_return_pct": 0.0,
+-    }
+-
+-    if not table_exists(MONITORING_DB, "virtual_trade"):
+-        return empty
+-
+-    with _connect_readonly(MONITORING_DB) as con:
+-        leg_row = con.execute(
+-            """
+-            SELECT
+-                COUNT(*) AS sell_event_count,
+-                COALESCE(SUM(weighted_return_pct), 0) AS realized_weighted_return_pct
+-            FROM virtual_trade
+-            WHERE strategy_name = ?
+-            """,
+-            (strategy_name,),
+-        ).fetchone()
+-
+-        completed_rows = con.execute(
+-            """
+-            WITH round_trips AS (
+-                SELECT
+-                    code,
+-                    entry_at,
+-                    SUM(exit_ratio) AS exited_ratio,
+-                    SUM(weighted_return_pct) AS trade_return_pct
+-                FROM virtual_trade
+-                WHERE strategy_name = ?
+-                GROUP BY code, entry_at
+-            )
+-            SELECT trade_return_pct
+-            FROM round_trips
+-            WHERE exited_ratio >= 0.999999
+-            """,
+-            (strategy_name,),
+-        ).fetchall()
+-
+-    completed_returns = [float(row["trade_return_pct"] or 0) for row in completed_rows]
+-    completed_count = len(completed_returns)
+-    wins = sum(1 for value in completed_returns if value > 0)
+-    sell_event_count = int(leg_row["sell_event_count"] or 0)
+-    realized_weighted = float(leg_row["realized_weighted_return_pct"] or 0)
+-
+-    return {
+-        "open_position_count": len(positions),
+-        "completed_trade_count": completed_count,
+-        "winning_trade_count": wins,
+-        "win_rate_pct": wins / completed_count * 100.0 if completed_count else 0.0,
+-        "average_return_pct": (
+-            sum(completed_returns) / completed_count if completed_count else 0.0
+-        ),
+-        "best_return_pct": max(completed_returns) if completed_returns else 0.0,
+-        "worst_return_pct": min(completed_returns) if completed_returns else 0.0,
+-        "sell_event_count": sell_event_count,
+-        "realized_weighted_return_pct": realized_weighted,
+-        # 구버전 프론트 호환 필드
+-        "closed_leg_count": sell_event_count,
+-        "winning_leg_count": wins,
+-        "weighted_realized_return_pct": realized_weighted,
+-    }
++    return virtual_queries.get_virtual_performance(
++        _virtual_query_context(),
++        strategy_name=strategy_name,
++    )
+ 
+ 
+ def get_paper_account(candidate_limit=100, trade_limit=100):
+-    """Read-only momentum account view; archived profiles are excluded. Does not create a paper DB."""
+-    from util.paper_trading import MOMENTUM
+-    empty = {"ready": False, "accounts": [], "watchlist": [], "stats": {}, "settings": None,
+-             "positions": [], "trades": [], "equity_history": [], "as_of": None,
+-             "metric_type": "CASH_BACKED_PAPER_NAV"}
+-    if not table_exists(PAPER_DB, "paper_account"):
+-        return empty
+-    with _connect_readonly(PAPER_DB) as con:
+-        con.execute("BEGIN")
+-        accounts = _rows_to_dicts(con.execute("SELECT * FROM paper_account WHERE strategy_name=?", (MOMENTUM,)))
+-        positions = _rows_to_dicts(con.execute("SELECT * FROM paper_position WHERE strategy_name=? ORDER BY code", (MOMENTUM,)))
+-        equity = _rows_to_dicts(con.execute("SELECT * FROM paper_equity WHERE strategy_name=? ORDER BY snapshot_date", (MOMENTUM,)))
+-        status = con.execute("SELECT * FROM paper_run_status ORDER BY snapshot_date DESC LIMIT 1").fetchone()
+-        watchlist = []
+-        if status:
+-            watchlist = _rows_to_dicts(con.execute("""SELECT * FROM paper_watchlist WHERE snapshot_date=?
+-                ORDER BY eligible DESC,momentum_rank,code LIMIT ?""", (status["snapshot_date"], candidate_limit)))
+-        trades = _rows_to_dicts(con.execute("SELECT * FROM paper_trade WHERE strategy_name=? ORDER BY trade_id DESC LIMIT ?", (MOMENTUM, trade_limit)))
+-        completed = _rows_to_dicts(con.execute("""
+-            SELECT strategy_name,position_id,
+-                   SUM(CASE WHEN event_type='BUY' THEN quantity ELSE -quantity END) AS remaining,
+-                   SUM(CASE WHEN event_type='SELL' THEN net_pnl ELSE 0 END) AS pnl,
+-                   SUM(CASE WHEN event_type='BUY' THEN price*quantity+fee ELSE 0 END) AS invested
+-            FROM paper_trade WHERE strategy_name=?
+-            GROUP BY strategy_name,position_id HAVING remaining=0 AND invested>0
+-        """, (MOMENTUM,)))
+-    for position in positions:
+-        position["state"] = _safe_json_loads(position.pop("state_json"))
+-        position["remaining_ratio"] = position["quantity"] / position["initial_quantity"]
+-    for candidate in watchlist:
+-        candidate["metric"] = _safe_json_loads(candidate.pop("metric_json"))
+-    for trade in trades:
+-        trade["condition_data"] = _safe_json_loads(trade.pop("condition_json"))
+-    for account in accounts:
+-        name = account["strategy_name"]
+-        config = _safe_json_loads(account.pop("config_json"))
+-        owned = [p for p in positions if p["strategy_name"] == name]
+-        nav = account["cash"] + sum(p["quantity"] * p["current_price"] for p in owned)
+-        history = [e for e in equity if e["strategy_name"] == name]
+-        done = [t for t in completed if t["strategy_name"] == name]
+-        returns = [t["pnl"] / t["invested"] * 100 for t in done]
+-        profit = sum(t["pnl"] for t in done if t["pnl"] > 0)
+-        loss = -sum(t["pnl"] for t in done if t["pnl"] < 0)
+-        account.update(equity=nav, cumulative_return_pct=(nav / account["initial_cash"] - 1) * 100,
+-                       max_drawdown_pct=min([e["drawdown_pct"] for e in history] + [account.get("max_drawdown_pct", 0), 0]),
+-                       open_position_count=len(owned), costs=config["account"],
+-                       performance={"open_position_count": len(owned), "completed_trade_count": len(done),
+-                           "winning_trade_count": sum(r > 0 for r in returns),
+-                           "win_rate_pct": sum(r > 0 for r in returns) / len(done) * 100 if done else 0,
+-                           "average_return_pct": sum(returns) / len(done) if done else 0,
+-                           "best_return_pct": max(returns) if done else 0,
+-                           "worst_return_pct": min(returns) if done else 0,
+-                           "profit_factor": profit / loss if loss else None})
+-    return {**empty, "ready": bool(accounts), "accounts": accounts, "positions": [p for p in positions if p["strategy_name"] == MOMENTUM],
+-            "trades": trades, "watchlist": watchlist, "equity_history": equity,
+-            "stats": _safe_json_loads(status["stats_json"]) if status else {},
+-            "settings": _safe_json_loads(status["settings_json"]) if status else None,
+-            "watchlist_date": status["snapshot_date"] if status else None,
+-            "as_of": max((a["updated_at"] for a in accounts), default=None)}
++    return paper_queries.get_paper_account(
++        ReadOnlyDatabase(PAPER_DB, SQLITE_BUSY_TIMEOUT_MS),
++        candidate_limit=candidate_limit,
++        trade_limit=trade_limit,
++    )
+ 
+ 
+ # Compatibility for callers using the former comparison API.
+diff --git a/web_api/paper_queries.py b/web_api/paper_queries.py
+new file mode 100644
+index 0000000..9b195cb
+--- /dev/null
++++ b/web_api/paper_queries.py
+@@ -0,0 +1,68 @@
++"""Cash-backed momentum account queries, including archived-profile exclusion."""
++from __future__ import annotations
++
++from typing import Any
++from .query_context import rows_to_dicts as _rows_to_dicts, safe_json_loads as _safe_json_loads
++from .query_context import ReadOnlyDatabase
++
++
++def get_paper_account(context: ReadOnlyDatabase, candidate_limit=100, trade_limit=100):
++    """Read-only momentum account view; archived profiles are excluded. Does not create a paper DB."""
++    from util.paper_trading import MOMENTUM
++    empty = {"ready": False, "accounts": [], "watchlist": [], "stats": {}, "settings": None,
++             "positions": [], "trades": [], "equity_history": [], "as_of": None,
++             "metric_type": "CASH_BACKED_PAPER_NAV"}
++    if not context.table_exists("paper_account"):
++        return empty
++    with context.connect() as con:
++        con.execute("BEGIN")
++        accounts = _rows_to_dicts(con.execute("SELECT * FROM paper_account WHERE strategy_name=?", (MOMENTUM,)))
++        positions = _rows_to_dicts(con.execute("SELECT * FROM paper_position WHERE strategy_name=? ORDER BY code", (MOMENTUM,)))
++        equity = _rows_to_dicts(con.execute("SELECT * FROM paper_equity WHERE strategy_name=? ORDER BY snapshot_date", (MOMENTUM,)))
++        status = con.execute("SELECT * FROM paper_run_status ORDER BY snapshot_date DESC LIMIT 1").fetchone()
++        watchlist = []
++        if status:
++            watchlist = _rows_to_dicts(con.execute("""SELECT * FROM paper_watchlist WHERE snapshot_date=?
++                ORDER BY eligible DESC,momentum_rank,code LIMIT ?""", (status["snapshot_date"], candidate_limit)))
++        trades = _rows_to_dicts(con.execute("SELECT * FROM paper_trade WHERE strategy_name=? ORDER BY trade_id DESC LIMIT ?", (MOMENTUM, trade_limit)))
++        completed = _rows_to_dicts(con.execute("""
++            SELECT strategy_name,position_id,
++                   SUM(CASE WHEN event_type='BUY' THEN quantity ELSE -quantity END) AS remaining,
++                   SUM(CASE WHEN event_type='SELL' THEN net_pnl ELSE 0 END) AS pnl,
++                   SUM(CASE WHEN event_type='BUY' THEN price*quantity+fee ELSE 0 END) AS invested
++            FROM paper_trade WHERE strategy_name=?
++            GROUP BY strategy_name,position_id HAVING remaining=0 AND invested>0
++        """, (MOMENTUM,)))
++    for position in positions:
++        position["state"] = _safe_json_loads(position.pop("state_json"))
++        position["remaining_ratio"] = position["quantity"] / position["initial_quantity"]
++    for candidate in watchlist:
++        candidate["metric"] = _safe_json_loads(candidate.pop("metric_json"))
++    for trade in trades:
++        trade["condition_data"] = _safe_json_loads(trade.pop("condition_json"))
++    for account in accounts:
++        name = account["strategy_name"]
++        config = _safe_json_loads(account.pop("config_json"))
++        owned = [p for p in positions if p["strategy_name"] == name]
++        nav = account["cash"] + sum(p["quantity"] * p["current_price"] for p in owned)
++        history = [e for e in equity if e["strategy_name"] == name]
++        done = [t for t in completed if t["strategy_name"] == name]
++        returns = [t["pnl"] / t["invested"] * 100 for t in done]
++        profit = sum(t["pnl"] for t in done if t["pnl"] > 0)
++        loss = -sum(t["pnl"] for t in done if t["pnl"] < 0)
++        account.update(equity=nav, cumulative_return_pct=(nav / account["initial_cash"] - 1) * 100,
++                       max_drawdown_pct=min([e["drawdown_pct"] for e in history] + [account.get("max_drawdown_pct", 0), 0]),
++                       open_position_count=len(owned), costs=config["account"],
++                       performance={"open_position_count": len(owned), "completed_trade_count": len(done),
++                           "winning_trade_count": sum(r > 0 for r in returns),
++                           "win_rate_pct": sum(r > 0 for r in returns) / len(done) * 100 if done else 0,
++                           "average_return_pct": sum(returns) / len(done) if done else 0,
++                           "best_return_pct": max(returns) if done else 0,
++                           "worst_return_pct": min(returns) if done else 0,
++                           "profit_factor": profit / loss if loss else None})
++    return {**empty, "ready": bool(accounts), "accounts": accounts, "positions": [p for p in positions if p["strategy_name"] == MOMENTUM],
++            "trades": trades, "watchlist": watchlist, "equity_history": equity,
++            "stats": _safe_json_loads(status["stats_json"]) if status else {},
++            "settings": _safe_json_loads(status["settings_json"]) if status else None,
++            "watchlist_date": status["snapshot_date"] if status else None,
++            "as_of": max((a["updated_at"] for a in accounts), default=None)}
+diff --git a/web_api/query_context.py b/web_api/query_context.py
+new file mode 100644
+index 0000000..14cb016
+--- /dev/null
++++ b/web_api/query_context.py
+@@ -0,0 +1,62 @@
++"""Read-only SQLite access shared by monitoring query modules."""
++from __future__ import annotations
++
++from contextlib import contextmanager
++from dataclasses import dataclass
++from datetime import datetime
++from pathlib import Path
++from typing import Callable, Iterable, Any
++import json
++import sqlite3
++
++
++class DatabaseNotReadyError(RuntimeError):
++    pass
++
++
++@dataclass(frozen=True)
++class ReadOnlyDatabase:
++    path: Path
++    busy_timeout_ms: int = 5000
++
++    @contextmanager
++    def connect(self):
++        path = Path(self.path).resolve()
++        if not path.exists():
++            raise DatabaseNotReadyError(f"DB 파일을 찾을 수 없습니다: {path}")
++        con = sqlite3.connect(str(path), timeout=self.busy_timeout_ms / 1000)
++        con.row_factory = sqlite3.Row
++        try:
++            con.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
++            con.execute("PRAGMA query_only = ON")
++            yield con
++        finally:
++            con.close()
++
++    def table_exists(self, table_name):
++        if not Path(self.path).exists():
++            return False
++        with self.connect() as con:
++            row = con.execute("""SELECT 1 FROM sqlite_master
++                WHERE type='table' AND name=? LIMIT 1""", (table_name,)).fetchone()
++        return row is not None
++
++
++@dataclass(frozen=True)
++class VirtualQueryContext:
++    monitoring: ReadOnlyDatabase
++    paper: ReadOnlyDatabase
++    clock: Callable[[], datetime] = datetime.now
++
++
++def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
++    return [dict(row) for row in rows]
++
++
++def safe_json_loads(value):
++    if value in (None, ""):
++        return value
++    try:
++        return json.loads(value)
++    except (TypeError, ValueError):
++        return value
+diff --git a/web_api/virtual_queries.py b/web_api/virtual_queries.py
+new file mode 100644
+index 0000000..e3f17ba
+--- /dev/null
++++ b/web_api/virtual_queries.py
+@@ -0,0 +1,463 @@
++"""Legacy virtual positions, execution events and performance queries."""
++from __future__ import annotations
++
++from typing import Any
++from .query_context import rows_to_dicts as _rows_to_dicts, safe_json_loads as _safe_json_loads
++from .query_context import VirtualQueryContext
++from .paper_queries import get_paper_account
++
++
++def get_virtual_positions(context: VirtualQueryContext, strategy_name: str | None = None) -> list[dict[str, Any]]:
++    if not context.monitoring.table_exists("virtual_position"):
++        return []
++    where = ""
++    params: list[Any] = []
++    if strategy_name:
++        where = "WHERE strategy_name = ?"
++        params.append(strategy_name)
++    with context.monitoring.connect() as con:
++        rows = con.execute(
++            f"""
++            SELECT strategy_name, code, code_name, entry_price, entry_at,
++                   remaining_ratio, current_price, unrealized_return_pct,
++                   buy_reason_code, buy_reason, state_json, updated_at
++            FROM virtual_position
++            {where}
++            ORDER BY updated_at DESC, code ASC
++            """,
++            params,
++        ).fetchall()
++    result = _rows_to_dicts(rows)
++    for item in result:
++        item["state"] = _safe_json_loads(item.pop("state_json", None)) or {}
++    return result
++
++
++
++def get_virtual_trades(
++    context: VirtualQueryContext,
++    strategy_name: str | None = None,
++    limit: int = 500,
++    offset: int = 0,
++) -> list[dict[str, Any]]:
++    if not context.monitoring.table_exists("virtual_trade"):
++        return []
++    where = ""
++    params: list[Any] = []
++    if strategy_name:
++        where = "WHERE strategy_name = ?"
++        params.append(strategy_name)
++    params.extend([max(1, min(int(limit), 5000)), max(0, int(offset))])
++    with context.monitoring.connect() as con:
++        rows = con.execute(
++            f"""
++            SELECT * FROM virtual_trade
++            {where}
++            ORDER BY exit_at DESC, trade_id DESC
++            LIMIT ? OFFSET ?
++            """,
++            params,
++        ).fetchall()
++    return _rows_to_dicts(rows)
++
++
++
++def get_virtual_event_summary(
++    context: VirtualQueryContext,
++    strategy_name: str,
++    event_date: str | None = None,
++) -> dict[str, int]:
++    """가상 체결만 기준으로 하루 BUY/SELL 이벤트 수를 집계한다.
++
++    BUY는 같은 전략/종목/진입시각을 한 번만 센다.
++    SELL은 부분청산을 포함한 실제 가상 청산 이벤트(virtual_trade row)를 센다.
++    """
++    event_date = str(event_date or context.clock().strftime("%Y%m%d"))
++
++    from util.paper_trading import MOMENTUM
++    if strategy_name == MOMENTUM:
++        if not context.paper.table_exists("paper_trade"):
++            return {"buy": 0, "sell": 0, "total": 0}
++        with context.paper.connect() as con:
++            counts = dict(con.execute("""SELECT event_type,COUNT(*) FROM paper_trade
++                WHERE strategy_name=? AND substr(event_at,1,8)=? GROUP BY event_type""", (strategy_name, event_date)))
++        return {"buy": counts.get("BUY", 0), "sell": counts.get("SELL", 0), "total": sum(counts.values())}
++
++    if not context.monitoring.table_exists("virtual_position"):
++        open_buy_count = 0
++    else:
++        with context.monitoring.connect() as con:
++            row = con.execute(
++                """
++                SELECT COUNT(*) AS count
++                FROM virtual_position
++                WHERE strategy_name = ?
++                  AND substr(entry_at, 1, 8) = ?
++                """,
++                (strategy_name, event_date),
++            ).fetchone()
++        open_buy_count = int(row["count"] or 0)
++
++    closed_buy_keys: set[tuple[str, str]] = set()
++    sell_count = 0
++
++    if context.monitoring.table_exists("virtual_trade"):
++        with context.monitoring.connect() as con:
++            rows = con.execute(
++                """
++                SELECT code, entry_at, exit_at
++                FROM virtual_trade
++                WHERE strategy_name = ?
++                  AND (
++                      substr(entry_at, 1, 8) = ?
++                      OR substr(exit_at, 1, 8) = ?
++                  )
++                """,
++                (strategy_name, event_date, event_date),
++            ).fetchall()
++
++        for row in rows:
++            if str(row["entry_at"] or "")[:8] == event_date:
++                closed_buy_keys.add((str(row["code"]), str(row["entry_at"])))
++            if str(row["exit_at"] or "")[:8] == event_date:
++                sell_count += 1
++
++    # 당일 진입 후 아직 보유 중인 종목 + 당일 진입 후 일부/전부 청산된 진입을 합친다.
++    # 같은 진입이 position과 trade 양쪽에 존재하는 부분청산 케이스 중복을 제거하기 위해
++    # open position의 code/entry_at도 key 집합으로 다시 계산한다.
++    buy_keys = set(closed_buy_keys)
++    if context.monitoring.table_exists("virtual_position"):
++        with context.monitoring.connect() as con:
++            rows = con.execute(
++                """
++                SELECT code, entry_at
++                FROM virtual_position
++                WHERE strategy_name = ?
++                  AND substr(entry_at, 1, 8) = ?
++                """,
++                (strategy_name, event_date),
++            ).fetchall()
++        buy_keys.update((str(row["code"]), str(row["entry_at"])) for row in rows)
++
++    return {
++        "buy": len(buy_keys),
++        "sell": int(sell_count),
++        "total": len(buy_keys) + int(sell_count),
++    }
++
++
++
++def get_virtual_events(
++    context: VirtualQueryContext,
++    strategy_name: str,
++    limit: int = 100,
++) -> list[dict[str, Any]]:
++    """가상 포지션/거래 테이블에서 BUY·SELL 이벤트 타임라인을 구성한다."""
++    limit = max(1, min(int(limit), 1000))
++    positions = get_virtual_positions(context, strategy_name)
++    trades = get_virtual_trades(context, strategy_name, limit=5000, offset=0)
++
++    events: list[dict[str, Any]] = []
++    buy_events: dict[tuple[str, str], dict[str, Any]] = {}
++
++    for position in positions:
++        key = (str(position.get("code")), str(position.get("entry_at")))
++        buy_events[key] = {
++            "event_id": f"BUY|{strategy_name}|{key[0]}|{key[1]}",
++            "strategy_name": strategy_name,
++            "event_type": "BUY",
++            "code": position.get("code"),
++            "code_name": position.get("code_name"),
++            "price": float(position.get("entry_price") or 0),
++            "reason_code": position.get("buy_reason_code"),
++            "reason": position.get("buy_reason"),
++            "event_at": position.get("entry_at"),
++            "position_status": "OPEN",
++            "return_pct": None,
++            "ratio": 1.0,
++        }
++
++    for trade in trades:
++        key = (str(trade.get("code")), str(trade.get("entry_at")))
++        buy_events.setdefault(
++            key,
++            {
++                "event_id": f"BUY|{strategy_name}|{key[0]}|{key[1]}",
++                "strategy_name": strategy_name,
++                "event_type": "BUY",
++                "code": trade.get("code"),
++                "code_name": trade.get("code_name"),
++                "price": float(trade.get("entry_price") or 0),
++                "reason_code": trade.get("buy_reason_code"),
++                "reason": trade.get("buy_reason"),
++                "event_at": trade.get("entry_at"),
++                "position_status": "CLOSED_OR_PARTIAL",
++                "return_pct": None,
++                "ratio": 1.0,
++            },
++        )
++
++        events.append(
++            {
++                "event_id": f"SELL|{trade.get('trade_id')}",
++                "strategy_name": strategy_name,
++                "event_type": "SELL",
++                "code": trade.get("code"),
++                "code_name": trade.get("code_name"),
++                "price": float(trade.get("exit_price") or 0),
++                "reason_code": trade.get("sell_reason_code"),
++                "reason": trade.get("sell_reason"),
++                "event_at": trade.get("exit_at"),
++                "position_status": "SELL",
++                "return_pct": float(trade.get("return_pct") or 0),
++                "ratio": float(trade.get("exit_ratio") or 0),
++            }
++        )
++
++    events.extend(buy_events.values())
++    events.sort(key=lambda item: str(item.get("event_at") or ""), reverse=True)
++    return events[:limit]
++
++
++
++def get_virtual_daily_performance(
++    context: VirtualQueryContext,
++    strategy_name: str,
++    date_from: str | None = None,
++    date_to: str | None = None,
++) -> dict[str, Any]:
++    """가상 SELL 이벤트를 날짜별로 집계한다.
++
++    daily_return_pct는 해당 날짜에 청산된 SELL leg의 수익률을
++    실제 청산비중(exit_ratio)으로 가중평균한 값이다.
++
++    현재 가상매매는 전략별 독립 현금/NAV를 운용하지 않으므로
++    이 값은 일간 NAV 수익률이 아니다.
++    아직 청산되지 않은 포지션의 미실현손익도 포함하지 않는다.
++    """
++    empty = {
++        "items": [],
++        "active_day_count": 0,
++        "best_daily_return_pct": 0.0,
++        "worst_daily_return_pct": 0.0,
++        "average_daily_return_pct": 0.0,
++        "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN",
++    }
++
++    if not context.monitoring.table_exists("virtual_trade"):
++        return empty
++
++    where = ["strategy_name = ?"]
++    params: list[Any] = [strategy_name]
++
++    if date_from:
++        where.append("substr(exit_at, 1, 8) >= ?")
++        params.append(str(date_from))
++
++    if date_to:
++        where.append("substr(exit_at, 1, 8) <= ?")
++        params.append(str(date_to))
++
++    with context.monitoring.connect() as con:
++        rows = con.execute(
++            f"""
++            SELECT
++                substr(exit_at, 1, 8) AS date,
++                COUNT(*) AS sell_event_count,
++                COALESCE(SUM(exit_ratio), 0) AS exited_ratio,
++                COALESCE(SUM(weighted_return_pct), 0)
++                    AS weighted_return_sum
++            FROM virtual_trade
++            WHERE {' AND '.join(where)}
++            GROUP BY substr(exit_at, 1, 8)
++            ORDER BY date ASC
++            """,
++            params,
++        ).fetchall()
++
++    items = []
++
++    for row in rows:
++        exited_ratio = float(row["exited_ratio"] or 0)
++        weighted_sum = float(row["weighted_return_sum"] or 0)
++
++        daily_return_pct = (
++            weighted_sum / exited_ratio
++            if exited_ratio > 0
++            else 0.0
++        )
++
++        items.append({
++            "date": str(row["date"]),
++            "sell_event_count": int(row["sell_event_count"] or 0),
++            "exited_ratio": exited_ratio,
++            "weighted_return_sum": weighted_sum,
++            "daily_return_pct": daily_return_pct,
++        })
++
++    daily_returns = [
++        float(item["daily_return_pct"])
++        for item in items
++    ]
++
++    return {
++        "items": items,
++        "active_day_count": len(items),
++        "best_daily_return_pct": (
++            max(daily_returns) if daily_returns else 0.0
++        ),
++        "worst_daily_return_pct": (
++            min(daily_returns) if daily_returns else 0.0
++        ),
++        "average_daily_return_pct": (
++            sum(daily_returns) / len(daily_returns)
++            if daily_returns
++            else 0.0
++        ),
++        "metric_type": "REALIZED_EXIT_WEIGHTED_RETURN",
++    }
++
++
++
++def get_virtual_strategy_index_history(
++    context: VirtualQueryContext,
++    strategy_name: str,
++    date_from: str | None = None,
++    date_to: str | None = None,
++) -> dict[str, Any]:
++    empty = {
++        "items": [],
++        "latest": None,
++        "best_daily_return_pct": 0.0,
++        "worst_daily_return_pct": 0.0,
++        "max_drawdown_pct": 0.0,
++        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
++    }
++
++    if not context.monitoring.table_exists("virtual_strategy_daily_snapshot"):
++        return empty
++
++    where = ["strategy_name = ?"]
++    params: list[Any] = [strategy_name]
++
++    if date_from:
++        where.append("snapshot_date >= ?")
++        params.append(str(date_from))
++    if date_to:
++        where.append("snapshot_date <= ?")
++        params.append(str(date_to))
++
++    with context.monitoring.connect() as con:
++        rows = con.execute(
++            f"""
++            SELECT *
++            FROM virtual_strategy_daily_snapshot
++            WHERE {' AND '.join(where)}
++            ORDER BY snapshot_date ASC
++            """,
++            params,
++        ).fetchall()
++
++    items = _rows_to_dicts(rows)
++    if not items:
++        return empty
++
++    daily_returns = [float(item.get("daily_return_pct") or 0) for item in items]
++    drawdowns = [float(item.get("drawdown_pct") or 0) for item in items]
++
++    return {
++        "items": items,
++        "latest": items[-1],
++        "best_daily_return_pct": max(daily_returns),
++        "worst_daily_return_pct": min(daily_returns),
++        "max_drawdown_pct": min(drawdowns),
++        "metric_type": "EQUAL_NOTIONAL_MARK_TO_MARKET_INDEX",
++    }
++
++
++
++def get_virtual_performance(context: VirtualQueryContext, strategy_name: str) -> dict[str, Any]:
++    """가상 BUY→완전청산 단위의 전략 성과를 반환한다.
++
++    PullbackTrend의 30% 부분매도처럼 한 포지션이 여러 SELL leg로 나뉘는 경우,
++    동일 code + entry_at을 하나의 거래로 묶고 청산비중 합계가 100%인 경우에만
++    완료 거래/승률/평균수익률 계산에 포함한다.
++    """
++    if strategy_name == "MomentumContractionStrategy":
++        review = get_paper_account(context.paper, candidate_limit=1, trade_limit=1)
++        return next((p["performance"] for p in review["accounts"] if p["strategy_name"] == strategy_name), {})
++    positions = get_virtual_positions(context, strategy_name)
++
++    empty = {
++        "open_position_count": len(positions),
++        "completed_trade_count": 0,
++        "winning_trade_count": 0,
++        "win_rate_pct": 0.0,
++        "average_return_pct": 0.0,
++        "best_return_pct": 0.0,
++        "worst_return_pct": 0.0,
++        "sell_event_count": 0,
++        "realized_weighted_return_pct": 0.0,
++        # 구버전 프론트 호환 필드
++        "closed_leg_count": 0,
++        "winning_leg_count": 0,
++        "weighted_realized_return_pct": 0.0,
++    }
++
++    if not context.monitoring.table_exists("virtual_trade"):
++        return empty
++
++    with context.monitoring.connect() as con:
++        leg_row = con.execute(
++            """
++            SELECT
++                COUNT(*) AS sell_event_count,
++                COALESCE(SUM(weighted_return_pct), 0) AS realized_weighted_return_pct
++            FROM virtual_trade
++            WHERE strategy_name = ?
++            """,
++            (strategy_name,),
++        ).fetchone()
++
++        completed_rows = con.execute(
++            """
++            WITH round_trips AS (
++                SELECT
++                    code,
++                    entry_at,
++                    SUM(exit_ratio) AS exited_ratio,
++                    SUM(weighted_return_pct) AS trade_return_pct
++                FROM virtual_trade
++                WHERE strategy_name = ?
++                GROUP BY code, entry_at
++            )
++            SELECT trade_return_pct
++            FROM round_trips
++            WHERE exited_ratio >= 0.999999
++            """,
++            (strategy_name,),
++        ).fetchall()
++
++    completed_returns = [float(row["trade_return_pct"] or 0) for row in completed_rows]
++    completed_count = len(completed_returns)
++    wins = sum(1 for value in completed_returns if value > 0)
++    sell_event_count = int(leg_row["sell_event_count"] or 0)
++    realized_weighted = float(leg_row["realized_weighted_return_pct"] or 0)
++
++    return {
++        "open_position_count": len(positions),
++        "completed_trade_count": completed_count,
++        "winning_trade_count": wins,
++        "win_rate_pct": wins / completed_count * 100.0 if completed_count else 0.0,
++        "average_return_pct": (
++            sum(completed_returns) / completed_count if completed_count else 0.0
++        ),
++        "best_return_pct": max(completed_returns) if completed_returns else 0.0,
++        "worst_return_pct": min(completed_returns) if completed_returns else 0.0,
++        "sell_event_count": sell_event_count,
++        "realized_weighted_return_pct": realized_weighted,
++        # 구버전 프론트 호환 필드
++        "closed_leg_count": sell_event_count,
++        "winning_leg_count": wins,
++        "weighted_realized_return_pct": realized_weighted,
++    }
+diff --git a/web_frontend/src/pages/MomentumPage.jsx b/web_frontend/src/pages/MomentumPage.jsx
+index f5b2986..827b576 100644
+--- a/web_frontend/src/pages/MomentumPage.jsx
++++ b/web_frontend/src/pages/MomentumPage.jsx
+@@ -3,9 +3,9 @@ import usePolling from "../hooks/usePolling";
+ import { Link } from "react-router-dom";
+ import { getPaperAccount } from "../api/tradingApi";
+ 
+-const PROFILES = [
+-  ["MomentumContractionStrategy", "모멘텀 수축 돌파", "#51c4a0"],
+-];
++const MOMENTUM = "MomentumContractionStrategy";
++const ACCOUNT_LABEL = "모멘텀 수축 돌파";
++const ACCOUNT_COLOR = "#51c4a0";
+ const money = (v) => v == null ? "—" : `${Number(v).toLocaleString("ko-KR", { maximumFractionDigits: 0 })}원`;
+ const percent = (v) => v == null ? "—" : `${Number(v).toFixed(2)}%`;
+ const costPercent = (v) => `${(Number(v) * 100).toFixed(3)}%`;
+@@ -29,24 +29,23 @@ const REASONS = {
+ };
+ 
+ function MomentumChart({ items }) {
+-  const dates = [...new Set(items.map((x) => x.snapshot_date))].sort();
++  const rows = items.filter((item) => item.strategy_name === MOMENTUM);
++  const dates = [...new Set(rows.map((x) => x.snapshot_date))].sort();
+   if (!dates.length) return <div className="chart-empty">장중 실행 후 가상 계좌 성과가 기록됩니다.</div>;
+-  const values = items.map((x) => x.cumulative_return_pct);
++  const values = rows.map((x) => x.cumulative_return_pct);
+   const max = Math.max(1, ...values), min = Math.min(-1, ...values);
+   const width = 1000, height = 300;
+   const x = (day) => 60 + (dates.length === 1 ? 440 : dates.indexOf(day) / (dates.length - 1) * 880);
+   const y = (value) => 30 + (max - value) / (max - min) * 220;
+   return <>
+-    <div className="paper-legend">{PROFILES.map(([key, label, color]) => <span key={key} style={{ color }}>{label}</span>)}</div>
++    <div className="paper-legend"><span style={{ color: ACCOUNT_COLOR }}>{ACCOUNT_LABEL}</span></div>
+     <svg className="daily-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="모멘텀 가상 계좌 누적 수익률">
+       <line x1="60" x2="940" y1={y(0)} y2={y(0)} className="chart-zero-line" />
+       {[min, 0, max].map((v) => <text key={v} x="50" y={y(v) + 4} textAnchor="end" className="chart-axis-label">{percent(v)}</text>)}
+-      {PROFILES.map(([key, label, color]) => {
+-        const rows = items.filter((item) => item.strategy_name === key);
+-        return <g key={key}><polyline fill="none" stroke={color} strokeWidth="2.5" points={rows.map((r) => `${x(r.snapshot_date)},${y(r.cumulative_return_pct)}`).join(" ")} />
+-          {rows.map((r) => <circle key={r.snapshot_date} cx={x(r.snapshot_date)} cy={y(r.cumulative_return_pct)} r="4" fill={color}><title>{`${label} ${r.snapshot_date}: ${percent(r.cumulative_return_pct)}`}</title></circle>)}
+-        </g>;
+-      })}
++      <g>
++        <polyline fill="none" stroke={ACCOUNT_COLOR} strokeWidth="2.5" points={rows.map((r) => `${x(r.snapshot_date)},${y(r.cumulative_return_pct)}`).join(" ")} />
++        {rows.map((r) => <circle key={r.snapshot_date} cx={x(r.snapshot_date)} cy={y(r.cumulative_return_pct)} r="4" fill={ACCOUNT_COLOR}><title>{`${ACCOUNT_LABEL} ${r.snapshot_date}: ${percent(r.cumulative_return_pct)}`}</title></circle>)}
++      </g>
+       {dates.filter((_, i) => i % Math.max(1, Math.ceil(dates.length / 6)) === 0 || i === dates.length - 1).map((d) => <text key={d} x={x(d)} y="280" textAnchor="middle" className="chart-axis-label">{`${d.slice(4, 6)}/${d.slice(6, 8)}`}</text>)}
+     </svg>
+   </>;
+@@ -54,7 +53,7 @@ function MomentumChart({ items }) {
+ 
+ export default function MomentumPage() {
+   const { data, error } = usePolling(getPaperAccount);
+-  const account = data?.accounts?.find((a) => a.strategy_name === "MomentumContractionStrategy");
++  const account = data?.accounts?.find((a) => a.strategy_name === MOMENTUM);
+   const rules = data?.settings?.strategy;
+   const costs = account?.costs;
+   return <main className="page-shell">
+@@ -73,10 +72,7 @@ export default function MomentumPage() {
+     <section className="panel"><div className="panel-title"><h2>가상 계좌 성과</h2><span>{timeLabel(data?.as_of)}</span></div>
+       <MomentumChart items={data?.equity_history || []} />
+       <div className="table-wrap"><table><thead><tr><th>계좌</th><th>평가액</th><th>수익률</th><th>MDD</th><th>완료 거래</th><th>승률</th><th>이익합 / 손실합</th></tr></thead><tbody>
+-        {PROFILES.map(([key, label]) => {
+-          const a = data?.accounts?.find((row) => row.strategy_name === key);
+-          return <tr key={key}><td>{label}</td><td>{money(a?.equity)}</td><td>{percent(a?.cumulative_return_pct)}</td><td>{percent(a?.max_drawdown_pct)}</td><td>{a?.performance?.completed_trade_count ?? "—"}</td><td>{percent(a?.performance?.win_rate_pct)}</td><td>{a?.performance?.profit_factor == null ? "—" : a.performance.profit_factor.toFixed(2)}</td></tr>;
+-        })}
++        <tr><td>{ACCOUNT_LABEL}</td><td>{money(account?.equity)}</td><td>{percent(account?.cumulative_return_pct)}</td><td>{percent(account?.max_drawdown_pct)}</td><td>{account?.performance?.completed_trade_count ?? "—"}</td><td>{percent(account?.performance?.win_rate_pct)}</td><td>{account?.performance?.profit_factor == null ? "—" : account.performance.profit_factor.toFixed(2)}</td></tr>
+       </tbody></table></div>
+       <p className="metric-note">모멘텀 가상 계좌는 당일 저가 손절·부분 매도·확정 종가 MA 청산을 사용합니다. 완료 거래는 잔량까지 전부 청산된 진입 건입니다. MDD는 5초 간격으로 기록한 평가액 기준입니다.</p>
+     </section>

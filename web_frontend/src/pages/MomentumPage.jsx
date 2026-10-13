@@ -3,9 +3,9 @@ import usePolling from "../hooks/usePolling";
 import { Link } from "react-router-dom";
 import { getPaperAccount } from "../api/tradingApi";
 
-const PROFILES = [
-  ["MomentumContractionStrategy", "모멘텀 수축 돌파", "#51c4a0"],
-];
+const MOMENTUM = "MomentumContractionStrategy";
+const ACCOUNT_LABEL = "모멘텀 수축 돌파";
+const ACCOUNT_COLOR = "#51c4a0";
 const money = (v) => v == null ? "—" : `${Number(v).toLocaleString("ko-KR", { maximumFractionDigits: 0 })}원`;
 const percent = (v) => v == null ? "—" : `${Number(v).toFixed(2)}%`;
 const costPercent = (v) => `${(Number(v) * 100).toFixed(3)}%`;
@@ -29,24 +29,23 @@ const REASONS = {
 };
 
 function MomentumChart({ items }) {
-  const dates = [...new Set(items.map((x) => x.snapshot_date))].sort();
+  const rows = items.filter((item) => item.strategy_name === MOMENTUM);
+  const dates = [...new Set(rows.map((x) => x.snapshot_date))].sort();
   if (!dates.length) return <div className="chart-empty">장중 실행 후 가상 계좌 성과가 기록됩니다.</div>;
-  const values = items.map((x) => x.cumulative_return_pct);
+  const values = rows.map((x) => x.cumulative_return_pct);
   const max = Math.max(1, ...values), min = Math.min(-1, ...values);
   const width = 1000, height = 300;
   const x = (day) => 60 + (dates.length === 1 ? 440 : dates.indexOf(day) / (dates.length - 1) * 880);
   const y = (value) => 30 + (max - value) / (max - min) * 220;
   return <>
-    <div className="paper-legend">{PROFILES.map(([key, label, color]) => <span key={key} style={{ color }}>{label}</span>)}</div>
+    <div className="paper-legend"><span style={{ color: ACCOUNT_COLOR }}>{ACCOUNT_LABEL}</span></div>
     <svg className="daily-chart" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="모멘텀 가상 계좌 누적 수익률">
       <line x1="60" x2="940" y1={y(0)} y2={y(0)} className="chart-zero-line" />
       {[min, 0, max].map((v) => <text key={v} x="50" y={y(v) + 4} textAnchor="end" className="chart-axis-label">{percent(v)}</text>)}
-      {PROFILES.map(([key, label, color]) => {
-        const rows = items.filter((item) => item.strategy_name === key);
-        return <g key={key}><polyline fill="none" stroke={color} strokeWidth="2.5" points={rows.map((r) => `${x(r.snapshot_date)},${y(r.cumulative_return_pct)}`).join(" ")} />
-          {rows.map((r) => <circle key={r.snapshot_date} cx={x(r.snapshot_date)} cy={y(r.cumulative_return_pct)} r="4" fill={color}><title>{`${label} ${r.snapshot_date}: ${percent(r.cumulative_return_pct)}`}</title></circle>)}
-        </g>;
-      })}
+      <g>
+        <polyline fill="none" stroke={ACCOUNT_COLOR} strokeWidth="2.5" points={rows.map((r) => `${x(r.snapshot_date)},${y(r.cumulative_return_pct)}`).join(" ")} />
+        {rows.map((r) => <circle key={r.snapshot_date} cx={x(r.snapshot_date)} cy={y(r.cumulative_return_pct)} r="4" fill={ACCOUNT_COLOR}><title>{`${ACCOUNT_LABEL} ${r.snapshot_date}: ${percent(r.cumulative_return_pct)}`}</title></circle>)}
+      </g>
       {dates.filter((_, i) => i % Math.max(1, Math.ceil(dates.length / 6)) === 0 || i === dates.length - 1).map((d) => <text key={d} x={x(d)} y="280" textAnchor="middle" className="chart-axis-label">{`${d.slice(4, 6)}/${d.slice(6, 8)}`}</text>)}
     </svg>
   </>;
@@ -54,7 +53,7 @@ function MomentumChart({ items }) {
 
 export default function MomentumPage() {
   const { data, error } = usePolling(getPaperAccount);
-  const account = data?.accounts?.find((a) => a.strategy_name === "MomentumContractionStrategy");
+  const account = data?.accounts?.find((a) => a.strategy_name === MOMENTUM);
   const rules = data?.settings?.strategy;
   const costs = account?.costs;
   return <main className="page-shell">
@@ -73,10 +72,7 @@ export default function MomentumPage() {
     <section className="panel"><div className="panel-title"><h2>가상 계좌 성과</h2><span>{timeLabel(data?.as_of)}</span></div>
       <MomentumChart items={data?.equity_history || []} />
       <div className="table-wrap"><table><thead><tr><th>계좌</th><th>평가액</th><th>수익률</th><th>MDD</th><th>완료 거래</th><th>승률</th><th>이익합 / 손실합</th></tr></thead><tbody>
-        {PROFILES.map(([key, label]) => {
-          const a = data?.accounts?.find((row) => row.strategy_name === key);
-          return <tr key={key}><td>{label}</td><td>{money(a?.equity)}</td><td>{percent(a?.cumulative_return_pct)}</td><td>{percent(a?.max_drawdown_pct)}</td><td>{a?.performance?.completed_trade_count ?? "—"}</td><td>{percent(a?.performance?.win_rate_pct)}</td><td>{a?.performance?.profit_factor == null ? "—" : a.performance.profit_factor.toFixed(2)}</td></tr>;
-        })}
+        <tr><td>{ACCOUNT_LABEL}</td><td>{money(account?.equity)}</td><td>{percent(account?.cumulative_return_pct)}</td><td>{percent(account?.max_drawdown_pct)}</td><td>{account?.performance?.completed_trade_count ?? "—"}</td><td>{percent(account?.performance?.win_rate_pct)}</td><td>{account?.performance?.profit_factor == null ? "—" : account.performance.profit_factor.toFixed(2)}</td></tr>
       </tbody></table></div>
       <p className="metric-note">모멘텀 가상 계좌는 당일 저가 손절·부분 매도·확정 종가 MA 청산을 사용합니다. 완료 거래는 잔량까지 전부 청산된 진입 건입니다. MDD는 5초 간격으로 기록한 평가액 기준입니다.</p>
     </section>

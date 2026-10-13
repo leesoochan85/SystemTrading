@@ -11,14 +11,10 @@ from unittest.mock import Mock, patch
 from paper_fixture import history, market_db, qt_stubs
 qt_stubs()
 
-from util.paper_breakout_baseline import PaperBreakoutBaseline
 from strategy.MomentumContractionStrategy import MomentumContractionStrategy
 from strategy.StrategyManager import StrategyManager
-from util.breakout_atr import ma_profit_exit_signal, load_atr_metrics, new_atr_state_from_value
-from util.market_history import load_breakout_metrics
 from util.paper_strategy_engine import MomentumPaperEngine
-from util.paper_trading import PROFILES, MOMENTUM
-from util.strategy_settings import get_ma_settings_status, save_ma_settings
+from util.paper_trading import MOMENTUM
 from util.virtual_strategy_engine import VirtualStrategyEngine
 
 
@@ -83,15 +79,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.momentum = MomentumContractionStrategy(self.kiwoom, market_db_path=self.path, clock=lambda: self.now)
         self.momentum.check_and_get_universe()
         self.momentum.is_init_success = True
-        self.high = PaperBreakoutBaseline(self.kiwoom, auto_init=False)
-        self.high.market_history_db_path = self.path
-        self.high.ma_settings_db_path = Path(self.directory.name) / "settings.db"
-        self.high.universe = self.momentum.universe
-        self.high.breakout_metrics = load_breakout_metrics(["000001"], breakout_window=180, db_path=self.path, before_date="20260930")
-        self.high.breakout_metrics["000001"].update(load_atr_metrics(["000001"], self.path, "20260930")["000001"])
-        self.high._ensure_daily_metrics = Mock()
-        self.high.is_init_success = True
-        self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "paper.db")
+        self.engine = MomentumPaperEngine([self.momentum], Path(self.directory.name) / "paper.db")
         self.momentum.check_and_get_price_data()
         self.momentum.on_realtime_registered()
 
@@ -125,7 +113,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         from io import StringIO
         ticks = Path(self.directory.name) / "recorded.csv"
         with patch.dict(os.environ, {"SYSTEMTRADING_PAPER_TICK_CSV": str(ticks)}):
-            self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
+            self.engine = MomentumPaperEngine([self.momentum], Path(self.directory.name) / "capture.db")
         self.tick("090000", 16200)
         self.tick("090459", 16400)
         self.tick("090500", 16600)
@@ -142,7 +130,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         ticks = Path(self.directory.name) / "wrong.csv"
         ticks.write_text("preserve this file", encoding="utf-8")
         with patch.dict(os.environ, {"SYSTEMTRADING_PAPER_TICK_CSV": str(ticks)}):
-            self.engine = MomentumPaperEngine([self.high, self.momentum], Path(self.directory.name) / "capture.db")
+            self.engine = MomentumPaperEngine([self.momentum], Path(self.directory.name) / "capture.db")
         self.assertIsNone(self.engine.tick_recorder)
         self.tick("090000", 16200)
         self.tick("090500", 16600)
@@ -170,7 +158,7 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.tick("090100", 16550)
         self.assertFalse(self.engine.broker.positions)
         self.tick("090500", 16600)
-        self.assertEqual(set(p for p, _ in self.engine.broker.positions), set(PROFILES))
+        self.assertEqual(set(p for p, _ in self.engine.broker.positions), {MOMENTUM})
         c = self.engine.broker.positions[(MOMENTUM, "000001")]
         self.assertEqual(c["state"]["initial_stop"], 16100)
         self.assertEqual(c["entry_price"], 16609)
@@ -218,15 +206,14 @@ class StrategyIntegrationTest(unittest.TestCase):
         self.assertEqual(context["ma_date"], "20260929")
         self.assertEqual(context["close"], 16200)
 
-    def test_manager_rejects_every_paper_profile_before_order_checks(self):
+    def test_manager_rejects_paper_momentum_before_order_checks(self):
         manager = StrategyManager.__new__(StrategyManager)
         manager.strategies = [self.momentum]
         manager.last_buy_rejections = {}
         manager.kiwoom = self.kiwoom
         manager.get_event_driven_order_block_reason = Mock(side_effect=AssertionError("guard should precede live flow"))
-        for profile in PROFILES:
-            self.assertIsNone(manager.request_buy_order(profile, "000001", "Fixture", 17000, "test", "2004"))
-            self.assertIn("가상 전용", manager.last_buy_rejections["000001"])
+        self.assertIsNone(manager.request_buy_order(MOMENTUM, "000001", "Fixture", 17000, "test", "2004"))
+        self.assertIn("가상 전용", manager.last_buy_rejections["000001"])
         self.kiwoom.send_order.assert_not_called()
 
     def test_legacy_virtual_processing_survives_paper_failure(self):
@@ -240,30 +227,6 @@ class StrategyIntegrationTest(unittest.TestCase):
             virtual.on_realtime_tick("000001", {"현재가": 16600})
         virtual._process_strategy.assert_called_once()
 
-    def test_ma_settings_apply_next_trading_day_and_not_holiday(self):
-        save_ma_settings(20, 0.95, 0, self.high.ma_settings_db_path, now=datetime(2026, 9, 30, 12))
-        self.high._ensure_ma_settings(datetime(2026, 9, 30, 13))
-        self.assertEqual(self.high.active_ma_settings["revision"], 0)
-        self.high._ensure_ma_settings(datetime(2026, 10, 5, 9))
-        self.assertEqual(get_ma_settings_status(self.high.ma_settings_db_path)["applied"]["applied_date"], "20260930")
-        self.high._ensure_ma_settings(datetime(2026, 10, 6, 9))
-        self.assertEqual(self.high.active_ma_settings["ma_period"], 20)
-        self.assertEqual(self.high.active_ma_settings["revision"], 1)
-
-    def test_legacy_ma_freezes_first_tick_is_profit_only_and_atr_has_priority(self):
-        state = new_atr_state_from_value(100, "20260923100000", 5, "20260922")
-        signal, frozen = ma_profit_exit_signal(110, 100, state, 440, now=datetime(2026, 9, 30, 15, 19))
-        self.assertIsNone(signal)
-        self.assertAlmostEqual(frozen["ma_profit_stop"], 106.7)
-        signal, again = ma_profit_exit_signal(105, 100, frozen, 400, now=datetime(2026, 9, 30, 15, 19, 30))
-        self.assertEqual(signal["reason_code"], "MA_PROFIT_EXIT")
-        self.assertEqual(again["ma_profit_stop"], 106.7)
-        self.assertIsNone(ma_profit_exit_signal(99, 100, frozen, 440, now=datetime(2026, 9, 30, 15, 19, 45))[0])
-        self.assertIsNone(ma_profit_exit_signal(105, 100, frozen, 440, now=datetime(2026, 9, 30, 15, 20))[0])
-        self.high._atr_history = Mock(return_value=[])
-        self.high._ensure_ma_settings = Mock(side_effect=AssertionError("ATR priority"))
-        signal, _ = self.high.evaluate_sell_signal("000001", 89, 100, state["entry_at"], state, now=datetime(2026, 9, 30, 15, 19))
-        self.assertEqual(signal["reason_code"], "ATR_INITIAL_STOP")
 
 
 class PaperApiTest(unittest.TestCase):

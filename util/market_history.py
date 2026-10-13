@@ -19,7 +19,6 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
 import sqlite3
-import math
 import time
 from typing import Dict, Iterable, Iterator
 
@@ -372,7 +371,7 @@ def bootstrap_market_history(
         stored_count = int(history_counts.get(code, 0) or 0)
         latest_date_text = latest_dates.get(code)
 
-        # A/B needs 180 completed bars. Recent dates alone do not prove
+        # Verify the configured history target. Recent dates alone do not prove
         # sufficient history; refill the requested past range when short.
         needs_backfill = stored_count < required_history_rows
         if latest_date_text and latest_date_text >= end_text and not needs_backfill:
@@ -529,118 +528,6 @@ def get_code_latest_dates(codes: Iterable[str], db_path: Path = DB_PATH) -> Dict
 
     latest = {str(code): (str(date) if date else None) for code, date in rows}
     return {code: latest.get(code) for code in normalized}
-
-
-def load_breakout_metrics(
-    codes: Iterable[str],
-    breakout_window: int = 60,
-    volume_window: int = 20,
-    ma_window: int = 20,
-    db_path: Path = DB_PATH,
-    before_date: str | None = None,
-) -> Dict[str, dict]:
-    """종목별 실제 최근 일봉을 기준으로 신고가 계산값을 만든다.
-
-    기존 방식처럼 시장 전체의 최근 N개 날짜를 공통 cutoff로 사용하지 않는다.
-    거래정지·휴지·개별 데이터 공백이 있었던 종목도 그 종목 자체의 최근
-    거래일 기준으로 필요한 봉 수를 확보한다.
-
-    SQLite window function으로 종목별 최신 max_window개 행만 읽기 때문에
-    daily_price 전체를 pandas에 올리는 것보다 메모리 사용도 제한된다.
-    """
-    normalized = {str(code).strip().upper().zfill(6) for code in codes}
-    if not normalized:
-        return {}
-
-    max_window = max(breakout_window, volume_window, ma_window)
-    before_date = before_date or datetime.now().strftime("%Y%m%d")
-
-    with _connect(db_path) as con:
-        df = pd.read_sql_query(
-            """
-            WITH ranked AS (
-                SELECT
-                    code, date, open, high, low, close, volume,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY code
-                        ORDER BY date DESC
-                    ) AS rn
-                FROM daily_price
-                WHERE date < ?
-            )
-            SELECT code, date, open, high, low, close, volume
-            FROM ranked
-            WHERE rn <= ?
-            ORDER BY code, date
-            """,
-            con,
-            params=(before_date, max_window),
-        )
-
-    if df.empty:
-        return {}
-
-    # stock_master 전체가 아닌 특정 codes가 전달되는 경우도 안전하게 지원한다.
-    df = df[df["code"].isin(normalized)]
-    if df.empty:
-        return {}
-
-    metrics: Dict[str, dict] = {}
-    for code, group in df.groupby("code", sort=False):
-        group = group.sort_values("date").copy()
-
-        # 각 종목 자체의 실제 최근 거래일 기준으로 필요한 봉 수를 요구한다.
-        if len(group) < max_window:
-            continue
-
-        for column in ("high", "close", "volume"):
-            group[column] = pd.to_numeric(group[column], errors="coerce")
-
-        group = group.dropna(subset=["high", "close", "volume"])
-        if len(group) < max_window:
-            continue
-
-        last_breakout = group.tail(breakout_window)
-        last_volume = group.tail(volume_window)
-        last_ma = group.tail(ma_window)
-        last_19 = group.tail(19)
-
-        # 최근 20거래일 평균 거래대금.
-        # 별도 TR/FID를 사용하지 않고 저장된 일봉의 종가 × 거래량으로 계산한다.
-        trading_value_ma20 = float(
-            (
-                last_volume["close"].astype("float64")
-                * last_volume["volume"].astype("float64")
-            ).mean()
-        )
-
-        metrics[str(code)] = {
-            "breakout_price": float(last_breakout["high"].max()),
-            "prev_high": float(group.iloc[-1]["high"]),
-            "volume_ma20": float(last_volume["volume"].mean()),
-            "trading_value_ma20": trading_value_ma20,
-            "ma20": float(last_ma["close"].mean()),
-            "ma19_close_sum": float(last_19["close"].sum()),
-            "ma19_count": int(len(last_19)),
-            "prev_close": float(group.iloc[-1]["close"]),
-            "history_last_date": str(group.iloc[-1]["date"]),
-        }
-
-    return metrics
-
-
-def load_completed_close_sum(code, before_date, count, db_path=DB_PATH):
-    """Latest N completed closes, excluding the decision day; no padded history."""
-    if not isinstance(count, int) or count < 1:
-        return None
-    with closing(sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True, timeout=15)) as con:
-        rows = con.execute(
-            "SELECT date, close FROM daily_price WHERE code=? AND date<? ORDER BY date DESC LIMIT ?",
-            (str(code).zfill(6), before_date, count),
-        ).fetchall()
-    if len(rows) != count or any(not math.isfinite(float(row[1])) or float(row[1]) <= 0 for row in rows):
-        return None
-    return {"close_sum": sum(float(row[1]) for row in rows), "latest_date": rows[0][0]}
 
 
 def build_realtime_daily_bars(realtime_map: Dict[str, dict], codes: Iterable[str] | None = None) -> Dict[str, dict]:

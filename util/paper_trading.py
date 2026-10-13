@@ -16,12 +16,7 @@ import sqlite3
 from util.position_sizing import stop_risk_quantity
 
 
-# Legacy identifiers are retained for archived DB records only.
-BASELINE = "HighBreakoutBaselinePaper"
-FILTERED = "HighBreakoutFilteredPaper"
 MOMENTUM = "MomentumContractionStrategy"
-PROFILES = (MOMENTUM,)
-
 
 class PaperBroker:
     def __init__(self, db_path, config, now=None):
@@ -102,15 +97,14 @@ class PaperBroker:
             config_text = json.dumps(self.config, sort_keys=True, ensure_ascii=False)
             stamp = now.strftime("%Y%m%d%H%M%S")
             with con:
-                for profile in PROFILES:
-                    con.execute("""INSERT OR IGNORE INTO paper_account
-                        (strategy_name,initial_cash,cash,total_fees,realized_pnl,peak_equity,config_json,created_at,updated_at)
-                        VALUES (?,?,?,0,0,?,?,?,?)""", (profile, self.costs["initial_cash"], self.costs["initial_cash"],
-                            self.costs["initial_cash"], config_text, stamp, stamp))
-                    row = con.execute("SELECT * FROM paper_account WHERE strategy_name=?", (profile,)).fetchone()
-                    if json.loads(row["config_json"]) != self.config:
-                        raise ValueError("가상 계좌 설정이 이전 실행과 다릅니다. 별도 실험 폴더/DB를 사용하세요.")
-                    self.accounts[profile] = dict(row)
+                con.execute("""INSERT OR IGNORE INTO paper_account
+                    (strategy_name,initial_cash,cash,total_fees,realized_pnl,peak_equity,config_json,created_at,updated_at)
+                    VALUES (?,?,?,0,0,?,?,?,?)""", (MOMENTUM, self.costs["initial_cash"], self.costs["initial_cash"],
+                        self.costs["initial_cash"], config_text, stamp, stamp))
+                row = con.execute("SELECT * FROM paper_account WHERE strategy_name=?", (MOMENTUM,)).fetchone()
+                if json.loads(row["config_json"]) != self.config:
+                    raise ValueError("가상 계좌 설정이 이전 실행과 다릅니다. 별도 실험 폴더/DB를 사용하세요.")
+                self.accounts[MOMENTUM] = dict(row)
             for row in con.execute("SELECT * FROM paper_position WHERE strategy_name=?", (MOMENTUM,)):
                 position = dict(row)
                 position["state"] = json.loads(position.pop("state_json"))
@@ -142,7 +136,7 @@ class PaperBroker:
         return float(max(1, math.floor(observed * (1 - self.costs["slippage_bps"] / 10000))))
 
     def buy(self, profile, code, code_name, observed, stop, state, reason, data, now, max_stop_distance=None):
-        if profile not in PROFILES:
+        if profile != MOMENTUM:
             return None, "INACTIVE_PAPER_ACCOUNT"
         self._refresh_guard(now)
         code = str(code).zfill(6)

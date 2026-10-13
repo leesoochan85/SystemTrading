@@ -15,6 +15,7 @@ from util.telegram_poller import TelegramCommandPoller
 from util.status_message import StatusMessageBuilder
 from strategy.order_coordinator import OrderCoordinator
 from strategy.account_state import AccountStateSynchronizer
+from strategy.value_report_service import ValueReportService
 from util.market_history import (
     build_realtime_daily_bars,
     get_db_path as get_market_history_db_path,
@@ -41,7 +42,6 @@ from util.virtual_trading import (
 )
 
 from util.value_quality_data import (
-    get_last_sent_value_report_at,
     get_last_scanned_hankyung_report_id,
     is_value_report_sent,
     save_last_scanned_hankyung_report_id,
@@ -158,8 +158,6 @@ class StrategyManager(QObject):
 
         self.last_value_report_check_at = 0
         self.value_report_check_interval = 1800  # 30분
-        self.value_report_lookback_days = 30
-        self.value_report_max_pages = 10
         self.last_value_report_error_log_at = 0
         self.value_report_error_log_interval = 3600
 
@@ -708,7 +706,6 @@ class StrategyManager(QObject):
             if failed:
                 return False
 
-            self.virtual_strategy_engine.paper_engine.get_candidate_codes(force=True)
             self.register_shared_event_realtime(
                 active,
                 force_refresh=True,
@@ -928,208 +925,24 @@ class StrategyManager(QObject):
     def build_status_message(self):
         return StatusMessageBuilder(self).build()
 
-    def get_value_quality_holding_codes(self):
-        codes = []
-
-        for raw_code, balance_info in self.kiwoom.balance.items():
-            code = str(raw_code).strip().zfill(6)
-            quantity = int(
-                balance_info.get("보유수량", 0)
-                or 0
-            )
-
-            if quantity <= 0:
-                continue
-
-            if (
-                get_position_strategy(code)
-                != "ValueQualityStrategy"
-            ):
-                continue
-
-            codes.append(code)
-
-        return sorted(set(codes))
-
-    def send_one_value_quality_report_if_needed(
-        self,
-        force=False,
-    ):
-        """
-        기존 무관한 경제뉴스 대신,
-        현재 ValueQualityStrategy로 실제 보유 중인 종목의
-        한경 컨센서스 기업 리포트만 Telegram으로 전송한다.
-
-        - 30분마다 확인
-        - 마지막 확인 리포트 ID 이후의 공개 상세페이지만 검사
-        - 한 번에 최대 1건 전송
-        - value_quality.db에서 중복 전송 방지
-        """
-        now = time.time()
-
-        if (
-            not force
-            and now - self.last_value_report_check_at
-            < self.value_report_check_interval
-        ):
-            return
-
-        self.last_value_report_check_at = now
-
-        holding_codes = (
-            self.get_value_quality_holding_codes()
+    def _value_reports(self):
+        return ValueReportService(
+            self,
+            position_strategy_lookup=get_position_strategy,
+            scan_reports=scan_new_hankyung_reports,
+            read_cursor=get_last_scanned_hankyung_report_id,
+            write_cursor=save_last_scanned_hankyung_report_id,
+            is_sent=is_value_report_sent,
+            record_sent=save_sent_value_report,
+            send_message=send_message,
+            clock=time.time,
         )
 
-        if not holding_codes:
-            return
+    def get_value_quality_holding_codes(self):
+        return self._value_reports().get_holding_codes()
 
-        try:
-            last_scanned_report_id = (
-                get_last_scanned_hankyung_report_id()
-            )
-
-            scan_result = scan_new_hankyung_reports(
-                target_codes=holding_codes,
-                last_scanned_report_id=last_scanned_report_id,
-                max_scan_count=120,
-                consecutive_miss_limit=15,
-            )
-
-            reports = scan_result["reports"]
-            new_last_scanned_id = int(
-                scan_result["last_scanned_report_id"]
-            )
-
-            # 새 리포트 상세페이지가 확인된 범위까지만 high-water mark 전진.
-            # 전송할 보유종목 리포트가 없어도 다음 검사에서 같은 전체 시장
-            # 리포트를 반복 조회하지 않는다.
-            if (
-                last_scanned_report_id is None
-                or new_last_scanned_id
-                > int(last_scanned_report_id)
-            ):
-                save_last_scanned_hankyung_report_id(
-                    new_last_scanned_id
-                )
-
-            target = None
-
-            # 오래된 것부터 처리해야 새 리포트가 여러 개 있을 때
-            # 30분마다 순서대로 하나씩 전달된다.
-            for report in reports:
-                report_key = report.get(
-                    "report_key"
-                )
-                code = str(
-                    report.get("code", "")
-                ).zfill(6)
-
-                if (
-                    not report_key
-                    or code not in holding_codes
-                ):
-                    continue
-
-                if is_value_report_sent(
-                    report_key
-                ):
-                    continue
-
-                target = report
-                break
-
-            if target is None:
-                return
-
-            code = str(
-                target.get("code", "")
-            ).zfill(6)
-
-            title = (
-                target.get("title")
-                or "기업 리포트"
-            )
-            broker = (
-                target.get("broker")
-                or "-"
-            )
-            analyst = (
-                target.get("analyst")
-                or "-"
-            )
-            report_date = (
-                target.get("report_date")
-                or "-"
-            )
-            opinion = (
-                target.get("opinion")
-                or "-"
-            )
-            target_price = (
-                target.get("target_price")
-            )
-            url = target["url"]
-
-            code_name = self.get_code_name(code)
-
-            if target_price not in (
-                None,
-                "",
-                0,
-                "0",
-            ):
-                target_price_text = str(
-                    target_price
-                )
-            else:
-                target_price_text = "-"
-
-            message = (
-                "[저평가 우량주 리포트]\n\n"
-                f"{code_name}({code})\n"
-                f"{title}\n"
-                f"발행기관: {broker}\n"
-                f"작성자: {analyst}\n"
-                f"발표일: {report_date}\n"
-                f"투자의견: {opinion}\n"
-                f"목표주가: {target_price_text}\n\n"
-                f"{url}"
-            )
-
-            result = send_message(message)
-
-            if result is not None:
-                save_sent_value_report(
-                    report_key=target[
-                        "report_key"
-                    ],
-                    code=code,
-                    title=title,
-                    broker=broker,
-                    report_date=report_date,
-                    url=url,
-                )
-
-                print(
-                    "[StrategyManager] "
-                    "저평가 우량주 리포트 전송 완료: "
-                    f"{code_name} / {title}"
-                )
-
-        except Exception as exc:
-            # 사이트/API 변경이나 일시적인 네트워크 오류가
-            # 자동매매 자체를 멈추게 해서는 안 된다.
-            if (
-                now - self.last_value_report_error_log_at
-                >= self.value_report_error_log_interval
-            ):
-                print(
-                    "[StrategyManager] "
-                    "한경 컨센서스 리포트 조회 실패 - "
-                    "매매는 계속 진행합니다: "
-                    f"{exc}"
-                )
-                self.last_value_report_error_log_at = now
+    def send_one_value_quality_report_if_needed(self, force=False):
+        return self._value_reports().send_if_due(force=force)
 
     # ------------------------------------------------------------------
     # 주기 실행

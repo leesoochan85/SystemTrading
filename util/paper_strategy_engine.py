@@ -32,7 +32,7 @@ class MomentumPaperEngine:
                 except (OSError, ValueError) as exc:
                     print(f"[MomentumPaper] 틱 기록 시작 실패: {exc}")
 
-    def get_candidate_codes(self, force=False):
+    def get_candidate_codes(self):
         if not self.momentum or not self.momentum.is_init_success:
             return []
         return self.momentum.get_realtime_candidate_codes()

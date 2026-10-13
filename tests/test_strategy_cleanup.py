@@ -3,6 +3,8 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import sqlite3
+from contextlib import closing
 import unittest
 from unittest.mock import Mock, patch
 from paper_fixture import history, market_db, qt_stubs
@@ -67,14 +69,14 @@ class StrategyCleanupTest(unittest.TestCase):
     def test_removed_comparison_ma_endpoints_cannot_change_settings(self):
         from fastapi.testclient import TestClient
         from web_api.main import app
-        from util.strategy_settings import get_ma_settings_status, save_ma_settings
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / "settings.db"
-            save_ma_settings(10, 0.95, 0, db, now=datetime(2026, 9, 30, 12))
+            with closing(sqlite3.connect(db)) as con, con:
+                con.execute("CREATE TABLE legacy_ma_settings (revision INTEGER, period INTEGER)")
+                con.execute("INSERT INTO legacy_ma_settings VALUES (1, 10)")
             original = db.read_bytes()
             client = TestClient(app)
             url = "/api/strategies/MomentumContractionStrategy/ma-settings"
             self.assertEqual(client.get(url).status_code, 404)
             self.assertEqual(client.put(url, json={"ma_period": 20, "exit_ratio": 0.95, "expected_revision": 1}).status_code, 404)
             self.assertEqual(db.read_bytes(), original)
-            self.assertEqual(get_ma_settings_status(db)["saved"]["revision"], 1)

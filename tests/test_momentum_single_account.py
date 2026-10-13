@@ -8,8 +8,13 @@ import unittest
 from unittest.mock import patch
 
 from paper_fixture import config
-from util.paper_trading import PaperBroker, MOMENTUM, BASELINE, FILTERED
+from util.paper_trading import PaperBroker, MOMENTUM
 from web_api import database
+
+
+# Old DB identifiers belong only to archived-data fixtures.
+BASELINE = "HighBreakoutBaselinePaper"
+FILTERED = "HighBreakoutFilteredPaper"
 
 
 class MomentumSingleAccountTest(unittest.TestCase):

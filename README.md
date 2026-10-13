@@ -10,6 +10,7 @@
 실제 주문 계좌가 실계좌인지 모의계좌인지는 Kiwoom 로그인과 계좌 선택에 따릅니다. 가상계좌 성과는 실제 계좌 체결·수익을 뜻하지 않습니다.
 기존 신고가·눌림목 보유와 미체결은 패치가 매도하거나 취소하지 않으므로 별도로 관리해야 합니다.
 
+- [A/B 잔여 코드·웹 조회·우량주 리포트 정리](docs/2026-10-13_combined_refactoring.md)
 - [모멘텀 가상계좌 단일화](docs/2026-10-13_momentum_single_account.md)
 - [이번 작업 기록](docs/2026-10-09_README.md)
 - [전략 정리 패치 안내](docs/2026-10-08_strategy_cleanup.md)
@@ -17,6 +18,15 @@
 - [이전 돌파 구현 기록](docs/2026-10-08_breakout_implementation.md)
 - [미사용 코드 정리와 리팩토링 내역](docs/2026-10-13_code_refactoring.md)
 - [DB·주문·잔고 관리 모듈 분리](docs/2026-10-13_persistence_account_refactoring.md)
+
+### 단일 모멘텀 계좌·웹 조회·우량주 리포트 정리 (2026-10-13)
+
+- `web_api/database.py`의 기존 조회 함수는 유지하며 가상 조회를 `virtual_queries.py`, 모멘텀 현금 계좌 조회를 `paper_queries.py`에 위임합니다. `query_context.py`가 조회 전용 SQLite 연결과 종료를 담당합니다.
+- `StrategyManager`의 우량주 리포트 처리와 메시지 구성은 `strategy/value_report_service.py`로 이동했습니다. 기존 30분 확인·한 번에 1건 전송·중복 방지·전송 결과 기록 기준은 유지합니다.
+- A/B 전용 `paper_breakout_baseline.py`, `strategy_settings.py`와 미사용 신고가 지표·청산 함수를 제거했습니다. 필요한 Wilder ATR 계산은 `util/atr.py`로 분리하고 모멘텀 import를 갱신했습니다.
+- 가상 계좌 생성과 모멘텀 화면은 단일 계좌 기준으로 정리했습니다. 과거 A/B DB 기록과 호환 API는 보존합니다.
+- 실제/가상 매매 조건, DB 구조, 실행 BAT와 웹 API 응답은 유지합니다.
+- 검증: Python 테스트 175개 통과. 변경 전 조회 함수 서명 21개와 응답 사례 12개 일치, 리포트 성공/실패·주기·중복 처리 확인.
 
 ### DB·주문·잔고 관리 분리 (2026-10-13, 후속 작업)
 
@@ -526,7 +536,7 @@ API 조회에서 제외하므로 과거 기록으로 보존되며 추가 가상 
 
 API는 `/api/strategies/MomentumContractionStrategy/paper-account`를 사용합니다.
 기존 `/paper-comparison` 경로는 호환용으로 같은 단일 계좌 결과만 반환합니다.
-과거 A/B 규칙·설정 유틸리티는 기존 테스트와 기록 호환을 위해 남지만 운영 엔진은 호출하지 않습니다.
+A/B 전용 규칙·설정 유틸리티와 관련 폐기 기능 테스트는 제거했습니다. 과거 DB 식별자는 기록 보존 검증용 테스트에만 남습니다. 모멘텀의 공용 ATR은 `util/atr.py`에서 계산합니다.
 
 ---
 

@@ -26,14 +26,22 @@
 - A/B 전용 `paper_breakout_baseline.py`, `strategy_settings.py`와 미사용 신고가 지표·청산 함수를 제거했습니다. 필요한 Wilder ATR 계산은 `util/atr.py`로 분리하고 모멘텀 import를 갱신했습니다.
 - 가상 계좌 생성과 모멘텀 화면은 단일 계좌 기준으로 정리했습니다. 과거 A/B DB 기록과 호환 API는 보존합니다.
 - 실제/가상 매매 조건, DB 구조, 실행 BAT와 웹 API 응답은 유지합니다.
-- 검증: Python 테스트 175개 통과. 변경 전 조회 함수 서명 21개와 응답 사례 12개 일치, 리포트 성공/실패·주기·중복 처리 확인.
+- 개발 검증 환경에서 Python 테스트 175개 통과. 변경 전 조회 함수 서명 21개와 응답 사례 12개 일치, 리포트 성공/실패·주기·중복 처리 확인. 검증 범위와 실행 명령은 20절을 참고하세요.
 
-### DB·주문·잔고 관리 분리 (2026-10-13, 후속 작업)
+### 현재 모듈별 역할
 
-- `util/db_helper.py`의 28개 함수는 기존 이름·인자를 유지하면서 스키마, 포지션, 주문/체결, 성과 저장 모듈로 위임합니다. DB 경로 설정도 유지합니다.
-- `StrategyManager`의 19개 메서드는 `OrderCoordinator`와 `AccountStateSynchronizer`로 분리했습니다. 예약 현금·조회 실패 상태·삭제 확인 횟수는 같은 Manager 상태를 공유하며, Qt 호출 순서와 주문 정책은 유지합니다.
-- SQLite 트랜잭션 종료 후 연결을 명시적으로 닫습니다. 커밋·롤백 조건은 유지합니다.
-- 전체 Python 테스트는 웹 의존성이 있는 환경에서 실행합니다. `webenv\Scripts\python.exe -m pip install -r requirements-test.txt`로 준비하고 `run_tests.bat`을 실행하세요. 매매 실행은 기존 Python 3.9 32bit BAT를 사용합니다.
+| 모듈 | 담당 역할 |
+|---|---|
+| `strategy/StrategyManager.py` | 시작·주기 실행·실시간 등록 및 주문/계좌/리포트 처리 조정 |
+| `strategy/order_coordinator.py` | 주문 승인·수량·현금 예약·취소 처리 |
+| `strategy/account_state.py` | 잔고 동기화·수량 보정·보유 삭제 확인 |
+| `strategy/value_report_service.py` | 실제 우량주 보유 종목의 리포트 검사·중복 확인·메시지 구성·전송 결과 기록 |
+| `util/atr.py` | 모멘텀에서 사용하는 Wilder ATR 계산과 결정일 이전 지표 조회 |
+| `util/paper_strategy_engine.py`, `util/paper_trading.py` | 단일 모멘텀 가상 신호 처리와 현금·체결·보유·평가 기록 |
+| `web_api/database.py` | 기존 공개 조회 함수와 현재 DB 경로를 유지하는 진입점 |
+| `web_api/virtual_queries.py`, `web_api/paper_queries.py` | 기존 가상 성과 조회와 모멘텀 현금 계좌 조회 |
+| `web_api/query_context.py` | 조회 전용 SQLite 연결·종료·테이블 검사·JSON 변환 |
+| `web_frontend/src/pages/MomentumPage.jsx` | 단일 모멘텀 가상 계좌의 성과·후보·보유·체결 표시 |
 
 ### 코드 정리 · 리팩토링 (2026-10-13)
 
@@ -101,7 +109,7 @@ set "SYSTEMTRADING_PAPER_DB=%CD%\paper_breakout.db"
 python run_web_api.py
 ```
 
-`http://127.0.0.1:8000/health`와 `/docs`를 확인합니다. 매매 프로그램과 웹 API의 비교계좌 DB 경로가 같아야 합니다.
+`http://127.0.0.1:8000/health`와 `/docs`를 확인합니다. 매매 프로그램과 웹 API의 모멘텀 가상계좌 DB 경로가 같아야 합니다.
 
 ### 4. React 실행 — 별도 터미널
 
@@ -861,6 +869,38 @@ npm run dev
 
 ## 20. 검증 기록
 
+### 현재 버전 자동 테스트 실행
+
+프로젝트 루트의 CMD에서 최초 의존성을 준비한 뒤 실행합니다.
+
+```cmd
+webenv\Scripts\python.exe -m pip install -r requirements-test.txt
+run_tests.bat
+```
+
+`run_tests.bat`는 `webenv\Scripts\python.exe`와 FastAPI·httpx·pandas·requests 설치 여부를 확인하고 `unittest discover -s tests -v`를 실행합니다. 매매 실행용 Python 3.9 32bit와 테스트 실행 환경은 구분합니다. 이미 의존성이 준비돼 있다면 매번 재설치하지 않고 `run_tests.bat`만 실행하면 됩니다.
+
+프론트엔드 검증:
+
+```cmd
+cd web_frontend
+npm run build
+npm test
+cd ..
+```
+
+현재 기록된 개발 검증 결과는 Python 175개·프론트엔드 폴링 테스트 4개 통과 및 Vite 빌드 성공입니다. 사용자 PC에서는 마지막의 `OK` 또는 `FAILED` 결과를 확인합니다.
+
+### 2026-10-13~14 통합 리팩토링·인코딩 검증
+
+- 단일 모멘텀 계좌 생성·기존 C 상태 복원과 과거 A/B 기록 보존 확인.
+- 운영 호출이 없는 A/B 신고가·MA 설정 코드 제거, 공용 ATR 계산은 유지.
+- 웹 조회 모듈 분리 전후 함수 서명 21개와 조회 사례 12개 일치.
+- 우량주 리포트의 기존 확인 주기·한 번에 1건 처리·전송 결과 기록 기준 유지.
+- 개발 환경 전체 Python 175개, 프론트엔드 테스트 4개·빌드 통과.
+- Windows 실제 테스트 로그에서 JSON CP949 디코딩 오류 5건 확인 후 UTF-8 지정 수정.
+- 수정 후 CP949 기본값을 모사한 조회 테스트 5개와 개발 환경 전체 175개 통과. 사용자 PC의 최종 `OK`는 아직 확인하지 않았으며, 실제 키움 장중 주문·Telegram 전송 검증 결과는 아닙니다.
+
 ### 2026-10-13 실행 절차 갱신
 
 - 기존 marketdata Python 3.12.13 / 64bit 실행 경로를 사용자 PC에서 확인했습니다.
@@ -946,29 +986,24 @@ updated_at 갱신   : PASS
 
 ---
 
-## 21. 테스트 데이터 정리
+## 21. 테스트 파일과 과거 데이터 관리
 
-운영 전 `T90001`, `T90002`, `T90003` 같은 테스트 가상 데이터를 제거합니다.
+`tests/test_*.py`와 `tests/fixtures/`는 재검증에 사용하는 소스입니다. 테스트가 한 번 통과했다고 삭제하지 않습니다. `run_tests.bat`도 이후 변경을 확인할 때 사용합니다.
 
-```cmd
-python test_virtual_data.py clean
-```
+현재 테스트의 주요 역할:
 
-테스트 스크립트는 운영 루트에 둘 필요가 없다면:
+| 테스트 | 확인 항목 |
+|---|---|
+| `test_atr.py` | Wilder ATR·최소 일봉·당일 봉 제외·잘못된 데이터 처리 |
+| `test_momentum_single_account.py` | 모멘텀 단일 계좌·상태 복원·A/B 기록 보존·조회 호환 |
+| `test_paper_trading.py`, `test_momentum_live.py` | 가상 현금·비용·손절·재진입 제한과 실제 체결 상태 처리 |
+| `test_manager_refactor.py`, `test_repository_refactor.py` | 공용 예약·주문/계좌 상태·트랜잭션·중복 체결 |
+| `test_value_report_service.py` | 리포트 주기·중복·성공/실패·메시지 형식 |
+| `test_web_query_refactor.py` | 조회 응답 호환·DB 경로/시계·조회 전용 연결 |
 
-```text
-tests/manual/
-```
+과거 안내에 등장하던 `test_virtual_data.py`, `test_virtual_snapshot_5s.py`, `test_frontend_polling.py`는 현재 저장소에 포함돼 있지 않습니다. 현재 소스에 없는 수동 테스트 명령 대신 위 자동 테스트를 사용합니다.
 
-같은 위치로 이동하거나 삭제합니다.
-
-권장 테스트 파일:
-
-```text
-test_virtual_data.py
-test_virtual_snapshot_5s.py
-test_frontend_polling.py
-```
+가상계좌 단일화와 코드 정리를 적용하려고 기존 DB를 삭제하거나 초기화할 필요는 없습니다. A/B 과거 기록과 기존 모멘텀 거래 이력은 보존합니다. `.patch` 파일은 코드 변경 전달용이며 매매 실행에 필요한 Python 모듈이 아닙니다.
 
 ---
 
@@ -1007,6 +1042,18 @@ npm run dev
 - 수정된 프론트엔드와 웹 API를 모두 재시작하고 브라우저를 새로고침합니다.
 - 최신 모멘텀 상세 화면에는 단일 계좌만 표시되며 A/B MA 설정 패널이 없습니다.
 - 기존 가상 DB는 유지합니다. 화면을 정리하려고 DB를 삭제할 필요는 없습니다.
+
+### run_tests.bat에서 UnicodeDecodeError: cp949 발생
+
+오류 위치가 `tests/test_web_query_refactor.py`의 `web_query_contract.json` 읽기라면 해당 줄에 UTF-8 지정이 있는지 확인합니다.
+
+```python
+self.contract = json.loads(
+    (Path(__file__).parent / "fixtures/web_query_contract.json").read_text(encoding="utf-8")
+)
+```
+
+JSON 파일은 UTF-8로 유지하고 수정된 테스트 파일을 사용한 뒤 프로젝트 루트에서 `run_tests.bat`를 다시 실행합니다. 같은 `setUp` 때문에 5개 테스트가 동시에 실패할 수 있습니다. 이 경우 5개의 독립적인 조회 오류로 해석하지 않습니다.
 
 ### QAxContainer import 실패
 

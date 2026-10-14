@@ -79,6 +79,44 @@ class HistoryBackfillTest(unittest.TestCase):
         self.assertEqual(result["insufficient_history_count"], 1)
         self.assertEqual(result["row_count"], 4)
 
+    def test_recent_full_scan_skips_repeat_but_still_reports_shortage(self):
+        self.run_collection(bars(4), count=4)
+        with patch.object(mh, "_fetch_code_ohlcv") as fetch:
+            result = mh.bootstrap_market_history(db_path=self.path, codes=["000001"], request_sleep=0)
+        fetch.assert_not_called()
+        self.assertEqual(result["insufficient_history_count"], 1)
+        self.assertEqual(result["up_to_date_codes"], 1)
+
+    def test_recent_full_scan_fetches_incrementally_on_next_day(self):
+        self.run_collection(bars(4), count=4)
+        class NextDay(FixedDatetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 10, 14, 8)
+        with patch.object(mh, "datetime", NextDay), patch.object(mh, "_fetch_code_ohlcv", return_value=bars(4)) as fetch:
+            result = mh.bootstrap_market_history(db_path=self.path, codes=["000001"], request_sleep=0)
+        self.assertEqual(fetch.call_args.args[0], "20261002")
+        self.assertEqual(result["incremental_codes"], 1)
+        self.assertEqual(result["insufficient_history_count"], 1)
+
+    def test_weekly_audit_or_larger_range_repeats_full_scan(self):
+        self.run_collection(bars(4), count=4)
+        for widen in (True, False):
+            if not widen:
+                with sqlite3.connect(self.path) as con:
+                    con.execute("UPDATE history_backfill_state SET end_date='20261001'")
+            with patch.object(mh, "_fetch_code_ohlcv", return_value=bars(4)) as fetch:
+                result = mh.bootstrap_market_history(db_path=self.path, codes=["000001"],
+                    request_sleep=0, lookback_calendar_days=500 if widen else 400)
+            self.assertEqual(result["backfill_codes"], 1)
+            self.assertLess(fetch.call_args.args[0], "20260101")
+
+    def test_empty_full_scan_does_not_suppress_retry(self):
+        self.run_collection(pd.DataFrame(), count=4)
+        with patch.object(mh, "_fetch_code_ohlcv", return_value=bars(4)) as fetch:
+            mh.bootstrap_market_history(db_path=self.path, codes=["000001"], request_sleep=0)
+        fetch.assert_called_once()
+
     def test_empty_response_preserves_existing_bars(self):
         result, _ = self.run_collection(pd.DataFrame())
         self.assertEqual(result["row_count"], 157)

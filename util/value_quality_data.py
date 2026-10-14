@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+import json
 import math
 from pathlib import Path
 import sqlite3
@@ -12,9 +14,12 @@ SQLITE_BUSY_TIMEOUT_MS = 15_000
 MAX_QUOTE_AGE_DAYS = 7
 MAX_FINANCIAL_AGE_DAYS = 240
 MAX_ANNUAL_AGE_DAYS = 550
+QUALITY_BASIS = "TTM; revenue/mean(TTM_start,end assets)"
 
 
+@contextmanager
 def _connect(db_path: Path = DB_PATH):
+    """Commit/rollback the transaction, then close the OS file handle."""
     db_path = Path(db_path).resolve()
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -22,13 +27,17 @@ def _connect(db_path: Path = DB_PATH):
         db_path,
         timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
     )
-    con.row_factory = sqlite3.Row
-    con.execute(
-        f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"
-    )
-    con.execute("PRAGMA journal_mode = WAL")
-    con.execute("PRAGMA synchronous = NORMAL")
-    return con
+    try:
+        con.row_factory = sqlite3.Row
+        con.execute(
+            f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}"
+        )
+        con.execute("PRAGMA journal_mode = WAL")
+        con.execute("PRAGMA synchronous = NORMAL")
+        with con:
+            yield con
+    finally:
+        con.close()
 
 
 def get_db_path() -> Path:
@@ -124,6 +133,9 @@ def fundamental_is_fresh(info, today=None):
     if info.get("validated") != 1 or not info.get("source_note"):
         return False
     try:
+        source = json.loads(info["source_note"])
+        if source.get("quality_basis") != QUALITY_BASIS:
+            return False
         for name in ("per_ttm", "pbr", "gross_margin_pct", "asset_turnover"):
             if not math.isfinite(float(info.get(name))):
                 return False
@@ -142,7 +154,7 @@ def fundamental_is_fresh(info, today=None):
             dates[field] = day
         if not dates["annual_period_end"] <= dates["financial_period_end"] <= dates["as_of_date"]:
             return False
-    except (TypeError, ValueError, OverflowError):
+    except (TypeError, ValueError, OverflowError, AttributeError):
         return False
     return True
 

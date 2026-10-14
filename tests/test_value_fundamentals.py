@@ -30,6 +30,8 @@ def statements(year, report="11011", owner=True):
     if year == 2025 and report != "11011":
         receipt = "20250814000001"
     def row(name, section, value, prior="1000", ytd=None):
+        if report != "11011" and ytd is None and name in ("Revenue", "GrossProfit"):
+            ytd = value / 2
         return dict(account_id="ifrs-full_" + name, account_nm=name,
                     sj_div=section, thstrm_amount=str(value), frmtrm_amount=str(prior),
                     thstrm_add_amount=str(ytd) if ytd is not None else "",
@@ -91,10 +93,11 @@ class FinancialCalculationTest(unittest.TestCase):
             collector.calculate_snapshot(annual, statements(2026, "11012"), statements(2025, "11012"),
                 year=2026, report_code="11012", fs_div="CFS", market_cap=1200, quote_date=TODAY)
 
-    def test_annual_quality_uses_average_assets(self):
+    def test_ttm_quality_uses_same_quarter_prior_year_assets(self):
         annual = statements(2025)
-        annual[2]["frmtrm_amount"] = "500"
-        result = collector.calculate_snapshot(annual, statements(2026, "11012"), statements(2025, "11012"),
+        prior = statements(2025, "11012")
+        prior[2]["thstrm_amount"] = "500"
+        result = collector.calculate_snapshot(annual, statements(2026, "11012"), prior,
             year=2026, report_code="11012", fs_div="CFS", market_cap=1200, quote_date=TODAY)
         self.assertEqual(result["asset_turnover"], 1.6)
 
@@ -225,7 +228,7 @@ class ClientSafetyTest(unittest.TestCase):
             key = "A" * 40
             session = Mock()
             session.get.side_effect = collector.requests.ConnectionError("secret=" + key)
-            client = collector.DartClient(key, tmp, sleep=0, session=session)
+            client = collector.DartClient(key, tmp, sleep=0, session=session, retries=0)
             with self.assertRaises(collector.DartFailure) as caught:
                 client.get("company.json", corp_code="12345678")
             self.assertNotIn(key, str(caught.exception))

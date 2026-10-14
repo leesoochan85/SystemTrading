@@ -1,7 +1,7 @@
 """OpenDART + pykrx collection, separate from the Kiwoom trading process.
 
 Only December-year-end, KRW, ordinary-share-only issuers are supported.
-Annual quality ratios preserve the strategy's original annual definitions.
+Quality ratios use trailing four quarters and update with quarterly reports.
 """
 from __future__ import annotations
 
@@ -22,7 +22,9 @@ import requests
 
 from util.value_quality_data import (
     upsert_fundamental_snapshot, mark_fundamental_invalid, fundamental_is_fresh,
+    QUALITY_BASIS,
 )
+from util import value_collection_state as checkpoints
 
 REPORTS = {"11013": (3, 31), "11012": (6, 30),
            "11014": (9, 30), "11011": (12, 31)}
@@ -153,27 +155,20 @@ def calculate_snapshot(annual, current, previous, *, year, report_code,
                                or r.get("reprt_code") != report_code for r in previous):
             raise DataUnavailable("MISSING_COMPARABLE_PERIOD")
         receipts += receipt_numbers(previous, quote_date)
-        # Half-year/Q3 thstrm_amount is just three months. Use YTD amounts.
-        def ytd(rows):
-            try:
-                return account_value(rows, profit_name, "thstrm_add_amount")
-            except DataUnavailable as exc:
-                if report_code != "11013" or str(exc) != "MISSING_AMOUNT":
-                    raise
-                # Q1 three-month and YTD periods are identical.
-                return account_value(rows, profit_name)
-        profit += ytd(current)
-        profit -= ytd(previous)
+        profit += period_flow(current, profit_name, report_code)
+        profit -= period_flow(previous, profit_name, report_code)
     equity = account_value(current, "owner_equity" if fs_div == "CFS" else "equity")
     revenue = account_value(annual, "revenue")
-    try:
-        gross = account_value(annual, "gross")
-    except DataUnavailable as exc:
-        if str(exc) != "MISSING_ACCOUNT:gross":
-            raise
-        gross = revenue - account_value(annual, "cost")
-    assets = account_value(annual, "assets")
-    prior_assets = account_value(annual, "assets", "frmtrm_amount")
+    gross = period_gross(annual, "11011")
+    assets = account_value(current, "assets")
+    prior_assets = (account_value(annual, "assets", "frmtrm_amount")
+                    if report_code == "11011" else account_value(previous, "assets"))
+    if report_code != "11011":
+        revenue += period_flow(current, "revenue", report_code)
+        revenue -= period_flow(previous, "revenue", report_code)
+        gross += period_gross(current, report_code)
+        gross -= period_gross(previous, report_code)
+        # TTM begins at the end of the same quarter one year earlier.
     cap = amount(market_cap)
     if min(cap, profit, equity, revenue, assets, prior_assets) <= 0:
         raise DataUnavailable("NONPOSITIVE_DENOMINATOR_OR_TTM_PROFIT")
@@ -190,12 +185,35 @@ def calculate_snapshot(annual, current, previous, *, year, report_code,
                     "report_code": report_code, "receipts": sorted(set(receipts)),
                     "per_basis": "ordinary_market_cap/TTM_owner_profit" if fs_div == "CFS"
                         else "ordinary_market_cap/TTM_profit",
-                    "quality_basis": "annual; revenue/mean(beginning,end assets)"}, ensure_ascii=False),
+                    "quality_basis": QUALITY_BASIS,
+                    "quality_period_end": period_end.strftime("%Y%m%d")}, ensure_ascii=False),
                 validation_note="OK")
 
 
+def period_flow(rows, name, report_code):
+    """Annual total or YTD, never a half-year/Q3 three-month amount."""
+    if report_code == "11011":
+        return account_value(rows, name)
+    try:
+        return account_value(rows, name, "thstrm_add_amount")
+    except DataUnavailable as exc:
+        if report_code != "11013" or str(exc) != "MISSING_AMOUNT":
+            raise
+        return account_value(rows, name)
+
+
+def period_gross(rows, report_code):
+    try:
+        return period_flow(rows, "gross", report_code)
+    except DataUnavailable as exc:
+        if str(exc) != "MISSING_ACCOUNT:gross":
+            raise
+        return period_flow(rows, "revenue", report_code) - period_flow(rows, "cost", report_code)
+
+
 class DartClient:
-    def __init__(self, key, cache_dir, *, sleep=0.3, session=None):
+    def __init__(self, key, cache_dir, *, sleep=0.3, session=None, retries=2,
+                 force_refresh=False):
         if not re.fullmatch(r"[A-Za-z0-9]{40}", key or ""):
             raise DartFailure("DART_API_KEY_REQUIRED_40_CHARACTERS")
         self.key = key
@@ -203,24 +221,53 @@ class DartClient:
         self.cache.mkdir(parents=True, exist_ok=True)
         self.sleep = sleep
         self.session = session or requests.Session()
+        self.retries = max(0, int(retries))
+        self.force_refresh = force_refresh
+        self.generations = {}
+        self.reset_generation = ""
+        self.api_requests = 0
+        self.cache_hits = 0
 
     def _request(self, endpoint, params):
-        time.sleep(self.sleep)
-        try:
-            response = self.session.get("https://opendart.fss.or.kr/api/" + endpoint,
-                params=dict(params, crtfc_key=self.key), timeout=(5, 30))
-        except requests.RequestException as exc:
-            raise DartFailure("DART_NETWORK:" + type(exc).__name__) from None
-        if response.status_code != 200:
-            raise DartFailure("DART_HTTP:" + str(response.status_code))
-        return response
+        for attempt in range(self.retries + 1):
+            time.sleep(self.sleep)
+            self.api_requests += 1
+            try:
+                response = self.session.get("https://opendart.fss.or.kr/api/" + endpoint,
+                    params=dict(params, crtfc_key=self.key), timeout=(5, 30))
+            except requests.RequestException as exc:
+                reason = "DART_NETWORK:" + type(exc).__name__
+                retryable = isinstance(exc, (requests.ConnectionError, requests.Timeout))
+            else:
+                if response.status_code == 200:
+                    return response
+                reason = "DART_HTTP:" + str(response.status_code)
+                retryable = response.status_code in (500, 502, 503, 504)
+            if not retryable or attempt == self.retries:
+                raise DartFailure(reason) from None
+            print(f"[ValueCollect retry] {reason} / retry {attempt + 1}/{self.retries}")
+            time.sleep(2 ** attempt)
+
+    def generation(self, corp):
+        return self.reset_generation + self.generations.get(corp, "")
 
     def get(self, endpoint, **params):
         identity = json.dumps([endpoint, params], sort_keys=True)
+        if params.get("corp_code") and self.generation(params["corp_code"]):
+            identity += self.generation(params["corp_code"])
         path = self.cache / (hashlib.sha256(identity.encode()).hexdigest() + ".json")
-        if path.exists() and time.time() - path.stat().st_mtime < 86400:
+        # Filings are polled every run (15-minute response cache), while
+        # unchanged financial responses last seven days as a fallback audit.
+        ttl = 900 if endpoint == "list.json" else 7 * 86400
+        if path.exists() and not self.force_refresh:
             try:
-                return json.loads(path.read_text(encoding="utf-8"))
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(payload, dict) or payload.get("status") not in ("000", "013"):
+                    raise ValueError("INVALID_CACHE")
+                effective_ttl = min(ttl, 6 * 3600) if payload["status"] == "013" else ttl
+                if 0 <= time.time() - path.stat().st_mtime < effective_ttl:
+                    self.cache_hits += 1
+                    return None if payload["status"] == "013" else payload
             except (OSError, ValueError):
                 pass
         try:
@@ -230,14 +277,65 @@ class DartClient:
         if not isinstance(payload, dict):
             raise DartFailure("DART_INVALID_PAYLOAD")
         status = str(payload.get("status", ""))
-        if status == "013":
-            return None
-        if status != "000":
+        if status not in ("000", "013"):
             raise DartFailure("DART_STATUS:" + status)
         temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         temp.replace(path)
-        return payload
+        return None if status == "013" else payload
+
+    def prepare_filings(self, quote_date):
+        """Poll market-wide regular filings, including corrections, before reuse.
+
+        The persisted watermark advances only after all pages succeed. Re-read
+        one overlap day; receipt tokens invalidate all company report caches.
+        """
+        path = self.cache / "filing_state.json"
+        try:
+            state = json.loads(path.read_text(encoding="utf-8"))
+            previous = date.fromisoformat(state["through"])
+            self.generations = dict(state["generations"])
+            self.reset_generation = str(state.get("reset_generation", ""))
+        except (OSError, ValueError, KeyError, TypeError):
+            previous = None
+        if previous and previous > quote_date:
+            # Historical requests must not reuse a later-date checkpoint/cache.
+            self.reset_generation = "historical:" + quote_date.isoformat()
+            previous = None
+        if previous and (quote_date - previous).days > 60:
+            self.reset_generation = "audit:" + quote_date.isoformat()
+            previous = None
+        begin = previous - timedelta(days=1) if previous else quote_date - timedelta(days=7)
+        page, pages = 1, 1
+        generations = dict(self.generations)
+        while page <= pages:
+            payload = self.get("list.json", bgn_de=begin.strftime("%Y%m%d"),
+                end_de=quote_date.strftime("%Y%m%d"), pblntf_ty="A",
+                last_reprt_at="N", page_count=100, page_no=page)
+            if payload is None:
+                if page != 1:
+                    raise DartFailure("DART_FILINGS_INCOMPLETE_PAGES")
+                break
+            try:
+                pages = int(payload["total_page"])
+                rows = payload["list"]
+                if not 1 <= pages <= 5000 or not isinstance(rows, list) or not rows:
+                    raise ValueError()
+                for row in rows:
+                    corp, receipt = row["corp_code"], row["rcept_no"]
+                    if not re.fullmatch(r"\d{8}", corp) or not re.fullmatch(r"\d{14}", receipt):
+                        raise ValueError()
+                    if receipt[:8] > quote_date.strftime("%Y%m%d"):
+                        raise ValueError()
+                    generations[corp] = max(generations.get(corp, ""), receipt)
+            except (KeyError, ValueError, TypeError):
+                raise DartFailure("DART_FILINGS_INVALID_PAYLOAD") from None
+            page += 1
+        self.generations = generations
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps(dict(through=quote_date.isoformat(),
+            generations=generations, reset_generation=self.reset_generation)), encoding="utf-8")
+        temp.replace(path)
 
     def companies(self):
         path = self.cache / "corp_codes.json"
@@ -367,15 +465,30 @@ def market_caps(requested_date):
     raise DartFailure("KRX_NO_RECENT_MARKET_CAP")
 
 
-def run_collection(client, db_path, quote_date, caps, companies, *, codes=None, limit=20):
+def run_collection(client, db_path, quote_date, caps, companies, *, codes=None, limit=20,
+                   resume=True):
     selected = list(codes) if codes else sorted(set(companies) & set(caps.index))
     if limit:
         selected = selected[:limit]
     if not selected:
         raise DataUnavailable("NO_COLLECTION_TARGETS")
-    summary = {"attempted": 0, "saved": 0, "skipped": 0, "errors": {},
+    completed = checkpoints.load_completed(db_path) if resume else {}
+    started = time.monotonic()
+    summary = {"attempted": 0, "saved": 0, "skipped": 0, "resumed": 0, "resumed_saved": 0,
+               "target": len(selected), "errors": {},
                "quote_date": quote_date.strftime("%Y%m%d")}
-    for code in selected:
+    for index, code in enumerate(selected, 1):
+        key = None
+        if code in companies and code in caps.index:
+            row = caps.loc[code]
+            generation = client.generation(companies[code]["corp_code"]) if isinstance(client, DartClient) else ""
+            key = checkpoints.fingerprint(quote_date, companies[code],
+                row["시가총액"], row["상장주식수"], generation)
+            if checkpoints.checkpoint_matches(completed.get(code), key):
+                summary["resumed"] += 1
+                summary["resumed_saved"] += int(completed[code][2] == "OK")
+                print(f"[ValueCollect {index}/{len(selected)}] {code}: 동일 기준일 처리 완료 - 건너뜀")
+                continue
         summary["attempted"] += 1
         try:
             if code not in companies or code not in caps.index:
@@ -388,15 +501,23 @@ def run_collection(client, db_path, quote_date, caps, companies, *, codes=None, 
             upsert_fundamental_snapshot(code=code, code_name=companies[code]["code_name"],
                 db_path=db_path, **snapshot)
             summary["saved"] += 1
-            print(f"[ValueCollect] {code}: 재무 지표 저장")
+            if key:
+                checkpoints.complete(db_path, code, key, "OK")
+            print(f"[ValueCollect {index}/{len(selected)}] {code}: 재무 지표 저장")
         except (DataUnavailable, DartFailure) as exc:
             reason = str(exc)
-            mark_fundamental_invalid(code, reason, db_path=db_path)
             summary["skipped"] += 1
             summary["errors"][code] = reason
-            print(f"[ValueCollect] {code}: 제외 / {reason}")
+            print(f"[ValueCollect {index}/{len(selected)}] {code}: 제외 / {reason}")
             if isinstance(exc, DartFailure):
-                # Stop on auth/quota/network issues instead of hammering API.
+                # A transport/auth failure does not prove old financials invalid.
+                # Never checkpoint the failed company; retry it on next run.
                 summary["stopped"] = reason
                 break
+            mark_fundamental_invalid(code, reason, db_path=db_path)
+            if key:
+                checkpoints.complete(db_path, code, key, reason)
+    summary["elapsed_seconds"] = round(time.monotonic() - started, 2)
+    if isinstance(client, DartClient):
+        summary.update(api_requests=client.api_requests, cache_hits=client.cache_hits)
     return summary

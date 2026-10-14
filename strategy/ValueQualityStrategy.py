@@ -35,8 +35,8 @@ class ValueQualityStrategy(QThread):
     ---------
     - 최근 4분기(TTM) PER: 0 초과 ~ 15배
     - PBR: 0 초과 ~ 1배
-    - 최근연도 매출총이익률: 30% ~ 95%
-    - 최근연도 총자산회전율: 1회 ~ 10회
+    - 최근 4분기(TTM) 매출총이익률: 30% ~ 95% (분기마다 갱신)
+    - 최근 4분기(TTM) 총자산회전율: 1회 ~ 10회 (분기마다 갱신)
 
     자동 매도 조건
     -------------
@@ -447,7 +447,7 @@ class ValueQualityStrategy(QThread):
         return {
             "reason_code": "VALUE_QUALITY_ENTRY",
             "signal_reason": (
-                "PER/PBR 저평가 + 매출총이익률/총자산회전율 우량 조건 충족"
+                "PER/PBR 저평가 + TTM 매출총이익률/총자산회전율 우량 조건 충족"
             ),
             "current_price": current_price,
             "condition_data": {
@@ -683,9 +683,9 @@ class ValueQualityStrategy(QThread):
             f"{quantity}주 {order_price:,}원 / "
             f"PER {data['per_ttm']:.2f} / "
             f"PBR {data['pbr']:.2f} / "
-            f"매출총이익률 "
+            f"TTM 매출총이익률 "
             f"{data['gross_margin_pct']:.2f}% / "
-            f"총자산회전율 "
+            f"TTM 총자산회전율 "
             f"{data['asset_turnover']:.2f}회"
         )
 

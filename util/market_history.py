@@ -71,6 +71,10 @@ def _connect(db_path: Path = DB_PATH) -> Iterator[sqlite3.Connection]:
             )
         """)
         con.execute("CREATE INDEX IF NOT EXISTS idx_stock_master_market ON stock_master(market)")
+        con.execute("""CREATE TABLE IF NOT EXISTS history_backfill_state (
+            code TEXT PRIMARY KEY, start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+            required_rows INTEGER NOT NULL, stored_count INTEGER NOT NULL
+        )""")
         with con:
             yield con
     finally:
@@ -364,6 +368,8 @@ def bootstrap_market_history(
         target_codes, db_path=db_path, before_date=completed_before
     )
     latest_dates = get_code_latest_dates(target_codes, db_path=db_path)
+    with _connect(db_path) as con:
+        full_scans = {row[0]: row[1:] for row in con.execute("SELECT * FROM history_backfill_state")}
 
     overlap_days = max(1, int(incremental_overlap_calendar_days))
 
@@ -374,11 +380,16 @@ def bootstrap_market_history(
         # Verify the configured history target. Recent dates alone do not prove
         # sufficient history; refill the requested past range when short.
         needs_backfill = stored_count < required_history_rows
-        if latest_date_text and latest_date_text >= end_text and not needs_backfill:
+        scan = full_scans.get(code)
+        recent_full_scan = bool(scan and scan[0] <= start_text
+            and scan[2] == required_history_rows and stored_count >= scan[3]
+            and 0 <= (end_date - datetime.strptime(scan[1], "%Y%m%d").date()).days < 7)
+        if latest_date_text and latest_date_text >= end_text and (not needs_backfill or recent_full_scan):
             up_to_date_codes += 1
             print(
                 f"[{idx}/{len(target_codes)}] {code}: 최신 {latest_date_text} / "
-                f"{stored_count}거래일 / 목표 {required_history_rows}봉 충족 - 건너뜀"
+                f"{stored_count}거래일 / "
+                f"{'최근 전체 범위 조회 완료' if needs_backfill else '목표 이력 충족'} - 건너뜀"
             )
             continue
 
@@ -386,7 +397,7 @@ def bootstrap_market_history(
             fetch_start_text = start_text
             mode_text = f"초기 구축 ({stored_count}/{required_history_rows}봉)"
             initial_build_codes += 1
-        elif needs_backfill:
+        elif needs_backfill and not recent_full_scan:
             fetch_start_text = start_text
             mode_text = f"과거 이력 보충 ({stored_count}/{required_history_rows}봉)"
             backfill_codes += 1
@@ -424,6 +435,14 @@ def bootstrap_market_history(
                     (code, date, open, high, low, close, volume, source, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, rows)
+                if fetch_start_text == start_text:
+                    count = con.execute("SELECT COUNT(*) FROM daily_price WHERE code=? AND date<=?",
+                                        (code, end_text)).fetchone()[0]
+                    con.execute("""INSERT INTO history_backfill_state VALUES (?,?,?,?,?)
+                        ON CONFLICT(code) DO UPDATE SET start_date=excluded.start_date,
+                        end_date=excluded.end_date, required_rows=excluded.required_rows,
+                        stored_count=excluded.stored_count""",
+                        (code, start_text, end_text, required_history_rows, count))
 
             fetched_codes += 1
             inserted_rows += len(frame)

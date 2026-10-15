@@ -252,7 +252,7 @@ class PaperBroker:
                     json.dumps(m, ensure_ascii=False), m["rejection_reason"] or "WAIT_OPENING_RANGE", stamp) for code, m in metrics.items()])
             con.execute("INSERT OR REPLACE INTO paper_run_status VALUES (?,?,?,?)", (day, json.dumps(stats, ensure_ascii=False), json.dumps(self.config, ensure_ascii=False), stamp))
 
-    def snapshot(self, now, watch_runtime=None):
+    def snapshot(self, now, watch_runtime=None, execution_status=None):
         day, stamp = now.strftime("%Y%m%d"), now.strftime("%Y%m%d%H%M%S")
         with self._connect() as con, con:
             con.executemany("UPDATE paper_position SET current_price=?,updated_at=? WHERE position_id=?", [(p["current_price"], p["updated_at"], p["position_id"]) for p in self.positions.values()])
@@ -271,4 +271,12 @@ class PaperBroker:
             if watch_runtime:
                 con.executemany("""UPDATE paper_watchlist SET current_price=?,opening_high=?,day_low=?,last_reason=?,updated_at=?
                     WHERE snapshot_date=? AND code=?""", [(v.get("price"), v.get("opening_high"), v.get("day_low"), v.get("reason"), stamp, day, code) for code, v in watch_runtime.items()])
+            if execution_status is not None:
+                target = execution_status.get("watchlist_date")
+                row = con.execute("SELECT stats_json FROM paper_run_status WHERE snapshot_date=?", (target,)).fetchone()
+                if row:
+                    stats = json.loads(row[0])
+                    stats["paper_execution"] = execution_status
+                    con.execute("UPDATE paper_run_status SET stats_json=?,updated_at=? WHERE snapshot_date=?",
+                                (json.dumps(stats, ensure_ascii=False), stamp, target))
         return len(self.positions)

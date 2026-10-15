@@ -23,8 +23,8 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[1] / "config" / "momentum
 def load_config(path=DEFAULT_CONFIG_PATH):
     config = json.loads(Path(path).read_text(encoding="utf-8"))
     rules, account = config["strategy"], config["account"]
-    if rules["momentum_mode"] not in ("video_low126", "pdf_returns"):
-        raise ValueError("momentum_mode must be video_low126 or pdf_returns")
+    if rules["momentum_mode"] not in ("video_low126", "pdf_returns", "return_21", "return_63", "return_126"):
+        raise ValueError("unsupported momentum_mode")
     for name in ("consolidation_days", "prior_move_window", "recent_range_days",
                  "opening_range_minutes", "partial_after_sessions", "trailing_ma_period"):
         value = rules[name]
@@ -135,7 +135,15 @@ def rank_and_filter(metrics, rules):
     counts = {"valid_history": len(ranked), "top_ranked": 0, "adr": 0,
               "liquid": 0, "prior_move": 0, "contraction": 0, "qualified": 0}
     for metric in ranked.values():
-        rank = metric["low126_score_rank"] if rules["momentum_mode"] == "video_low126" else min(metric[f + "_rank"] for f in fields[1:])
+        mode = rules["momentum_mode"]
+        if mode == "video_low126":
+            rank = metric["low126_score_rank"]
+        elif mode == "pdf_returns":
+            rank = min(metric[f + "_rank"] for f in fields[1:])
+        elif mode in ("return_21", "return_63", "return_126"):
+            rank = metric["return" + mode.split("_")[1] + "_pct_rank"]
+        else:
+            raise ValueError("unsupported momentum_mode")
         metric["momentum_rank"] = rank
         metric["rank_cutoff"] = cutoff
         checks = (

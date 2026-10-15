@@ -13,6 +13,7 @@ async function request(path, options) {
 export const getDashboard = () => request("/api/dashboard");
 export const getStrategy = (name) => request(`/api/strategies/${name}`);
 export const getPaperAccount = () => request("/api/strategies/MomentumContractionStrategy/paper-account");
+export const getMomentumPeriods = () => request("/api/strategies/MomentumContractionStrategy/momentum-periods");
 export const getVirtualPerformance = (name) =>
   request(`/api/strategies/${name}/virtual-performance`);
 export const getVirtualTrades = (name, limit = 100) =>

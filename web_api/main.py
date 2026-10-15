@@ -33,6 +33,9 @@ from .strategies import (
     get_all_strategy_configs,
     get_strategy_config,
 )
+from . import database as database_module
+from .period_queries import get_momentum_periods
+from .query_context import ReadOnlyDatabase
 
 
 app = FastAPI(
@@ -153,6 +156,16 @@ def paper_account(strategy_name: str, candidate_limit: int = Query(100, ge=1, le
     if not config.get("supports_paper_account"):
         raise HTTPException(status_code=404, detail="가상 계좌를 지원하지 않는 전략입니다")
     return get_paper_account(candidate_limit, trade_limit)
+
+
+@app.get("/api/strategies/{strategy_name}/momentum-periods")
+def momentum_periods(strategy_name: str, candidate_limit: int = Query(100, ge=1, le=200),
+                     trade_limit: int = Query(100, ge=1, le=200)):
+    config = _require_strategy(strategy_name)
+    if not config.get("supports_paper_account"):
+        raise HTTPException(status_code=404, detail="기간 비교를 지원하지 않는 전략입니다")
+    return get_momentum_periods(ReadOnlyDatabase(database_module.PAPER_DB, database_module.SQLITE_BUSY_TIMEOUT_MS),
+                                candidate_limit, trade_limit)
 
 
 @app.get("/api/strategies/{strategy_name}")

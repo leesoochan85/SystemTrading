@@ -56,7 +56,15 @@ class MomentumContractionStrategy:
         self.exit_cache_date = None
         if self.watchlist_writer:
             self.watchlist_writer(before_date, self.metrics, self.universe, self.stats, now)
-        print(f"[MomentumContraction] 가상 전용 후보 {stats['qualified']}/{stats['valid_history']} / ADR > {self.rules['min_adr_pct']}% / 기준일 {stats['reference_date']}")
+        print(f"[MomentumContraction] 공통 신호 후보 {stats['qualified']}/{stats['valid_history']} / 기준일 {stats['reference_date']}")
+        print("[MomentumContraction] 단계별 통과: "
+              f"전체 {stats['universe']} → 유효 일봉 {stats['valid_history']} "
+              f"→ 상위 {self.rules['top_percent']}% {stats['top_ranked']} "
+              f"→ ADR>{self.rules['min_adr_pct']}% {stats['adr']} "
+              f"→ 평균 거래대금 {stats['liquid']} → 선행 상승 {stats['prior_move']} "
+              f"→ 변동폭 수축 {stats['contraction']} → 저점 상승/최종 {stats['qualified']}")
+        if not stats['qualified']:
+            print("[MomentumContraction] 오늘 후보 없음 - 일봉 수집과 별개로 조건을 모두 통과한 종목이 없습니다. 기존 가상 보유 관리는 계속합니다.")
 
     def ensure_daily_metrics(self, now):
         if self.metrics_date != now.strftime("%Y%m%d"):

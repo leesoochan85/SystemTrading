@@ -378,10 +378,6 @@ class StrategyManager(QObject):
             return []
 
         union_codes = self.get_event_realtime_union_codes(active)
-        if not union_codes:
-            raise RuntimeError(
-                "event-driven 전략의 실시간 등록 가능 종목이 없습니다."
-            )
 
         # Operational strategies and the momentum paper account share one tick stream.
         fid_names = ("체결시간", "현재가", "시가", "고가", "저가", "누적거래량", "거래량", "(최우선)매수호가", "(최우선)매도호가")
@@ -398,6 +394,9 @@ class StrategyManager(QObject):
             registered = getattr(strategy, "on_realtime_registered", None)
             if callable(registered):
                 registered()
+        paper_registered = getattr(self.virtual_strategy_engine.paper_engine, "on_realtime_registered", None)
+        if callable(paper_registered):
+            paper_registered()
 
         print(
             "[StrategyManager] event-driven 공통 실시간 등록: "
